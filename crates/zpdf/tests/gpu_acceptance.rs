@@ -1274,3 +1274,414 @@ fn gpu_dense_nested_multiply_tiling_preserves_backdrop() {
         "dense nested Multiply tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
     );
 }
+
+/// Regression: opaque outer soft mask on a backdrop-dependent tiling pattern
+/// (white + cyan `Multiply` over blue and yellow backdrops) must preserve the
+/// live page backdrop on both CPU and GPU through the interpreter
+/// (ISO 32000-1 §11.6.7).
+#[test]
+fn gpu_masked_backdrop_dependent_tiling_preserves_page_backdrop() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let mask_form = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /S /Transparency /CS /DeviceRGB >>",
+        b"1 1 1 rg 0 0 50 100 re f",
+    );
+    let gs_smask =
+        b"<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 7 0 R >> >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 10 20 re f\n0 1 1 rg 10 0 10 20 re f",
+    );
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 50 100 50 re f\n\
+          1 1 0 rg 0 0 100 50 re f\n\
+          /GSM gs /Pattern cs /P0 scn 0 0 100 100 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> /ExtGState << /GSM 8 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+        mask_form,                                     // 7
+        gs_smask,                                      // 8
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU masked tiling test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 99 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let blue_px = px(&gpu.data, 5, 75);
+    assert!(
+        blue_px[0] < 10 && blue_px[1] < 10 && blue_px[2] > 245,
+        "GPU opaque-masked white Multiply over blue must stay blue, got {blue_px:?}"
+    );
+    let green_px = px(&gpu.data, 15, 25);
+    assert!(
+        green_px[0] < 10 && green_px[1] > 245 && green_px[2] < 10,
+        "GPU opaque-masked cyan Multiply over yellow must turn green, got {green_px:?}"
+    );
+    let masked_out = px(&gpu.data, 75, 25);
+    assert!(
+        masked_out[0] > 245 && masked_out[1] > 245 && masked_out[2] < 10,
+        "GPU zero-masked area over yellow must stay yellow, got {masked_out:?}"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  masked_backdrop_tiling: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "masked backdrop tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}
+
+/// Regression: dense (>4,096 tiles) outer cell painting a translucent (50%)
+/// inner pattern with two white `Multiply` marks must preserve a blue backdrop
+/// on BOTH sides of the tile cap on GPU (matching CPU).
+#[test]
+fn gpu_dense_translucent_multi_segment_nested_tiling_preserves_backdrop() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_half = b"<< /Type /ExtGState /ca 0.5 >>".to_vec();
+    let p_inner = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 2 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 2 2 re f\n/GM gs 1 1 1 rg 0 0 2 2 re f",
+    );
+    let p_outer = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4 \
+         /Resources << /Pattern << /PI 5 0 R >> /ExtGState << /GH 8 0 R >> >>",
+        b"/GH gs /Pattern cs /PI scn 0 0 4 4 re f",
+    );
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 320 260 re f\n\
+          /Pattern cs /PO scn 0 0 40 40 re f\n\
+          60 0 260 260 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 260] /Contents 4 0 R \
+          /Resources << /Pattern << /PO 6 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        p_inner,                                       // 5
+        p_outer,                                       // 6
+        gs_mul,                                        // 7
+        gs_half,                                       // 8
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU translucent nested tiling test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 259 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let below = px(&gpu.data, 20, 20);
+    let above = px(&gpu.data, 190, 130);
+    assert!(
+        below[0] < 10 && below[1] < 10 && below[2] > 245,
+        "GPU below-cap translucent nested white Multiply over blue must stay blue, got {below:?}"
+    );
+    assert!(
+        above[0] < 10 && above[1] < 10 && above[2] > 245,
+        "GPU above-cap translucent nested white Multiply over blue must stay blue, got {above:?}"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  dense_translucent_nested_white_multiply: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "dense translucent nested white Multiply GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}
+
+/// Regression: 2 overlapping copies × 33 segments (= 66 > 64) on the dense GPU
+/// path must still keep both copies separate so the spanning 50%-gray Multiply
+/// strip evaluates to ~64 on white (matching below-cap direct replay and CPU).
+#[test]
+fn gpu_overlapping_multiply_above_64_passes_preserves_both_copies() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let mut cell_stream = String::from("/GM gs 0.5 0.5 0.5 rg 0 0 8 2 re f\n");
+    for _ in 0..32 {
+        cell_stream.push_str("/GM gs 0.99 0.99 0.99 rg 0 2 4 2 re f\n");
+    }
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 8 4] /XStep 4 /YStep 4 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        cell_stream.as_bytes(),
+    );
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 40 40 re f\n60 0 260 260 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU overlapping >64 passes test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 259 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let below = px(&gpu.data, 22, 21);
+    let above = px(&gpu.data, 190, 129);
+    assert!(
+        below.iter().all(|&c| (58..=70).contains(&c)),
+        "GPU below-cap 2x33 overlapping Multiply must be ~64, got {below:?}"
+    );
+    assert!(
+        above.iter().all(|&c| (58..=70).contains(&c)),
+        "GPU above-cap 2x33 (>64) overlapping Multiply must stay ~64 (not ~128), got {above:?}"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  overlapping_multiply_2x33_above_64: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "overlapping Multiply 2x33 GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}
+
+/// Regression: GPU outer shape and clip coverage (fill edge, stroke edge, and
+/// anti-aliased glyph clip) must be applied ONCE across all segments of a
+/// multi-segment `Multiply` tiling pattern — matching a solid opaque black
+/// reference (~128 on half-covered edges, NOT ~64).
+#[test]
+fn gpu_multi_segment_tiling_applies_outer_shape_coverage_once() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
+    );
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let build_pdf = |paint_cmds: &[u8]| {
+        let content = stream_obj("", paint_cmds);
+        assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 120] /Contents 4 0 R \
+              /Resources << /Pattern << /P0 5 0 R >> /Font << /F1 6 0 R >> >> >>"
+                .to_vec(), // 3
+            content,                                       // 4
+            cell.clone(),                                  // 5
+            font.clone(),                                  // 6
+            gs_mul.clone(),                                // 7
+        ])
+    };
+    let pat_pdf = build_pdf(
+        b"/Pattern cs /P0 scn 10.5 10 20 80 re f\n\
+          /Pattern CS /P0 SCN 9 w 50 10 m 50 90 l S\n\
+          /Pattern cs /P0 scn BT /F1 60 Tf 70 25 Td (O) Tj ET",
+    );
+    let ref_pdf = build_pdf(
+        b"0 0 0 rg 10.5 10 20 80 re f\n\
+          0 0 0 RG 9 w 50 10 m 50 90 l S\n\
+          q BT /F1 60 Tf 7 Tr 70 25 Td (O) Tj ET 0 0 0 rg 65 20 55 60 re f Q",
+    );
+
+    let render_gpu = |pdf: Vec<u8>| {
+        let doc = PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+        let mut images = ImageCache::new();
+        let dl = ContentInterpreter::new(page.media_box)
+            .with_fonts(&mut fonts)
+            .with_document(doc.file(), &page.resources)
+            .with_images(&mut images)
+            .interpret(&content_bytes);
+        zpdf::gpu::WgpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_images(&images)
+            .render_display_list(&dl, 1.0)
+    };
+    let pat_gpu = match render_gpu(pat_pdf) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skipping GPU outer-shape coverage test (no adapter?): {e}");
+            return;
+        }
+    };
+    let ref_gpu = render_gpu(ref_pdf).expect("gpu solid reference render");
+
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 119 - y_pdf;
+        let off = ((iy * pat_gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let fill_pat = px(&pat_gpu.data, 10, 50);
+    let fill_ref = px(&ref_gpu.data, 10, 50);
+    assert!(
+        (110..=145).contains(&fill_ref[0]),
+        "GPU sanity check: solid fill edge must be ~128, got {fill_ref:?}"
+    );
+    assert!(
+        (fill_pat[0] as i32 - fill_ref[0] as i32).abs() <= 4,
+        "GPU multi-segment fill edge must match solid ref ({fill_ref:?}), got {fill_pat:?}"
+    );
+
+    let stroke_pat = px(&pat_gpu.data, 45, 50);
+    let stroke_ref = px(&ref_gpu.data, 45, 50);
+    assert!(
+        (110..=145).contains(&stroke_ref[0]),
+        "GPU sanity check: solid stroke edge must be ~128, got {stroke_ref:?}"
+    );
+    assert!(
+        (stroke_pat[0] as i32 - stroke_ref[0] as i32).abs() <= 4,
+        "GPU multi-segment stroke edge must match solid ref ({stroke_ref:?}), got {stroke_pat:?}"
+    );
+
+    let mut aa_glyph_pixels = 0usize;
+    for y in 20..110u32 {
+        for x in 65..118u32 {
+            let off = ((y * pat_gpu.width + x) * 4) as usize;
+            let r_ref = ref_gpu.data[off];
+            if (60..=200).contains(&r_ref) {
+                aa_glyph_pixels += 1;
+                let r_pat = pat_gpu.data[off];
+                assert!(
+                    (r_pat as i32 - r_ref as i32).abs() <= 4,
+                    "GPU glyph-clip AA pixel ({x},{y}) diverged: solid ref={r_ref}, tiling={r_pat}"
+                );
+            }
+        }
+    }
+    assert!(
+        aa_glyph_pixels >= 10,
+        "expected anti-aliased glyph-clip pixels on GPU, found {aa_glyph_pixels}"
+    );
+}

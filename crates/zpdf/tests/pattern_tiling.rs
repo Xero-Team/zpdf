@@ -1557,3 +1557,337 @@ fn overlapping_mixed_normal_and_multiply_preserves_copy_order_above_cap() {
         "above-cap overlapping Normal-over-Multiply copy order must yield red (not black)",
     );
 }
+
+/// Regression: an object with a fully opaque outer soft mask painting a
+/// backdrop-dependent tiling pattern (opaque white `Multiply` over a blue page)
+/// must evaluate the pattern against the live blue page backdrop before
+/// applying the mask, leaving the pixel blue — NOT white (ISO 32000-1 §11.6.7).
+#[test]
+fn masked_backdrop_dependent_tiling_pattern_preserves_page_backdrop() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let mask_form = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /S /Transparency /CS /DeviceRGB >>",
+        b"1 1 1 rg 0 0 50 100 re f",
+    );
+    let gs_smask =
+        b"<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 7 0 R >> >>".to_vec();
+    // Cell: left half white Multiply, right half cyan Multiply.
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 10 20 re f\n0 1 1 rg 10 0 10 20 re f",
+    );
+    // Blue top half [0..100]×[50..100], yellow bottom half [0..100]×[0..50].
+    // Soft mask is opaque white on left [0..50] and black (masked out) on right [50..100].
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 50 100 50 re f\n\
+          1 1 0 rg 0 0 100 50 re f\n\
+          /GSM gs /Pattern cs /P0 scn 0 0 100 100 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> /ExtGState << /GSM 8 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+        mask_form,                                     // 7
+        gs_smask,                                      // 8
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+
+    // Unmasked left half [0..50], blue top half: white Multiply over blue MUST stay blue!
+    assert_rgbish(
+        px_on(&page, 100.0, 1.0, 5.0, 75.0),
+        [0, 0, 255],
+        "opaque-masked white Multiply tiling over blue must stay blue (not white)",
+    );
+    // Unmasked left half [0..50], yellow bottom half: white stays yellow, cyan turns green.
+    assert_rgbish(
+        px_on(&page, 100.0, 1.0, 5.0, 25.0),
+        [255, 255, 0],
+        "opaque-masked white Multiply tiling over yellow must stay yellow",
+    );
+    assert_rgbish(
+        px_on(&page, 100.0, 1.0, 15.0, 25.0),
+        [0, 255, 0],
+        "opaque-masked cyan Multiply tiling over yellow must turn green",
+    );
+    // Masked-out right half [50..100], yellow bottom half: cyan Multiply masked out -> stays yellow.
+    assert_rgbish(
+        px_on(&page, 100.0, 1.0, 75.0, 25.0),
+        [255, 255, 0],
+        "zero-masked cyan Multiply tiling over yellow must leave backdrop untouched",
+    );
+}
+
+/// Regression: an outer cell painting a translucent (50%) inner pattern whose
+/// cell has two opaque white `Multiply` marks must preserve a blue page
+/// backdrop on BOTH sides of the 4,096 tile cap (neither pasting half-white
+/// over blue nor diverging above vs below the cap).
+#[test]
+fn dense_translucent_multi_segment_nested_tiling_preserves_backdrop_above_cap() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_half = b"<< /Type /ExtGState /ca 0.5 >>".to_vec();
+    // Inner pattern (2×2): two opaque white Multiply marks covering [0..2]×[0..2].
+    let p_inner = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 2 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 2 2 re f\n/GM gs 1 1 1 rg 0 0 2 2 re f",
+    );
+    // Outer pattern (4×4): paints inner pattern at 50% opacity.
+    let p_outer = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4 \
+         /Resources << /Pattern << /PI 5 0 R >> /ExtGState << /GH 8 0 R >> >>",
+        b"/GH gs /Pattern cs /PI scn 0 0 4 4 re f",
+    );
+    // Blue page [0..320]×[0..260].
+    // Left fill [0..40]×[0..40] = 100 tiles (below 4,096 cap).
+    // Right fill [60..320]×[0..260] = 65×65 = 4,225 tiles (above 4,096 cap).
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 320 260 re f\n\
+          /Pattern cs /PO scn 0 0 40 40 re f\n\
+          60 0 260 260 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 260] /Contents 4 0 R \
+          /Resources << /Pattern << /PO 6 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        p_inner,                                       // 5
+        p_outer,                                       // 6
+        gs_mul,                                        // 7
+        gs_half,                                       // 8
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+
+    let below = px_on(&page, 260.0, 1.0, 20.5, 20.5);
+    let above = px_on(&page, 260.0, 1.0, 190.5, 130.5);
+    assert_rgbish(
+        below,
+        [0, 0, 255],
+        "below-cap translucent nested white Multiply over blue must stay blue",
+    );
+    assert_rgbish(
+        above,
+        [0, 0, 255],
+        "above-cap translucent nested white Multiply over blue must stay blue (not pale blue)",
+    );
+}
+
+/// Regression: when overlapping copies × segments exceeds 64 (2 copies × 33
+/// segments = 66), dense compositing must STILL keep overlapping copies
+/// separate in painter's order so two 50%-gray `Multiply` marks give ~64 on
+/// white (not ~128).
+#[test]
+fn overlapping_multiply_above_64_passes_preserves_both_copies() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let mut cell_stream = String::from("/GM gs 0.5 0.5 0.5 rg 0 0 8 2 re f\n");
+    // 32 additional Multiply marks in a separate horizontal strip y=[2..4]
+    // so the cell has 33 Multiply segments total (2 copies × 33 = 66 > 64).
+    for _ in 0..32 {
+        cell_stream.push_str("/GM gs 0.99 0.99 0.99 rg 0 2 4 2 re f\n");
+    }
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 8 4] /XStep 4 /YStep 4 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        cell_stream.as_bytes(),
+    );
+    // Left [0..40]×[0..40] = 100 tiles (below cap); right [60..320]×[0..260] = 4,225 tiles (above cap).
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 40 40 re f\n60 0 260 260 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+
+    // Sample inside the spanning strip y mod 4 = 1.0 (e.g. y = 21.0 and y = 129.0).
+    let below = px_on(&page, 260.0, 1.0, 22.5, 21.0);
+    let above = px_on(&page, 260.0, 1.0, 190.5, 129.0);
+    assert!(
+        below.iter().all(|&c| (58..=70).contains(&c)),
+        "below-cap 2x33 overlapping 50%-gray Multiply must be ~64 on white, got {below:?}"
+    );
+    assert!(
+        above.iter().all(|&c| (58..=70).contains(&c)),
+        "above-cap 2x33 (>64) overlapping 50%-gray Multiply must stay ~64 on white (not ~128), got {above:?}"
+    );
+}
+
+/// Regression: outer anti-aliased shape coverage (fills, stroked outlines, and
+/// outline glyph runs) must be applied ONCE to the completed multi-segment
+/// pattern rather than once per segment — matching a solid opaque black
+/// reference on half-covered edge pixels (~128 on white, NOT ~64).
+#[test]
+fn multi_segment_tiling_applies_outer_shape_coverage_once_for_fill_stroke_and_glyph() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
+    );
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let build_pdf = |paint_cmds: &[u8]| {
+        let content = stream_obj("", paint_cmds);
+        assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 120] /Contents 4 0 R \
+              /Resources << /Pattern << /P0 5 0 R >> /Font << /F1 6 0 R >> >> >>"
+                .to_vec(), // 3
+            content,                                       // 4
+            cell.clone(),                                  // 5
+            font.clone(),                                  // 6
+            gs_mul.clone(),                                // 7
+        ])
+    };
+
+    // 1. Half-pixel fill edge at x = 10.5 (pixel x=10 has ~50% coverage).
+    // 2. Half-pixel stroke edges at x = 45.5 and 54.5 (stroke at x=50, width=9).
+    // 3. Anti-aliased glyph clip 'O' at (70, 25), 60pt Helvetica. Using `7 Tr`
+    //    (clip) + solid black rect in `ref_pdf` exercises the exact same
+    //    `PushClip(glyph_clip)` geometry as pattern-painted text so every AA
+    //    edge pixel is directly comparable without outline-curve flattening drift.
+    let pat_pdf = build_pdf(
+        b"/Pattern cs /P0 scn 10.5 10 20 80 re f\n\
+          /Pattern CS /P0 SCN 9 w 50 10 m 50 90 l S\n\
+          /Pattern cs /P0 scn BT /F1 60 Tf 70 25 Td (O) Tj ET",
+    );
+    let ref_pdf = build_pdf(
+        b"0 0 0 rg 10.5 10 20 80 re f\n\
+          0 0 0 RG 9 w 50 10 m 50 90 l S\n\
+          q BT /F1 60 Tf 7 Tr 70 25 Td (O) Tj ET 0 0 0 rg 65 20 55 60 re f Q",
+    );
+
+    let (pat_dl, _, pat_page) = render_with_stats(pat_pdf, 1.0);
+    let (_, _, ref_page) = render_with_stats(ref_pdf, 1.0);
+
+    // Fill edge pixel at x=10, y=50: must match solid black reference (~128, NOT ~64).
+    let fill_edge_pat = px_on(&pat_page, 120.0, 1.0, 10.2, 50.0);
+    let fill_edge_ref = px_on(&ref_page, 120.0, 1.0, 10.2, 50.0);
+    assert!(
+        (120..=136).contains(&fill_edge_ref[0]),
+        "sanity check: solid fill edge must be ~128, got {fill_edge_ref:?}"
+    );
+    assert!(
+        (fill_edge_pat[0] as i32 - fill_edge_ref[0] as i32).abs() <= 2,
+        "multi-segment fill edge must match solid reference ({fill_edge_ref:?}), got {fill_edge_pat:?}"
+    );
+
+    // Stroke edge pixel at x=45, y=50: must match solid black stroke reference (~128, NOT ~64).
+    let stroke_edge_pat = px_on(&pat_page, 120.0, 1.0, 45.2, 50.0);
+    let stroke_edge_ref = px_on(&ref_page, 120.0, 1.0, 45.2, 50.0);
+    assert!(
+        (120..=136).contains(&stroke_edge_ref[0]),
+        "sanity check: solid stroke edge must be ~128, got {stroke_edge_ref:?}"
+    );
+    assert!(
+        (stroke_edge_pat[0] as i32 - stroke_edge_ref[0] as i32).abs() <= 2,
+        "multi-segment stroke edge must match solid reference ({stroke_edge_ref:?}), got {stroke_edge_pat:?}"
+    );
+
+    // Anti-aliased glyph-clip 'O' region x=[65..118], y_dev=[20..110]: every
+    // partial-coverage edge pixel in the solid reference (60..=200) must match
+    // the multi-segment tiling pattern within <= 2 (single coverage pass).
+    let mut aa_clip_pixels = 0usize;
+    for y in 20..110u32 {
+        for x in 65..118u32 {
+            let off = ((y * pat_page.width + x) * 4) as usize;
+            let r_ref = ref_page.data[off];
+            if (60..=200).contains(&r_ref) {
+                aa_clip_pixels += 1;
+                let r_pat = pat_page.data[off];
+                assert!(
+                    (r_pat as i32 - r_ref as i32).abs() <= 2,
+                    "glyph-clip AA edge pixel ({x},{y}) diverged: solid ref={r_ref}, tiling={r_pat}"
+                );
+            }
+        }
+    }
+    assert!(
+        aa_clip_pixels >= 20,
+        "expected anti-aliased glyph-clip edge pixels in 'O', found {aa_clip_pixels}"
+    );
+
+    // 4. Direct `RenderCommand::DrawGlyphRun` with `Paint::Tiling` (2 black
+    //    Multiply segments) vs `Paint::Solid(black)`: proves the glyph-run
+    //    renderer itself also applies outline glyph AA coverage once.
+    let tiling_paint = pat_dl
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            zpdf::display_list::RenderCommand::FillPath {
+                paint: p @ zpdf::display_list::Paint::Tiling(_),
+                ..
+            } => Some(p.clone()),
+            _ => None,
+        })
+        .expect("tiling paint in pat_dl");
+    let glyph_pdf = build_pdf(b"0 0 0 rg BT /F1 60 Tf 70 25 Td (O) Tj ET");
+    let doc = PdfDocument::open(glyph_pdf).expect("open glyph pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let solid_glyph_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content);
+    let mut tiling_glyph_dl = solid_glyph_dl.clone();
+    let mut patched_runs = 0usize;
+    for cmd in &mut tiling_glyph_dl.commands {
+        if let zpdf::display_list::RenderCommand::DrawGlyphRun(run) = cmd {
+            run.paint = tiling_paint.clone();
+            patched_runs += 1;
+        }
+    }
+    assert!(patched_runs >= 1, "expected at least one DrawGlyphRun");
+    let solid_glyph_page = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&solid_glyph_dl, 1.0)
+        .expect("solid glyph render");
+    let tiling_glyph_page = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&tiling_glyph_dl, 1.0)
+        .expect("tiling glyph render");
+    let mut aa_run_pixels = 0usize;
+    for y in 20..110u32 {
+        for x in 65..118u32 {
+            let off = ((y * solid_glyph_page.width + x) * 4) as usize;
+            let r_ref = solid_glyph_page.data[off];
+            if (60..=200).contains(&r_ref) {
+                aa_run_pixels += 1;
+                let r_pat = tiling_glyph_page.data[off];
+                assert!(
+                    (r_pat as i32 - r_ref as i32).abs() <= 2,
+                    "DrawGlyphRun AA edge pixel ({x},{y}) diverged: solid ref={r_ref}, tiling={r_pat}"
+                );
+            }
+        }
+    }
+    assert!(
+        aa_run_pixels >= 20,
+        "expected anti-aliased DrawGlyphRun edge pixels in 'O', found {aa_run_pixels}"
+    );
+}

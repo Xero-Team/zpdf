@@ -243,7 +243,7 @@ struct PatternDefKey {
 
 /// Cap on separate `(overlap_copy × blend_segment)` SVG passes for one
 /// overlapping backdrop-dependent tiling fill or stroke.
-const MAX_SVG_TILING_BLEND_PASSES: usize = 64;
+const MAX_SVG_TILING_BLEND_PASSES: usize = 1024;
 /// Cap on chained page-backdrop `<g id="b...">` snapshots used for non-associative
 /// multi-pass tiling patterns painted with `opacity < 1.0`.
 const MAX_BACKDROP_SNAPSHOTS: usize = 4;
@@ -704,14 +704,63 @@ impl<'a> SvgWriter<'a> {
     /// affine in the backdrop, evaluating all marks onto the identity tile
     /// lets the caller paint a single `<path>` with `mix-blend-mode` and
     /// apply the object's constant opacity once (ISO 32000-1 §11.6.7).
+    fn emit_collapsed_steps(
+        &mut self,
+        steps: &[zpdf_display_list::TilingBlendStep],
+        identity: &str,
+        css_name: &str,
+        tile_w: f64,
+        tile_h: f64,
+        depth: u8,
+    ) {
+        for step in steps {
+            match step {
+                zpdf_display_list::TilingBlendStep::Segment(seg) => {
+                    let _ = writeln!(
+                        self.out,
+                        "<g style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
+                    );
+                    self.emit_commands(&seg.commands.commands, depth + 1);
+                    self.out.push_str("</g>\n");
+                }
+                zpdf_display_list::TilingBlendStep::OpacityGroup {
+                    alpha,
+                    steps: inner,
+                } => {
+                    let a = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    self.out.push_str("<g opacity=\"");
+                    push_num(&mut self.out, a as f64);
+                    let _ = writeln!(
+                        self.out,
+                        "\" style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
+                    );
+                    self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                    push_num(&mut self.out, tile_w);
+                    self.out.push_str("\" height=\"");
+                    push_num(&mut self.out, tile_h);
+                    let _ = writeln!(self.out, "\" fill=\"{identity}\"/>");
+                    self.emit_collapsed_steps(inner, identity, css_name, tile_w, tile_h, depth);
+                    self.out.push_str("</g>\n");
+                }
+            }
+        }
+    }
+
     fn emit_tiling_pattern_def_collapsed(
         &mut self,
         tiling: &zpdf_display_list::TilingPattern,
-        segments: &[zpdf_display_list::TilingBlendSegment],
+        steps: &[zpdf_display_list::TilingBlendStep],
         mode: BlendMode,
         depth: u8,
     ) -> Option<u32> {
-        if depth >= MAX_MASK_DEPTH || segments.is_empty() {
+        if depth >= MAX_MASK_DEPTH || steps.is_empty() {
             return None;
         }
         let identity = match mode {
@@ -771,16 +820,13 @@ impl<'a> SvgWriter<'a> {
 
         for dj in overlap.dj.clone() {
             for di in overlap.di.clone() {
+                if !zpdf_display_list::TilingBlendStep::any_intersects_period(steps, tiling, di, dj)
+                {
+                    continue;
+                }
                 self.x0 = g.bx0 - di as f64 * g.x_step;
                 self.y1 = g.by0 + g.abs_y - dj as f64 * g.y_step;
-                for seg in segments {
-                    let _ = writeln!(
-                        self.out,
-                        "<g style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
-                    );
-                    self.emit_commands(&seg.commands.commands, depth + 1);
-                    self.out.push_str("</g>\n");
-                }
+                self.emit_collapsed_steps(steps, identity, css_name, g.tile_w, g.tile_h, depth);
             }
         }
 
@@ -812,7 +858,7 @@ impl<'a> SvgWriter<'a> {
         depth: u8,
     ) -> Vec<(u32, BlendMode)> {
         if self.tiling_is_backdrop_dependent(tiling) {
-            if let Some(segments) = tiling.blend_segments() {
+            if let Some(steps) = tiling.blend_steps() {
                 let overlap = tiling.overlap_copy_ranges();
                 let overlap_nx = overlap
                     .di
@@ -827,55 +873,84 @@ impl<'a> SvgWriter<'a> {
                     .saturating_add(1)
                     .max(0) as usize;
                 let overlap_count = overlap_nx.saturating_mul(overlap_ny);
+                let total_segs = zpdf_display_list::TilingBlendStep::count_segments(&steps);
+                let has_opacity_group = steps
+                    .iter()
+                    .any(|s| matches!(s, zpdf_display_list::TilingBlendStep::OpacityGroup { .. }));
 
-                let uniform_assoc = segments.first().map(|s| s.blend_mode).filter(|&m| {
-                    matches!(m, BlendMode::Multiply | BlendMode::Screen)
-                        && segments.iter().all(|s| s.blend_mode == m)
-                });
-                if (segments.len() > 1 || overlap_count > 1) && self.opaque_backdrop(depth) {
+                let uniform_assoc = zpdf_display_list::TilingBlendStep::uniform_blend_mode(&steps)
+                    .filter(|&m| matches!(m, BlendMode::Multiply | BlendMode::Screen));
+                if (total_segs > 1 || overlap_count > 1 || has_opacity_group)
+                    && self.opaque_backdrop(depth)
+                {
                     if let Some(mode) = uniform_assoc {
                         if let Some(id) =
-                            self.emit_tiling_pattern_def_collapsed(tiling, &segments, mode, depth)
+                            self.emit_tiling_pattern_def_collapsed(tiling, &steps, mode, depth)
                         {
                             return vec![(id, mode)];
                         }
                     }
                 }
 
-                let separate_copies = overlap_count > 1
-                    && overlap_count.saturating_mul(segments.len()) <= MAX_SVG_TILING_BLEND_PASSES;
-
-                let mut passes = Vec::new();
-                if separate_copies {
-                    for dj in overlap.dj.clone() {
-                        for di in overlap.di.clone() {
-                            for (seg_idx, seg) in segments.iter().enumerate() {
-                                if let Some(id) = self.emit_tiling_pattern_def_for(
-                                    tiling,
-                                    &seg.commands,
-                                    seg_idx + 1,
-                                    Some((di, dj)),
-                                    depth,
-                                ) {
-                                    passes.push((id, seg.blend_mode));
-                                }
-                            }
+                // Collect flat segments when there are no nested OpacityGroups.
+                let mut flat_segments = Vec::with_capacity(total_segs);
+                let mut all_flat = true;
+                for step in &steps {
+                    match step {
+                        zpdf_display_list::TilingBlendStep::Segment(seg) => {
+                            flat_segments.push(seg);
                         }
-                    }
-                } else {
-                    for (seg_idx, seg) in segments.iter().enumerate() {
-                        if let Some(id) = self.emit_tiling_pattern_def_for(
-                            tiling,
-                            &seg.commands,
-                            seg_idx + 1,
-                            None,
-                            depth,
-                        ) {
-                            passes.push((id, seg.blend_mode));
+                        zpdf_display_list::TilingBlendStep::OpacityGroup { .. } => {
+                            all_flat = false;
+                            break;
                         }
                     }
                 }
-                return passes;
+                if all_flat {
+                    let mut passes = Vec::new();
+                    let mut remaining = MAX_SVG_TILING_BLEND_PASSES;
+                    if overlap_count > 1 {
+                        'copies: for dj in overlap.dj.clone() {
+                            for di in overlap.di.clone() {
+                                for seg in &flat_segments {
+                                    if remaining == 0 {
+                                        break 'copies;
+                                    }
+                                    if !seg.intersects_period(tiling, di, dj) {
+                                        continue;
+                                    }
+                                    remaining -= 1;
+                                    if let Some(id) = self.emit_tiling_pattern_def_for(
+                                        tiling,
+                                        &seg.commands,
+                                        seg.segment_id,
+                                        Some((di, dj)),
+                                        depth,
+                                    ) {
+                                        passes.push((id, seg.blend_mode));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for seg in &flat_segments {
+                            if remaining == 0 {
+                                break;
+                            }
+                            remaining -= 1;
+                            if let Some(id) = self.emit_tiling_pattern_def_for(
+                                tiling,
+                                &seg.commands,
+                                seg.segment_id,
+                                None,
+                                depth,
+                            ) {
+                                passes.push((id, seg.blend_mode));
+                            }
+                        }
+                    }
+                    return passes;
+                }
             }
             tracing::warn!(
                 "svg tiling pattern has unsegmentable backdrop-dependent marks; falling back to isolated pattern"
@@ -3093,5 +3168,99 @@ mod tests {
             "mixed Normal+Multiply stroke at 50% over white must be ~[128,128,128] (not [128,64,64]), got {stroke_px:?}"
         );
         assert_eq!(px(50, 30), [255, 255, 255], "unpainted gap stays white");
+    }
+
+    #[test]
+    fn tiling_pattern_overlapping_above_64_passes_preserves_both_copies_in_svg() {
+        // 2 overlapping copies × 33 mixed segments = 66 > 64:
+        //  - 1 spanning 50%-gray Multiply mark across [0..16]×[0..4] (covered twice -> ~64 on white)
+        //  - 32 alternating Normal/Multiply marks in a separate strip [0..8]×[4..8]
+        //    so the cell is non-uniform (exercises the per-copy path, not uniform-Multiply collapse).
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 16.0, 8.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 16.0, 8.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 16.0, 4.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        for k in 0..16 {
+            let x0 = (k % 4) as f64 * 2.0;
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(x0, 4.0, x0 + 2.0, 8.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.8, 0.9, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 16.0, 8.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(x0, 4.0, x0 + 2.0, 8.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.9, 0.8)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 16.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+        assert_eq!(tiling.blend_segments().unwrap().len(), 33);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 64.0, 32.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 64.0, 32.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(64, 32).expect("pixmap");
+        let sx = 64.0 / tree.size().width();
+        let sy = 32.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        // Interior pixel in spanning strip y_pdf=2 -> svg_y = 32 - 2 = 30, x=28.
+        let p = pixmap.pixel(28, 30).expect("in bounds");
+        let rgb = [p.red(), p.green(), p.blue()];
+        assert!(
+            rgb.iter().all(|&c| (58..=70).contains(&c)),
+            "SVG overlapping 2x33 (>64) copies must preserve both 50%-gray Multiply marks (~64, not ~128), got {rgb:?}"
+        );
     }
 }

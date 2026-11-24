@@ -98,6 +98,11 @@ pub enum PageOp {
         /// finished result via `mix(base, group, alpha)` (ISO 32000-1 §11.4.5
         /// / §11.6.7 for `Normal` blend mode).
         non_isolated: bool,
+        /// When true, do not stamp `clips` into the group's own stencil (used
+        /// when `mask` already incorporates the active clip stack so clip AA
+        /// edges are applied once on `PopBlend`, not once per inner blend pass).
+        /// `clips` are still re-stamped into the parent layer on `PopBlend`.
+        unclipped_group: bool,
     },
     /// End the current group: composite it onto the parent with `mode` (carried by
     /// the matching PushBlend), then re-stamp `clips` into the resulting layer.
@@ -201,6 +206,13 @@ impl SyntheticTile {
 }
 
 /// Accumulates geometry + ops for one page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlendFrameKind {
+    Real,
+    Passthrough,
+    Skipped,
+}
+
 #[derive(Default)]
 pub struct PageRecorder {
     pub vertices: Vec<SolidVertex>,
@@ -238,6 +250,9 @@ pub struct PageRecorder {
     /// Groups omitted after reaching the depth cap. Matching pops consume this
     /// counter instead of closing a real outer group.
     skipped_blend_depth: usize,
+    /// LIFO kind of every currently open `PushBlendGroup` frame so passthrough,
+    /// skipped, and real GPU blend layers pop in exact nesting order.
+    blend_frames: Vec<BlendFrameKind>,
     /// Shared by the page and every soft-mask sub-list; never saved/restored
     /// with the local clip/blend state in `record_subops`.
     limits: ParseLimits,
@@ -754,6 +769,7 @@ impl PageRecorder {
                 );
             }
             self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            self.blend_frames.push(BlendFrameKind::Skipped);
             return;
         }
         let clips = self.active_clips();
@@ -764,16 +780,25 @@ impl PageRecorder {
             mask,
             overprint: None,
             non_isolated: false,
+            unclipped_group: false,
         });
         self.blend_depth += 1;
+        self.blend_frames.push(BlendFrameKind::Real);
     }
 
-    /// Begin a non-isolated constant-opacity group (ISO 32000-1 §11.4.5 /
-    /// §11.6.7): the group layer is initialized with a copy of the live parent
-    /// backdrop so blend modes / overprint inside evaluate against the real
-    /// destination, and `PopBlend` applies `alpha` ONCE to the finished group
-    /// result via `mix(base, group, alpha)`.
-    pub fn push_non_isolated_opacity(&mut self, alpha: f32) {
+    /// Record a passthrough non-isolated group (`Normal`, `alpha == 1`, no mask,
+    /// no knockout): draws straight onto the active layer at zero layer cost
+    /// while keeping `pop_blend()` balanced.
+    pub fn push_passthrough_blend(&mut self) {
+        self.blend_frames.push(BlendFrameKind::Passthrough);
+    }
+
+    /// Begin a non-isolated `Normal` group with constant `alpha` and optional
+    /// soft `mask` (ISO 32000-1 §11.4.5 / §11.6.7): the group layer starts from
+    /// a copy of the live parent backdrop so blend modes / overprint inside
+    /// evaluate against the real destination, and `PopBlend` applies `alpha`
+    /// (and `mask` coverage when present) ONCE via `mix(base, group, alpha * cov)`.
+    pub fn push_non_isolated(&mut self, alpha: f32, mask: Option<MaskOps>) {
         if !self.can_push_blend() {
             if self.skipped_blend_depth == 0 {
                 tracing::warn!(
@@ -782,6 +807,7 @@ impl PageRecorder {
                 );
             }
             self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            self.blend_frames.push(BlendFrameKind::Skipped);
             return;
         }
         let clips = self.active_clips();
@@ -789,11 +815,55 @@ impl PageRecorder {
             mode: BlendMode::Normal,
             alpha,
             clips,
-            mask: None,
+            mask,
             overprint: None,
             non_isolated: true,
+            unclipped_group: false,
         });
         self.blend_depth += 1;
+        self.blend_frames.push(BlendFrameKind::Real);
+    }
+
+    /// Begin a non-isolated constant-opacity group (no soft mask).
+    pub fn push_non_isolated_opacity(&mut self, alpha: f32) {
+        self.push_non_isolated(alpha, None);
+    }
+
+    /// Evaluate `body` inside an unclipped non-isolated `Normal` group seeded
+    /// from the live backdrop, then merge back into the parent ONCE via
+    /// `mix(parent, group, alpha * shape_mask_cov)` and restore the parent's
+    /// active clip stack. Because `shape_mask` already incorporates the active
+    /// clip stack (recorded via [`Self::record_subops_clipped`]), suppressing
+    /// clips inside the group guarantees that anti-aliased clip edges (such as
+    /// glyph clips) are never multiplied across multiple pattern segments.
+    pub fn with_non_isolated_shape_mask(
+        &mut self,
+        alpha: f32,
+        shape_mask: MaskOps,
+        body: impl FnOnce(&mut Self),
+    ) {
+        if !self.can_push_blend() {
+            body(self);
+            return;
+        }
+        let clips = self.active_clips();
+        self.ops.push(PageOp::PushBlend {
+            mode: BlendMode::Normal,
+            alpha,
+            clips,
+            mask: Some(shape_mask),
+            overprint: None,
+            non_isolated: true,
+            unclipped_group: true,
+        });
+        self.blend_depth += 1;
+        self.blend_frames.push(BlendFrameKind::Real);
+        let saved_stack = std::mem::take(&mut self.clip_stack);
+        let saved_depth = std::mem::replace(&mut self.clip_depth, 0);
+        body(self);
+        self.clip_stack = saved_stack;
+        self.clip_depth = saved_depth;
+        self.pop_blend();
     }
 
     /// Begin an overprint group (PDF 8.6.7): the next recorded draw renders into
@@ -808,6 +878,7 @@ impl PageRecorder {
                 );
             }
             self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            self.blend_frames.push(BlendFrameKind::Skipped);
             return;
         }
         let clips = self.active_clips();
@@ -818,8 +889,45 @@ impl PageRecorder {
             mask: None,
             overprint: Some(op),
             non_isolated: false,
+            unclipped_group: false,
         });
         self.blend_depth += 1;
+        self.blend_frames.push(BlendFrameKind::Real);
+    }
+
+    /// Record a sub-sequence into the shared arena with the caller's current
+    /// clip stack stamped up front (used to build a single-pass shape+clip AA
+    /// coverage mask for backdrop-dependent tiling patterns).
+    pub fn record_subops_clipped(&mut self, f: impl FnOnce(&mut Self)) -> Vec<PageOp> {
+        let nested_offset = self
+            .blend_depth_offset
+            .saturating_add(self.blend_depth)
+            .saturating_add(1);
+        let saved_ops = std::mem::take(&mut self.ops);
+        let saved_stack = self.clip_stack.clone();
+        let saved_depth = self.clip_depth;
+        let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
+        let saved_blend_offset = std::mem::replace(&mut self.blend_depth_offset, nested_offset);
+        let saved_skipped_blend_depth = std::mem::replace(&mut self.skipped_blend_depth, 0);
+        let saved_blend_frames = std::mem::take(&mut self.blend_frames);
+        for entry in &self.clip_stack {
+            if let Some(range) = entry.range {
+                self.ops.push(PageOp::StampClip {
+                    range,
+                    ref_value: entry.ref_value,
+                });
+            }
+        }
+        f(self);
+        self.close_open_blends();
+        let sub = std::mem::replace(&mut self.ops, saved_ops);
+        self.clip_stack = saved_stack;
+        self.clip_depth = saved_depth;
+        self.blend_depth = saved_blend_depth;
+        self.blend_depth_offset = saved_blend_offset;
+        self.skipped_blend_depth = saved_skipped_blend_depth;
+        self.blend_frames = saved_blend_frames;
+        sub
     }
 
     /// Record a sub-sequence (a soft mask's commands) into the SHARED geometry
@@ -838,6 +946,7 @@ impl PageRecorder {
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_blend_offset = std::mem::replace(&mut self.blend_depth_offset, nested_offset);
         let saved_skipped_blend_depth = std::mem::replace(&mut self.skipped_blend_depth, 0);
+        let saved_blend_frames = std::mem::take(&mut self.blend_frames);
         f(self);
         self.close_open_blends();
         let sub = std::mem::replace(&mut self.ops, saved_ops);
@@ -846,23 +955,26 @@ impl PageRecorder {
         self.blend_depth = saved_blend_depth;
         self.blend_depth_offset = saved_blend_offset;
         self.skipped_blend_depth = saved_skipped_blend_depth;
+        self.blend_frames = saved_blend_frames;
         sub
     }
 
     pub fn pop_blend(&mut self) {
-        if self.skipped_blend_depth > 0 {
-            self.skipped_blend_depth -= 1;
-            return;
+        match self.blend_frames.pop() {
+            Some(BlendFrameKind::Passthrough) => {}
+            Some(BlendFrameKind::Skipped) => {
+                self.skipped_blend_depth = self.skipped_blend_depth.saturating_sub(1);
+            }
+            Some(BlendFrameKind::Real) if self.blend_depth > 0 => {
+                self.ops.push(PageOp::PopBlend);
+                self.blend_depth -= 1;
+            }
+            Some(BlendFrameKind::Real) | None => {}
         }
-        if self.blend_depth == 0 {
-            return;
-        }
-        self.ops.push(PageOp::PopBlend);
-        self.blend_depth -= 1;
     }
 
     pub fn close_open_blends(&mut self) {
-        while self.blend_depth > 0 || self.skipped_blend_depth > 0 {
+        while !self.blend_frames.is_empty() {
             self.pop_blend();
         }
     }

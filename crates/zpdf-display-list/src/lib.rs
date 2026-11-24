@@ -208,6 +208,119 @@ pub struct TilingOverlapRanges {
 pub struct TilingBlendSegment {
     pub blend_mode: BlendMode,
     pub commands: std::sync::Arc<DisplayList>,
+    /// Stable 1-based tile cache index unique within the parent
+    /// [`TilingPattern::blend_steps`] plan.
+    pub segment_id: usize,
+    /// Conservative local cell-space bounding box of painted marks in this
+    /// segment (`None` when unbounded/unknown). Used to skip `(di, dj)`
+    /// neighbor copies that cannot touch the fundamental tile period.
+    pub bounds: Option<Rect>,
+}
+
+impl TilingBlendSegment {
+    /// True when this segment shifted by `(di * x_step, dj * y_step)` can touch
+    /// `tiling`'s fundamental period `[bx0, bx0 + |x_step|] × [by0, by0 + |y_step|]`.
+    pub fn intersects_period(&self, tiling: &TilingPattern, di: i64, dj: i64) -> bool {
+        let Some(b) = self.bounds else {
+            return true;
+        };
+        let bbox = tiling.bbox.normalize();
+        let abs_x = tiling.x_step.abs();
+        let abs_y = tiling.y_step.abs();
+        if ![
+            bbox.x0,
+            bbox.y0,
+            abs_x,
+            abs_y,
+            b.x0,
+            b.y0,
+            b.x1,
+            b.y1,
+            tiling.x_step,
+            tiling.y_step,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        {
+            return true;
+        }
+        let dx = di as f64 * tiling.x_step;
+        let dy = dj as f64 * tiling.y_step;
+        let eps = 1e-6;
+        let sx0 = b.x0 + dx;
+        let sx1 = b.x1 + dx;
+        let sy0 = b.y0 + dy;
+        let sy1 = b.y1 + dy;
+        sx1 > bbox.x0 - eps
+            && sx0 < bbox.x0 + abs_x + eps
+            && sy1 > bbox.y0 - eps
+            && sy0 < bbox.y0 + abs_y + eps
+    }
+}
+
+/// One step in a decomposed backdrop-dependent [`TilingPattern`] plan.
+#[derive(Debug, Clone)]
+pub enum TilingBlendStep {
+    /// Rasterize a single blend-mode slice into a period tile and composite it
+    /// against the live destination with `blend_mode`.
+    Segment(TilingBlendSegment),
+    /// Evaluate `steps` at full outer opacity (`1.0`) against a copy of the
+    /// live destination backdrop, then mix the finished result back into the
+    /// destination with constant `alpha` (ISO 32000-1 §11.4.5 / §11.6.7).
+    OpacityGroup {
+        alpha: f32,
+        steps: Vec<TilingBlendStep>,
+    },
+}
+
+impl TilingBlendStep {
+    /// Total number of leaf [`TilingBlendSegment`]s in `steps`.
+    pub fn count_segments(steps: &[Self]) -> usize {
+        steps
+            .iter()
+            .map(|s| match s {
+                Self::Segment(_) => 1,
+                Self::OpacityGroup { steps, .. } => Self::count_segments(steps),
+            })
+            .sum()
+    }
+
+    /// True when at least one leaf segment in `steps` can touch `tiling`'s
+    /// fundamental period under neighbor shift `(di, dj)`.
+    pub fn any_intersects_period(steps: &[Self], tiling: &TilingPattern, di: i64, dj: i64) -> bool {
+        steps.iter().any(|s| match s {
+            Self::Segment(seg) => seg.intersects_period(tiling, di, dj),
+            Self::OpacityGroup { steps, .. } => Self::any_intersects_period(steps, tiling, di, dj),
+        })
+    }
+
+    /// If every leaf segment in `steps` shares the same [`BlendMode`] and there
+    /// is at least one segment, return that mode.
+    pub fn uniform_blend_mode(steps: &[Self]) -> Option<BlendMode> {
+        let mut mode: Option<BlendMode> = None;
+        fn visit(steps: &[TilingBlendStep], mode: &mut Option<BlendMode>) -> bool {
+            for s in steps {
+                match s {
+                    TilingBlendStep::Segment(seg) => match *mode {
+                        None => *mode = Some(seg.blend_mode),
+                        Some(m) if m == seg.blend_mode => {}
+                        Some(_) => return false,
+                    },
+                    TilingBlendStep::OpacityGroup { steps, .. } => {
+                        if !visit(steps, mode) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        if visit(steps, &mut mode) {
+            mode
+        } else {
+            None
+        }
+    }
 }
 
 /// A PDF tiling pattern (ISO 32000-1 §8.7.3): the single cell's content
@@ -239,125 +352,7 @@ impl TilingPattern {
     /// primitive paints inside `bbox`, or falls back to `bbox` when any
     /// command's bounds require external font metrics (e.g. `DrawGlyphRun`).
     pub fn ink_bounds(&self) -> Option<Rect> {
-        let bbox = self.bbox.normalize();
-        if ![bbox.x0, bbox.y0, bbox.x1, bbox.y1]
-            .iter()
-            .all(|v| v.is_finite())
-            || bbox.width() <= 0.0
-            || bbox.height() <= 0.0
-        {
-            return None;
-        }
-        let mut has_ink = false;
-        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
-        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-
-        let mut include_rect = |rx0: f64, ry0: f64, rx1: f64, ry1: f64| -> bool {
-            if ![rx0, ry0, rx1, ry1].iter().all(|v| v.is_finite()) {
-                return false;
-            }
-            has_ink = true;
-            x0 = x0.min(rx0);
-            y0 = y0.min(ry0);
-            x1 = x1.max(rx1);
-            y1 = y1.max(ry1);
-            true
-        };
-
-        let path_rect = |path: &Path| -> Option<(f64, f64, f64, f64)> {
-            let mut any = false;
-            let (mut px0, mut py0) = (f64::INFINITY, f64::INFINITY);
-            let (mut px1, mut py1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-            let mut add = |p: zpdf_core::Point| {
-                any = true;
-                px0 = px0.min(p.x);
-                py0 = py0.min(p.y);
-                px1 = px1.max(p.x);
-                py1 = py1.max(p.y);
-            };
-            for elem in path {
-                match elem {
-                    PathElement::MoveTo(p) | PathElement::LineTo(p) => add(p),
-                    PathElement::CurveTo(c1, c2, end) => {
-                        add(c1);
-                        add(c2);
-                        add(end);
-                    }
-                    PathElement::Close => {}
-                }
-            }
-            any.then_some((px0, py0, px1, py1))
-        };
-
-        for cmd in &self.commands.commands {
-            match cmd {
-                RenderCommand::FillPath { path, .. } => {
-                    if let Some((px0, py0, px1, py1)) = path_rect(path) {
-                        if !include_rect(px0, py0, px1, py1) {
-                            return Some(bbox);
-                        }
-                    }
-                }
-                RenderCommand::StrokePath { path, style, .. } => {
-                    if let Some((px0, py0, px1, py1)) = path_rect(path) {
-                        let pad = if style.width.is_finite() && style.width > 0.0 {
-                            let w = style.width as f64;
-                            let miter = if style.miter_limit.is_finite() {
-                                (style.miter_limit as f64).clamp(1.0, 100.0)
-                            } else {
-                                10.0
-                            };
-                            (w * 0.5 * miter).max(w)
-                        } else {
-                            // Hairline stroke: pad conservatively.
-                            1.0
-                        };
-                        if !include_rect(px0 - pad, py0 - pad, px1 + pad, py1 + pad) {
-                            return Some(bbox);
-                        }
-                    }
-                }
-                RenderCommand::DrawImage(draw) => {
-                    let corners = [
-                        zpdf_core::Point::new(0.0, 0.0),
-                        zpdf_core::Point::new(1.0, 0.0),
-                        zpdf_core::Point::new(0.0, 1.0),
-                        zpdf_core::Point::new(1.0, 1.0),
-                    ];
-                    let (mut ix0, mut iy0) = (f64::INFINITY, f64::INFINITY);
-                    let (mut ix1, mut iy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-                    for c in &corners {
-                        let p = c.transform(&draw.transform);
-                        ix0 = ix0.min(p.x);
-                        iy0 = iy0.min(p.y);
-                        ix1 = ix1.max(p.x);
-                        iy1 = iy1.max(p.y);
-                    }
-                    if !include_rect(ix0, iy0, ix1, iy1) {
-                        return Some(bbox);
-                    }
-                }
-                // Glyph extents depend on font outlines not stored in DisplayList.
-                RenderCommand::DrawGlyphRun(_) => return Some(bbox),
-                RenderCommand::PushClip { .. }
-                | RenderCommand::PushClipStroke { .. }
-                | RenderCommand::PopClip
-                | RenderCommand::PushBlendGroup { .. }
-                | RenderCommand::PopBlendGroup => {}
-            }
-        }
-
-        if !has_ink {
-            return None;
-        }
-        let ix0 = x0.max(bbox.x0);
-        let iy0 = y0.max(bbox.y0);
-        let ix1 = x1.min(bbox.x1);
-        let iy1 = y1.min(bbox.y1);
-        if ix1 <= ix0 || iy1 <= iy0 {
-            return None;
-        }
-        Some(Rect::new(ix0, iy0, ix1, iy1))
+        commands_ink_bounds(&self.commands.commands, self.bbox)
     }
 
     /// Compute the integer shift ranges `(di, dj)` whose shifted cell copies
@@ -461,86 +456,162 @@ impl TilingPattern {
 
     /// Split a backdrop-dependent cell into sequential top-level blend-mode
     /// slices when every mark can be rasterized into a tile pixmap and
-    /// composited onto the destination with its own [`BlendMode`]. Recursively
-    /// lifts non-overlapping nested backdrop-dependent [`TilingPattern`] paints
-    /// so dense nested `Multiply` (etc.) patterns stay representable. Returns
-    /// `None` when the cell uses active overprint, non-passthrough nested
-    /// backdrop-dependent groups, overlapping nested backdrop-dependent tiling
-    /// patterns, or exceeds the segment cap.
+    /// composited onto the destination with its own [`BlendMode`]. Returns
+    /// `None` when the cell requires a non-isolated [`TilingBlendStep::OpacityGroup`]
+    /// (use [`Self::blend_steps`] to handle those too) or cannot be segmented.
     pub fn blend_segments(&self) -> Option<Vec<TilingBlendSegment>> {
-        let mut memo = std::collections::HashMap::new();
-        self.blend_segments_at(0, &mut memo)
+        let steps = self.blend_steps()?;
+        let mut out = Vec::with_capacity(steps.len());
+        for step in steps {
+            match step {
+                TilingBlendStep::Segment(seg) => out.push(seg),
+                TilingBlendStep::OpacityGroup { .. } => return None,
+            }
+        }
+        Some(out)
     }
 
-    fn blend_segments_at(
+    /// Split a backdrop-dependent cell into sequential [`TilingBlendStep`]s
+    /// (blend-mode slices and non-isolated constant-opacity groups). Recursively
+    /// lifts non-overlapping nested backdrop-dependent [`TilingPattern`] paints
+    /// — including translucent multi-segment inner patterns — and non-isolated
+    /// `Normal` opacity groups so dense cells stay backdrop-aware. Returns
+    /// `None` when the cell uses active overprint, non-passthrough masked
+    /// non-isolated groups, overlapping nested backdrop-dependent tiling
+    /// patterns, or exceeds the segment/depth cap.
+    pub fn blend_steps(&self) -> Option<Vec<TilingBlendStep>> {
+        let mut memo = std::collections::HashMap::new();
+        let mut next_seg_id = 1usize;
+        self.blend_steps_for_slice(&self.commands.commands, &[], 0, &mut memo, &mut next_seg_id)
+    }
+
+    fn blend_steps_for_slice(
         &self,
+        cmds: &[RenderCommand],
+        initial_clips: &[RenderCommand],
         depth: u8,
         memo: &mut std::collections::HashMap<(usize, u8), bool>,
-    ) -> Option<Vec<TilingBlendSegment>> {
-        const MAX_SEGMENTS: usize = 64;
+        next_seg_id: &mut usize,
+    ) -> Option<Vec<TilingBlendStep>> {
+        const MAX_SEGMENTS: usize = 256;
         if depth > MAX_TILING_BACKDROP_SCAN_DEPTH {
             return None;
         }
-        let cmds = &self.commands.commands;
         let page_rect = self.commands.page_rect;
-        let mut segments: Vec<TilingBlendSegment> = Vec::new();
-        let mut clip_stack: Vec<RenderCommand> = Vec::new();
+        let bbox = self.bbox;
+        let mut steps: Vec<TilingBlendStep> = Vec::new();
+        let mut clip_stack: Vec<RenderCommand> = initial_clips.to_vec();
         let mut cur_normal: Vec<RenderCommand> = Vec::new();
         let mut passthrough_pops: Vec<usize> = Vec::new();
 
+        let make_segment = |blend_mode: BlendMode,
+                            seg_cmds: Vec<RenderCommand>,
+                            next_seg_id: &mut usize|
+         -> Option<TilingBlendSegment> {
+            if *next_seg_id > MAX_SEGMENTS {
+                return None;
+            }
+            let segment_id = *next_seg_id;
+            *next_seg_id += 1;
+            let bounds = commands_ink_bounds(&seg_cmds, bbox);
+            let mut dl = DisplayList::new(page_rect);
+            dl.commands = seg_cmds;
+            Some(TilingBlendSegment {
+                blend_mode,
+                commands: std::sync::Arc::new(dl),
+                segment_id,
+                bounds,
+            })
+        };
+
         let flush_normal = |cur_normal: &mut Vec<RenderCommand>,
                             clip_stack: &[RenderCommand],
-                            segments: &mut Vec<TilingBlendSegment>|
+                            steps: &mut Vec<TilingBlendStep>,
+                            next_seg_id: &mut usize|
          -> Option<()> {
             if cur_normal.is_empty() {
                 return Some(());
             }
-            if segments.len() >= MAX_SEGMENTS {
-                return None;
-            }
             for _ in 0..clip_stack.len() {
                 cur_normal.push(RenderCommand::PopClip);
             }
-            let mut dl = DisplayList::new(page_rect);
-            dl.commands = std::mem::take(cur_normal);
-            segments.push(TilingBlendSegment {
-                blend_mode: BlendMode::Normal,
-                commands: std::sync::Arc::new(dl),
-            });
+            let seg = make_segment(BlendMode::Normal, std::mem::take(cur_normal), next_seg_id)?;
+            steps.push(TilingBlendStep::Segment(seg));
             Some(())
         };
 
-        let emit_lifted_cmd = |blend_mode: BlendMode,
-                               cmd: RenderCommand,
-                               cur_normal: &mut Vec<RenderCommand>,
-                               clip_stack: &[RenderCommand],
-                               segments: &mut Vec<TilingBlendSegment>|
-         -> Option<()> {
-            if blend_mode == BlendMode::Normal {
-                if cur_normal.is_empty() {
-                    cur_normal.extend(clip_stack.iter().cloned());
-                }
-                cur_normal.push(cmd);
-                return Some(());
-            }
-            flush_normal(cur_normal, clip_stack, segments)?;
-            if segments.len() >= MAX_SEGMENTS {
-                return None;
-            }
+        let wrap_cmd_in_clips = |cmd: RenderCommand, clip_stack: &[RenderCommand]| {
             let mut seg_cmds = Vec::with_capacity(clip_stack.len() * 2 + 1);
             seg_cmds.extend(clip_stack.iter().cloned());
             seg_cmds.push(cmd);
             for _ in 0..clip_stack.len() {
                 seg_cmds.push(RenderCommand::PopClip);
             }
-            let mut dl = DisplayList::new(page_rect);
-            dl.commands = seg_cmds;
-            segments.push(TilingBlendSegment {
-                blend_mode,
-                commands: std::sync::Arc::new(dl),
-            });
-            Some(())
+            seg_cmds
         };
+
+        #[allow(clippy::too_many_arguments)]
+        fn lift_inner_steps<F>(
+            inner: &TilingPattern,
+            inner_steps: Vec<TilingBlendStep>,
+            leaf_alpha: f32,
+            clip_stack: &[RenderCommand],
+            page_rect: Rect,
+            bbox: Rect,
+            next_seg_id: &mut usize,
+            build_cmd: &F,
+        ) -> Option<Vec<TilingBlendStep>>
+        where
+            F: Fn(std::sync::Arc<TilingPattern>, f32) -> RenderCommand,
+        {
+            let mut out = Vec::with_capacity(inner_steps.len());
+            for step in inner_steps {
+                match step {
+                    TilingBlendStep::Segment(seg) => {
+                        if *next_seg_id > MAX_SEGMENTS {
+                            return None;
+                        }
+                        let segment_id = *next_seg_id;
+                        *next_seg_id += 1;
+                        let mut lifted = inner.clone();
+                        lifted.commands = seg.commands;
+                        let cmd = build_cmd(std::sync::Arc::new(lifted), leaf_alpha);
+                        let mut seg_cmds = Vec::with_capacity(clip_stack.len() * 2 + 1);
+                        seg_cmds.extend(clip_stack.iter().cloned());
+                        seg_cmds.push(cmd);
+                        for _ in 0..clip_stack.len() {
+                            seg_cmds.push(RenderCommand::PopClip);
+                        }
+                        let bounds = commands_ink_bounds(&seg_cmds, bbox);
+                        let mut dl = DisplayList::new(page_rect);
+                        dl.commands = seg_cmds;
+                        out.push(TilingBlendStep::Segment(TilingBlendSegment {
+                            blend_mode: seg.blend_mode,
+                            commands: std::sync::Arc::new(dl),
+                            segment_id,
+                            bounds,
+                        }));
+                    }
+                    TilingBlendStep::OpacityGroup { alpha, steps } => {
+                        let lifted_children = lift_inner_steps(
+                            inner,
+                            steps,
+                            1.0,
+                            clip_stack,
+                            page_rect,
+                            bbox,
+                            next_seg_id,
+                            build_cmd,
+                        )?;
+                        out.push(TilingBlendStep::OpacityGroup {
+                            alpha,
+                            steps: lifted_children,
+                        });
+                    }
+                }
+            }
+            Some(out)
+        }
 
         let mut idx = 0usize;
         while idx < cmds.len() {
@@ -582,26 +653,87 @@ impl TilingPattern {
                             {
                                 return None;
                             }
-                            let inner_segs = inner.blend_segments_at(depth + 1, memo)?;
-                            if inner_segs.len() > 1 && *alpha < 1.0 {
-                                return None;
-                            }
-                            for seg in inner_segs {
-                                let mut lifted = (**inner).clone();
-                                lifted.commands = seg.commands;
-                                emit_lifted_cmd(
-                                    seg.blend_mode,
-                                    RenderCommand::FillPath {
-                                        path: path.clone(),
-                                        rule: *rule,
-                                        paint: Paint::Tiling(std::sync::Arc::new(lifted)),
-                                        alpha: *alpha,
-                                        overprint: *overprint,
-                                    },
+                            let mut inner_seg_id = 1usize;
+                            let inner_steps = inner.blend_steps_for_slice(
+                                &inner.commands.commands,
+                                &[],
+                                depth + 1,
+                                memo,
+                                &mut inner_seg_id,
+                            )?;
+                            let needs_opacity_group = *alpha < 1.0
+                                && (inner_steps.len() > 1
+                                    || matches!(
+                                        inner_steps.first(),
+                                        Some(TilingBlendStep::OpacityGroup { .. })
+                                    ));
+                            let leaf_alpha = if needs_opacity_group { 1.0 } else { *alpha };
+                            let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
+                                RenderCommand::FillPath {
+                                    path: path.clone(),
+                                    rule: *rule,
+                                    paint: Paint::Tiling(pat),
+                                    alpha: a,
+                                    overprint: *overprint,
+                                }
+                            };
+                            if needs_opacity_group {
+                                flush_normal(
                                     &mut cur_normal,
                                     &clip_stack,
-                                    &mut segments,
+                                    &mut steps,
+                                    next_seg_id,
                                 )?;
+                                let lifted = lift_inner_steps(
+                                    inner,
+                                    inner_steps,
+                                    leaf_alpha,
+                                    &clip_stack,
+                                    page_rect,
+                                    bbox,
+                                    next_seg_id,
+                                    &build,
+                                )?;
+                                steps.push(TilingBlendStep::OpacityGroup {
+                                    alpha: *alpha,
+                                    steps: lifted,
+                                });
+                            } else {
+                                let lifted = lift_inner_steps(
+                                    inner,
+                                    inner_steps,
+                                    leaf_alpha,
+                                    &clip_stack,
+                                    page_rect,
+                                    bbox,
+                                    next_seg_id,
+                                    &build,
+                                )?;
+                                for step in lifted {
+                                    match step {
+                                        TilingBlendStep::Segment(seg)
+                                            if seg.blend_mode == BlendMode::Normal =>
+                                        {
+                                            // Keep consecutive Normal work coalesced.
+                                            flush_normal(
+                                                &mut cur_normal,
+                                                &clip_stack,
+                                                &mut steps,
+                                                next_seg_id,
+                                            )?;
+                                            steps.push(TilingBlendStep::Segment(seg));
+                                        }
+                                        other => {
+                                            flush_normal(
+                                                &mut cur_normal,
+                                                &clip_stack,
+                                                &mut steps,
+                                                next_seg_id,
+                                            )?;
+                                            steps.push(other);
+                                        }
+                                    }
+                                }
                             }
                             idx += 1;
                             continue;
@@ -631,26 +763,48 @@ impl TilingPattern {
                             {
                                 return None;
                             }
-                            let inner_segs = inner.blend_segments_at(depth + 1, memo)?;
-                            if inner_segs.len() > 1 && *alpha < 1.0 {
-                                return None;
-                            }
-                            for seg in inner_segs {
-                                let mut lifted = (**inner).clone();
-                                lifted.commands = seg.commands;
-                                emit_lifted_cmd(
-                                    seg.blend_mode,
-                                    RenderCommand::StrokePath {
-                                        path: path.clone(),
-                                        style: style.clone(),
-                                        paint: Paint::Tiling(std::sync::Arc::new(lifted)),
-                                        alpha: *alpha,
-                                        overprint: *overprint,
-                                    },
-                                    &mut cur_normal,
-                                    &clip_stack,
-                                    &mut segments,
-                                )?;
+                            let mut inner_seg_id = 1usize;
+                            let inner_steps = inner.blend_steps_for_slice(
+                                &inner.commands.commands,
+                                &[],
+                                depth + 1,
+                                memo,
+                                &mut inner_seg_id,
+                            )?;
+                            let needs_opacity_group = *alpha < 1.0
+                                && (inner_steps.len() > 1
+                                    || matches!(
+                                        inner_steps.first(),
+                                        Some(TilingBlendStep::OpacityGroup { .. })
+                                    ));
+                            let leaf_alpha = if needs_opacity_group { 1.0 } else { *alpha };
+                            let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
+                                RenderCommand::StrokePath {
+                                    path: path.clone(),
+                                    style: style.clone(),
+                                    paint: Paint::Tiling(pat),
+                                    alpha: a,
+                                    overprint: *overprint,
+                                }
+                            };
+                            flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
+                            let lifted = lift_inner_steps(
+                                inner,
+                                inner_steps,
+                                leaf_alpha,
+                                &clip_stack,
+                                page_rect,
+                                bbox,
+                                next_seg_id,
+                                &build,
+                            )?;
+                            if needs_opacity_group {
+                                steps.push(TilingBlendStep::OpacityGroup {
+                                    alpha: *alpha,
+                                    steps: lifted,
+                                });
+                            } else {
+                                steps.extend(lifted);
                             }
                             idx += 1;
                             continue;
@@ -674,22 +828,45 @@ impl TilingPattern {
                             {
                                 return None;
                             }
-                            let inner_segs = inner.blend_segments_at(depth + 1, memo)?;
-                            if inner_segs.len() > 1 && run.alpha < 1.0 {
-                                return None;
-                            }
-                            for seg in inner_segs {
-                                let mut lifted = (**inner).clone();
-                                lifted.commands = seg.commands;
+                            let mut inner_seg_id = 1usize;
+                            let inner_steps = inner.blend_steps_for_slice(
+                                &inner.commands.commands,
+                                &[],
+                                depth + 1,
+                                memo,
+                                &mut inner_seg_id,
+                            )?;
+                            let needs_opacity_group = run.alpha < 1.0
+                                && (inner_steps.len() > 1
+                                    || matches!(
+                                        inner_steps.first(),
+                                        Some(TilingBlendStep::OpacityGroup { .. })
+                                    ));
+                            let leaf_alpha = if needs_opacity_group { 1.0 } else { run.alpha };
+                            let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
                                 let mut lifted_run = run.clone();
-                                lifted_run.paint = Paint::Tiling(std::sync::Arc::new(lifted));
-                                emit_lifted_cmd(
-                                    seg.blend_mode,
-                                    RenderCommand::DrawGlyphRun(lifted_run),
-                                    &mut cur_normal,
-                                    &clip_stack,
-                                    &mut segments,
-                                )?;
+                                lifted_run.paint = Paint::Tiling(pat);
+                                lifted_run.alpha = a;
+                                RenderCommand::DrawGlyphRun(lifted_run)
+                            };
+                            flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
+                            let lifted = lift_inner_steps(
+                                inner,
+                                inner_steps,
+                                leaf_alpha,
+                                &clip_stack,
+                                page_rect,
+                                bbox,
+                                next_seg_id,
+                                &build,
+                            )?;
+                            if needs_opacity_group {
+                                steps.push(TilingBlendStep::OpacityGroup {
+                                    alpha: run.alpha,
+                                    steps: lifted,
+                                });
+                            } else {
+                                steps.extend(lifted);
                             }
                             idx += 1;
                             continue;
@@ -730,6 +907,22 @@ impl TilingPattern {
                             // Passthrough non-isolated group: flatten into outer stream.
                             passthrough_pops.push(end);
                             idx += 1;
+                        } else if !*knockout && mask.is_none() {
+                            // Non-isolated constant-opacity group: keep live backdrop
+                            // across its decomposed steps and apply `alpha` once.
+                            flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
+                            let inner_steps = self.blend_steps_for_slice(
+                                inner,
+                                &clip_stack,
+                                depth + 1,
+                                memo,
+                                next_seg_id,
+                            )?;
+                            steps.push(TilingBlendStep::OpacityGroup {
+                                alpha: *alpha,
+                                steps: inner_steps,
+                            });
+                            idx = end + 1;
                         } else {
                             return None;
                         }
@@ -737,16 +930,12 @@ impl TilingPattern {
                         if !*isolated && inner_backdrop {
                             return None;
                         }
-                        flush_normal(&mut cur_normal, &clip_stack, &mut segments)?;
-                        if segments.len() >= MAX_SEGMENTS {
-                            return None;
-                        }
-                        let mut seg_cmds =
-                            Vec::with_capacity(clip_stack.len() * 2 + inner.len() + 2);
-                        seg_cmds.extend(clip_stack.iter().cloned());
+                        flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
                         let needs_wrapper = *alpha < 1.0 || mask.is_some() || *knockout;
-                        if needs_wrapper {
-                            seg_cmds.push(RenderCommand::PushBlendGroup {
+                        let seg_cmds = if needs_wrapper {
+                            let mut v = Vec::with_capacity(clip_stack.len() * 2 + inner.len() + 2);
+                            v.extend(clip_stack.iter().cloned());
+                            v.push(RenderCommand::PushBlendGroup {
                                 blend_mode: BlendMode::Normal,
                                 isolated: true,
                                 knockout: *knockout,
@@ -754,20 +943,25 @@ impl TilingPattern {
                                 alpha: *alpha,
                                 mask: mask.clone(),
                             });
-                        }
-                        seg_cmds.extend(inner.iter().cloned());
-                        if needs_wrapper {
-                            seg_cmds.push(RenderCommand::PopBlendGroup);
-                        }
-                        for _ in 0..clip_stack.len() {
-                            seg_cmds.push(RenderCommand::PopClip);
-                        }
-                        let mut dl = DisplayList::new(page_rect);
-                        dl.commands = seg_cmds;
-                        segments.push(TilingBlendSegment {
-                            blend_mode: *blend_mode,
-                            commands: std::sync::Arc::new(dl),
-                        });
+                            v.extend(inner.iter().cloned());
+                            v.push(RenderCommand::PopBlendGroup);
+                            for _ in 0..clip_stack.len() {
+                                v.push(RenderCommand::PopClip);
+                            }
+                            v
+                        } else if inner.len() == 1 {
+                            wrap_cmd_in_clips(inner[0].clone(), &clip_stack)
+                        } else {
+                            let mut v = Vec::with_capacity(clip_stack.len() * 2 + inner.len());
+                            v.extend(clip_stack.iter().cloned());
+                            v.extend(inner.iter().cloned());
+                            for _ in 0..clip_stack.len() {
+                                v.push(RenderCommand::PopClip);
+                            }
+                            v
+                        };
+                        let seg = make_segment(*blend_mode, seg_cmds, next_seg_id)?;
+                        steps.push(TilingBlendStep::Segment(seg));
                         idx = end + 1;
                     }
                 }
@@ -776,9 +970,129 @@ impl TilingPattern {
                 }
             }
         }
-        flush_normal(&mut cur_normal, &clip_stack, &mut segments)?;
-        Some(segments)
+        flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
+        Some(steps)
     }
+}
+
+fn commands_ink_bounds(cmds: &[RenderCommand], bbox: Rect) -> Option<Rect> {
+    let bbox = bbox.normalize();
+    if ![bbox.x0, bbox.y0, bbox.x1, bbox.y1]
+        .iter()
+        .all(|v| v.is_finite())
+        || bbox.width() <= 0.0
+        || bbox.height() <= 0.0
+    {
+        return None;
+    }
+    let mut has_ink = false;
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+
+    let mut include_rect = |rx0: f64, ry0: f64, rx1: f64, ry1: f64| -> bool {
+        if ![rx0, ry0, rx1, ry1].iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        has_ink = true;
+        x0 = x0.min(rx0);
+        y0 = y0.min(ry0);
+        x1 = x1.max(rx1);
+        y1 = y1.max(ry1);
+        true
+    };
+
+    let path_rect = |path: &Path| -> Option<(f64, f64, f64, f64)> {
+        let mut any = false;
+        let (mut px0, mut py0) = (f64::INFINITY, f64::INFINITY);
+        let (mut px1, mut py1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut add = |p: zpdf_core::Point| {
+            any = true;
+            px0 = px0.min(p.x);
+            py0 = py0.min(p.y);
+            px1 = px1.max(p.x);
+            py1 = py1.max(p.y);
+        };
+        for elem in path {
+            match elem {
+                PathElement::MoveTo(p) | PathElement::LineTo(p) => add(p),
+                PathElement::CurveTo(c1, c2, end) => {
+                    add(c1);
+                    add(c2);
+                    add(end);
+                }
+                PathElement::Close => {}
+            }
+        }
+        any.then_some((px0, py0, px1, py1))
+    };
+
+    for cmd in cmds {
+        match cmd {
+            RenderCommand::FillPath { path, .. } => {
+                if let Some((px0, py0, px1, py1)) = path_rect(path) {
+                    if !include_rect(px0, py0, px1, py1) {
+                        return Some(bbox);
+                    }
+                }
+            }
+            RenderCommand::StrokePath { path, style, .. } => {
+                if let Some((px0, py0, px1, py1)) = path_rect(path) {
+                    let pad = if style.width.is_finite() && style.width > 0.0 {
+                        let w = style.width as f64;
+                        let miter = if style.miter_limit.is_finite() {
+                            (style.miter_limit as f64).clamp(1.0, 100.0)
+                        } else {
+                            10.0
+                        };
+                        (w * 0.5 * miter).max(w)
+                    } else {
+                        1.0
+                    };
+                    if !include_rect(px0 - pad, py0 - pad, px1 + pad, py1 + pad) {
+                        return Some(bbox);
+                    }
+                }
+            }
+            RenderCommand::DrawImage(draw) => {
+                let corners = [
+                    zpdf_core::Point::new(0.0, 0.0),
+                    zpdf_core::Point::new(1.0, 0.0),
+                    zpdf_core::Point::new(0.0, 1.0),
+                    zpdf_core::Point::new(1.0, 1.0),
+                ];
+                let (mut ix0, mut iy0) = (f64::INFINITY, f64::INFINITY);
+                let (mut ix1, mut iy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for c in &corners {
+                    let p = c.transform(&draw.transform);
+                    ix0 = ix0.min(p.x);
+                    iy0 = iy0.min(p.y);
+                    ix1 = ix1.max(p.x);
+                    iy1 = iy1.max(p.y);
+                }
+                if !include_rect(ix0, iy0, ix1, iy1) {
+                    return Some(bbox);
+                }
+            }
+            RenderCommand::DrawGlyphRun(_) => return Some(bbox),
+            RenderCommand::PushClip { .. }
+            | RenderCommand::PushClipStroke { .. }
+            | RenderCommand::PopClip
+            | RenderCommand::PushBlendGroup { .. }
+            | RenderCommand::PopBlendGroup => {}
+        }
+    }
+
+    if !has_ink {
+        return None;
+    }
+    let ix0 = x0.max(bbox.x0);
+    let iy0 = y0.max(bbox.y0);
+    let ix1 = x1.min(bbox.x1);
+    let iy1 = y1.min(bbox.y1);
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return None;
+    }
+    Some(Rect::new(ix0, iy0, ix1, iy1))
 }
 
 fn find_matching_pop_blend(cmds: &[RenderCommand], push_idx: usize) -> Option<usize> {
@@ -1477,5 +1791,110 @@ mod tiling_backdrop_tests {
             tiling_type: outer.tiling_type,
         }
         .is_backdrop_dependent());
+    }
+
+    #[test]
+    fn blend_steps_wraps_translucent_multi_segment_inner_tiling_in_opacity_group() {
+        let mut inner_cmds = Vec::new();
+        for _ in 0..2 {
+            inner_cmds.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            inner_cmds.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            inner_cmds.push(RenderCommand::PopBlendGroup);
+        }
+        let inner = Arc::new(tiling_with(inner_cmds));
+        let outer = tiling_with(vec![RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(inner),
+            alpha: 0.5,
+            overprint: None,
+        }]);
+        let steps = outer
+            .blend_steps()
+            .expect("translucent multi-segment inner Multiply must decompose into OpacityGroup");
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            TilingBlendStep::OpacityGroup { alpha, steps } => {
+                assert!((*alpha - 0.5).abs() < 1e-6);
+                assert_eq!(steps.len(), 2);
+                for s in steps {
+                    assert!(matches!(
+                        s,
+                        TilingBlendStep::Segment(TilingBlendSegment {
+                            blend_mode: BlendMode::Multiply,
+                            ..
+                        })
+                    ));
+                }
+            }
+            other => panic!("expected OpacityGroup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blend_segment_intersects_period_skips_disjoint_neighbor_copy() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 4.0));
+        // Mark 1 spans [0..8] × [0..2] (intersects both di=-1 and di=0).
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 8.0, 4.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 8.0, 2.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+        // Mark 2 occupies only [0..3] × [2..4] (intersects di=0, NOT di=-1).
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 8.0, 4.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 2.0, 3.0, 4.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let pat = TilingPattern {
+            commands: Arc::new(dl),
+            bbox: Rect::new(0.0, 0.0, 8.0, 4.0),
+            x_step: 4.0,
+            y_step: 4.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        };
+        let segs = pat.blend_segments().expect("segments");
+        assert_eq!(segs.len(), 2);
+        assert!(segs[0].intersects_period(&pat, -1, 0));
+        assert!(segs[0].intersects_period(&pat, 0, 0));
+        assert!(!segs[1].intersects_period(&pat, -1, 0));
+        assert!(segs[1].intersects_period(&pat, 0, 0));
     }
 }

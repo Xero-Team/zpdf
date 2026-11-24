@@ -4163,13 +4163,34 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
         if self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some() {
+            // A backdrop-dependent tiling pattern under a Normal-mode outer
+            // soft mask must evaluate against the live page backdrop BEFORE the
+            // object's soft mask is applied (ISO 32000-1 §11.6.7), so open a
+            // non-isolated group instead of isolating from the page backdrop.
+            let non_isolated_tiling = self.current.blend_mode == BlendMode::Normal
+                && self.current.soft_mask.is_some()
+                && match &cmd {
+                    RenderCommand::FillPath {
+                        paint: Paint::Tiling(t),
+                        ..
+                    }
+                    | RenderCommand::StrokePath {
+                        paint: Paint::Tiling(t),
+                        ..
+                    } => t.is_backdrop_dependent(),
+                    RenderCommand::DrawGlyphRun(run) => match &run.paint {
+                        Paint::Tiling(t) => t.is_backdrop_dependent(),
+                        _ => false,
+                    },
+                    _ => false,
+                };
             self.display_list.push(RenderCommand::PushBlendGroup {
                 blend_mode: self.current.blend_mode,
-                // A single object carrying a blend mode / soft mask is equivalent
-                // to an isolated group of one element composited with that mode —
-                // it must NOT pull in the backdrop (which would change a
-                // semi-transparent blended fill).
-                isolated: true,
+                // A single solid/backdrop-independent object carrying a blend
+                // mode or soft mask is equivalent to an isolated group of one
+                // element composited with that mode — it must NOT pull in the
+                // backdrop (which would change a semi-transparent blended fill).
+                isolated: !non_isolated_tiling,
                 knockout: false,
                 bounds: self.display_list.page_rect,
                 alpha: 1.0,

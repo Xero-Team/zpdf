@@ -539,6 +539,8 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             }
             RenderCommand::PushBlendGroup {
                 blend_mode,
+                isolated,
+                knockout,
                 alpha,
                 mask,
                 ..
@@ -553,7 +555,15 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 } else {
                     None
                 };
-                page.recorder.push_blend(*blend_mode, *alpha, mask_ops);
+                if !*isolated && !*knockout && *blend_mode == zpdf_display_list::BlendMode::Normal {
+                    if *alpha >= 1.0 && mask_ops.is_none() {
+                        page.recorder.push_passthrough_blend();
+                    } else {
+                        page.recorder.push_non_isolated(*alpha, mask_ops);
+                    }
+                } else {
+                    page.recorder.push_blend(*blend_mode, *alpha, mask_ops);
+                }
             }
             RenderCommand::PopBlendGroup => {
                 page.recorder.pop_blend();
@@ -1301,6 +1311,8 @@ fn record_dl_commands_at(
             // copying the shared `Arc<DisplayList>`.
             RenderCommand::PushBlendGroup {
                 blend_mode,
+                isolated,
+                knockout,
                 alpha,
                 mask,
                 ..
@@ -1311,7 +1323,15 @@ fn record_dl_commands_at(
                 } else {
                     None
                 };
-                rec.push_blend(*blend_mode, *alpha, sub);
+                if !*isolated && !*knockout && *blend_mode == zpdf_display_list::BlendMode::Normal {
+                    if *alpha >= 1.0 && sub.is_none() {
+                        rec.push_passthrough_blend();
+                    } else {
+                        rec.push_non_isolated(*alpha, sub);
+                    }
+                } else {
+                    rec.push_blend(*blend_mode, *alpha, sub);
+                }
             }
             RenderCommand::PopBlendGroup => rec.pop_blend(),
         }
@@ -1757,11 +1777,12 @@ fn record_tiling_pattern_rasterized(
     };
 
     if rec.tiling_is_backdrop_dependent(tiling) {
-        if let Some(segments) = tiling.blend_segments() {
-            // Preserve the live backdrop across all segments and overlapping
-            // neighbor copies while evaluating at opacity 1.0, then apply the
-            // object's constant opacity ONCE (ISO 32000-1 §11.6.7).
-            const MAX_DENSE_BLEND_PASSES: usize = 64;
+        if let Some(steps) = tiling.blend_steps() {
+            // Preserve the live backdrop across all steps (segments, nested
+            // OpacityGroups, and overlapping neighbor copies) while evaluating
+            // at opacity 1.0, then apply the object's constant opacity ONCE
+            // (ISO 32000-1 §11.6.7).
+            const MAX_DENSE_BLEND_PASSES: usize = 1024;
             let overlap_nx = overlap
                 .di
                 .end()
@@ -1775,8 +1796,6 @@ fn record_tiling_pattern_rasterized(
                 .saturating_add(1)
                 .max(0) as usize;
             let overlap_count = overlap_nx.saturating_mul(overlap_ny);
-            let separate_copies = overlap_count > 1
-                && overlap_count.saturating_mul(segments.len()) <= MAX_DENSE_BLEND_PASSES;
 
             let wrap_alpha = opacity < 1.0 && rec.can_push_blend();
             if wrap_alpha {
@@ -1785,44 +1804,128 @@ fn record_tiling_pattern_rasterized(
             let seg_quad = if wrap_alpha { quad_opaque } else { quad_alpha };
             let seg_alpha = if wrap_alpha { 1.0 } else { opacity };
 
-            let emit_segment = |rec: &mut PageRecorder,
-                                seg_idx: usize,
-                                seg: &zpdf_display_list::TilingBlendSegment,
-                                overlap_shift: Option<(i64, i64)>| {
-                let Some(tile_id) =
-                    get_or_record_tile(rec, &seg.commands, seg_idx + 1, overlap_shift)
-                else {
-                    return;
-                };
-                if seg.blend_mode == zpdf_display_list::BlendMode::Normal {
-                    rec.add_tile(seg_quad, tile_id);
-                } else if rec.can_push_blend() {
-                    rec.push_blend(seg.blend_mode, seg_alpha, None);
-                    rec.add_tile(quad_opaque, tile_id);
-                    rec.pop_blend();
-                } else {
-                    rec.add_tile(seg_quad, tile_id);
-                }
-            };
-
-            if separate_copies {
-                'copies: for dj in overlap.dj.clone() {
-                    for di in overlap.di.clone() {
-                        for (seg_idx, seg) in segments.iter().enumerate() {
-                            if !rec.can_record() {
-                                break 'copies;
+            #[allow(clippy::too_many_arguments)]
+            fn emit_steps<F>(
+                rec: &mut PageRecorder,
+                tiling: &zpdf_display_list::TilingPattern,
+                steps: &[zpdf_display_list::TilingBlendStep],
+                overlap_shift: Option<(i64, i64)>,
+                seg_quad: [transform::TexturedVertex; 4],
+                quad_opaque: [transform::TexturedVertex; 4],
+                seg_alpha: f32,
+                remaining_passes: &mut usize,
+                get_or_record_tile: &F,
+            ) where
+                F: Fn(
+                    &mut PageRecorder,
+                    &zpdf_display_list::DisplayList,
+                    usize,
+                    Option<(i64, i64)>,
+                ) -> Option<u32>,
+            {
+                for step in steps {
+                    if !rec.can_record() || *remaining_passes == 0 {
+                        return;
+                    }
+                    match step {
+                        zpdf_display_list::TilingBlendStep::Segment(seg) => {
+                            if let Some((di, dj)) = overlap_shift {
+                                if !seg.intersects_period(tiling, di, dj) {
+                                    continue;
+                                }
                             }
-                            emit_segment(rec, seg_idx, seg, Some((di, dj)));
+                            *remaining_passes = remaining_passes.saturating_sub(1);
+                            let Some(tile_id) = get_or_record_tile(
+                                rec,
+                                &seg.commands,
+                                seg.segment_id,
+                                overlap_shift,
+                            ) else {
+                                continue;
+                            };
+                            if seg.blend_mode == zpdf_display_list::BlendMode::Normal {
+                                rec.add_tile(seg_quad, tile_id);
+                            } else if rec.can_push_blend() {
+                                rec.push_blend(seg.blend_mode, seg_alpha, None);
+                                rec.add_tile(quad_opaque, tile_id);
+                                rec.pop_blend();
+                            } else {
+                                rec.add_tile(seg_quad, tile_id);
+                            }
+                        }
+                        zpdf_display_list::TilingBlendStep::OpacityGroup {
+                            alpha: inner_alpha,
+                            steps: inner_steps,
+                        } => {
+                            if let Some((di, dj)) = overlap_shift {
+                                if !zpdf_display_list::TilingBlendStep::any_intersects_period(
+                                    inner_steps,
+                                    tiling,
+                                    di,
+                                    dj,
+                                ) {
+                                    continue;
+                                }
+                            }
+                            let a = unit(*inner_alpha);
+                            if a <= 0.0 {
+                                continue;
+                            }
+                            let wrap_inner = a < 1.0 && rec.can_push_blend();
+                            if wrap_inner {
+                                rec.push_non_isolated_opacity(a);
+                            }
+                            emit_steps(
+                                rec,
+                                tiling,
+                                inner_steps,
+                                overlap_shift,
+                                if wrap_inner { quad_opaque } else { seg_quad },
+                                quad_opaque,
+                                if wrap_inner { 1.0 } else { seg_alpha },
+                                remaining_passes,
+                                get_or_record_tile,
+                            );
+                            if wrap_inner {
+                                rec.pop_blend();
+                            }
                         }
                     }
                 }
-            } else {
-                for (seg_idx, seg) in segments.iter().enumerate() {
-                    if !rec.can_record() {
-                        break;
+            }
+
+            let mut remaining_passes = MAX_DENSE_BLEND_PASSES;
+            if overlap_count > 1 {
+                'copies: for dj in overlap.dj.clone() {
+                    for di in overlap.di.clone() {
+                        if !rec.can_record() || remaining_passes == 0 {
+                            break 'copies;
+                        }
+                        emit_steps(
+                            rec,
+                            tiling,
+                            &steps,
+                            Some((di, dj)),
+                            seg_quad,
+                            quad_opaque,
+                            seg_alpha,
+                            &mut remaining_passes,
+                            &get_or_record_tile,
+                        );
                     }
-                    emit_segment(rec, seg_idx, seg, None);
                 }
+            } else {
+                emit_steps(
+                    rec,
+                    tiling,
+                    &steps,
+                    None,
+                    seg_quad,
+                    quad_opaque,
+                    seg_alpha,
+                    &mut remaining_passes,
+                    &get_or_record_tile,
+                );
             }
             if wrap_alpha {
                 rec.pop_blend();
@@ -1878,11 +1981,39 @@ fn record_tiling_fill(
         }
         Some(_) => {}
         None => {
-            rec.push_clip_transformed(path, rule, outer_ctm, map);
-            record_tiling_pattern(
-                rec, tiling, outer_ctm, bounds, alpha, fonts, images, map, depth,
-            );
-            rec.pop_clip();
+            let opacity = unit(alpha);
+            if opacity <= 0.0 {
+                return;
+            }
+            // For backdrop-dependent tiling fills, evaluate the full pattern
+            // against a copy of the live backdrop and apply BOTH outer shape
+            // coverage and constant object opacity ONCE via a non-isolated
+            // alpha mask (ISO 32000-1 §11.4.5 / §11.6.7) so anti-aliased edge
+            // pixels are never blended multiple times across segments or tiles.
+            if rec.tiling_is_backdrop_dependent(tiling) && rec.can_push_blend() {
+                let shape_ops = rec.record_subops_clipped(|r| {
+                    r.add_fill_transformed(path, rule, [1.0, 1.0, 1.0, 1.0], outer_ctm, map);
+                });
+                let shape_mask = record::MaskOps {
+                    ops: shape_ops,
+                    kind: zpdf_display_list::SoftMaskKind::Alpha,
+                    backdrop_luma: 0.0,
+                    dx: 0,
+                    dy: 0,
+                    transfer: None,
+                };
+                rec.with_non_isolated_shape_mask(opacity, shape_mask, |r| {
+                    record_tiling_pattern(
+                        r, tiling, outer_ctm, bounds, 1.0, fonts, images, map, depth,
+                    );
+                });
+            } else {
+                rec.push_clip_transformed(path, rule, outer_ctm, map);
+                record_tiling_pattern(
+                    rec, tiling, outer_ctm, bounds, alpha, fonts, images, map, depth,
+                );
+                rec.pop_clip();
+            }
         }
     }
 }
@@ -1916,11 +2047,34 @@ fn record_tiling_stroke(
         }
         Some(_) => {}
         None => {
-            rec.push_clip_stroke_transformed(path, style, outer_ctm, map);
-            record_tiling_pattern(
-                rec, tiling, outer_ctm, bounds, alpha, fonts, images, map, depth,
-            );
-            rec.pop_clip();
+            let opacity = unit(alpha);
+            if opacity <= 0.0 {
+                return;
+            }
+            if rec.tiling_is_backdrop_dependent(tiling) && rec.can_push_blend() {
+                let shape_ops = rec.record_subops_clipped(|r| {
+                    r.add_stroke_transformed(path, style, [1.0, 1.0, 1.0, 1.0], outer_ctm, map);
+                });
+                let shape_mask = record::MaskOps {
+                    ops: shape_ops,
+                    kind: zpdf_display_list::SoftMaskKind::Alpha,
+                    backdrop_luma: 0.0,
+                    dx: 0,
+                    dy: 0,
+                    transfer: None,
+                };
+                rec.with_non_isolated_shape_mask(opacity, shape_mask, |r| {
+                    record_tiling_pattern(
+                        r, tiling, outer_ctm, bounds, 1.0, fonts, images, map, depth,
+                    );
+                });
+            } else {
+                rec.push_clip_stroke_transformed(path, style, outer_ctm, map);
+                record_tiling_pattern(
+                    rec, tiling, outer_ctm, bounds, alpha, fonts, images, map, depth,
+                );
+                rec.pop_clip();
+            }
         }
     }
 }
@@ -2151,8 +2305,10 @@ fn composite_into(
                 mask,
                 overprint,
                 non_isolated,
+                unclipped_group,
             } => {
                 let g = pool.acquire(device)?;
+                let group_clips: &[record::ClipStamp] = if *unclipped_group { &[] } else { clips };
                 if *non_isolated {
                     let parent = *active.last().unwrap_or(&base);
                     init_layer_from_base(
@@ -2160,13 +2316,19 @@ fn composite_into(
                         encoder,
                         pool.get(g),
                         pool.get(parent),
-                        clips,
+                        group_clips,
                         res,
                         keep_bgs,
                         keep_bufs,
                     );
                 } else {
-                    init_layer(encoder, pool.get(g), wgpu::Color::TRANSPARENT, clips, res);
+                    init_layer(
+                        encoder,
+                        pool.get(g),
+                        wgpu::Color::TRANSPARENT,
+                        group_clips,
+                        res,
+                    );
                 }
                 active.push(g);
                 blend_info.push((
@@ -2191,13 +2353,39 @@ fn composite_into(
                     ));
                 let parent = *active.last().unwrap_or(&base);
 
+                // Non-isolated group with a soft mask: evaluate `mix(parent, group, alpha * cov)`
+                // directly into `scratch` (preserving live backdrop while applying mask and
+                // object opacity once), re-stamp parent clips, and replace `parent`.
+                if non_isolated {
+                    if let Some(m) = mask {
+                        let scratch = apply_soft_mask(
+                            ctx,
+                            encoder,
+                            pool,
+                            group,
+                            m,
+                            Some((parent, unit(alpha), &clips)),
+                            res,
+                            keep_bgs,
+                            keep_bufs,
+                        )?;
+                        active.pop();
+                        if parent != base {
+                            pool.recycle(parent);
+                        }
+                        active.push(scratch);
+                        i += 1;
+                        continue;
+                    }
+                }
+
                 // A soft mask pre-multiplies the group layer by per-pixel
                 // coverage: render the mask into its own layer, then an
                 // apply-mask pass writes (group × coverage) into a fresh layer
                 // that takes the group's place as the composite source. The
                 // original group + coverage layers are recycled inside.
                 let group = if let Some(m) = mask {
-                    apply_soft_mask(ctx, encoder, pool, group, m, res, keep_bgs, keep_bufs)?
+                    apply_soft_mask(ctx, encoder, pool, group, m, None, res, keep_bgs, keep_bufs)?
                 } else {
                     group
                 };
@@ -2315,9 +2503,11 @@ struct MaskUniform {
     kind: u32,
     dx: i32,
     dy: i32,
-    _pad0: u32,
+    non_isolated: u32,
     backdrop_luma: f32,
-    _pad1: [f32; 3],
+    group_alpha: f32,
+    _pad2: f32,
+    _pad3: f32,
     lut: [u32; 64],
 }
 
@@ -2351,6 +2541,7 @@ fn apply_soft_mask(
     pool: &mut blend::LayerPool,
     group: usize,
     mask: &record::MaskOps,
+    non_isolated: Option<(usize, f32, &[record::ClipStamp])>,
     res: &ReplayRes,
     keep_bgs: &mut Vec<wgpu::BindGroup>,
     keep_bufs: &mut Vec<wgpu::Buffer>,
@@ -2382,14 +2573,17 @@ fn apply_soft_mask(
         ctx, encoder, pool, mask_base, &mask.ops, res, keep_bgs, keep_bufs,
     )?;
 
-    // 2. Pre-multiply the group layer by the mask coverage into a fresh layer.
-    //    The apply pass samples coverage at `coord − (dx, dy)` (tiling-pattern
-    //    reuse offset), reduces to luminosity/alpha, and runs it through the /TR
-    //    transfer LUT before scaling the group.
+    // 2. Pre-multiply the group layer by the mask coverage into a fresh layer
+    //    (isolated), or blend `mix(parent, group, group_alpha * coverage)`
+    //    directly into the fresh layer (non-isolated).
     let masked = pool.acquire(device)?;
     let kind_id: u32 = match mask.kind {
         SoftMaskKind::Luminosity => 1,
         SoftMaskKind::Alpha => 2,
+    };
+    let (ni_flag, group_alpha, base_layer, restamp_clips) = match non_isolated {
+        Some((parent, ga, clips)) => (1u32, ga, parent, Some(clips)),
+        None => (0u32, 1.0f32, group, None),
     };
     let mask_u = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("zpdf-mask-uniform"),
@@ -2397,9 +2591,11 @@ fn apply_soft_mask(
             kind: kind_id,
             dx: mask.dx,
             dy: mask.dy,
-            _pad0: 0,
+            non_isolated: ni_flag,
             backdrop_luma: backdrop.r as f32,
-            _pad1: [0.0; 3],
+            group_alpha,
+            _pad2: 0.0,
+            _pad3: 0.0,
             lut: pack_transfer_lut(mask.transfer.as_ref()),
         }),
         usage: wgpu::BufferUsages::UNIFORM,
@@ -2422,6 +2618,12 @@ fn apply_soft_mask(
                 binding: 2,
                 resource: mask_u.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(
+                    pool.get(base_layer).sampleable_view(),
+                ),
+            },
         ],
     });
     {
@@ -2443,6 +2645,9 @@ fn apply_soft_mask(
                 fs.base_vertex,
                 0..1,
             );
+        }
+        if let Some(clips) = restamp_clips {
+            stamp_clips(&mut pass, clips, res);
         }
     }
     keep_bgs.push(mask_bg);

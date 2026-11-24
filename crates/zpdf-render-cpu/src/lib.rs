@@ -204,7 +204,7 @@ const MAX_TILING_TILE_DIM: u32 = 4096;
 const MAX_TILING_TILE_PIXELS: u64 = 4_194_304; // 2048×2048 = 16 MiB RGBA
 const MAX_TILING_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_DIRECT_TILING_TILES: i64 = 4096;
-const MAX_DENSE_TILING_BLEND_PASSES: usize = 64;
+const MAX_DENSE_TILING_BLEND_PASSES: usize = 1024;
 
 fn unit(v: f32) -> f32 {
     if v.is_finite() {
@@ -529,6 +529,11 @@ struct BlendEntry {
     /// no mask, no knockout): its elements draw straight onto the canvas, so no
     /// buffer is parked and `pop` is a no-op.
     passthrough: bool,
+    /// Non-isolated Normal group with constant alpha and/or soft mask: the
+    /// group surface was seeded with a copy of `pixmap` so blend modes inside
+    /// see the live backdrop, and `pop` applies `alpha * mask` once via
+    /// `mix(backdrop, group, alpha * mask)` (ISO 32000-1 §11.4.5 / §11.6.7).
+    non_isolated: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1395,6 +1400,313 @@ impl<'a> CpuRenderer<'a> {
         painted
     }
 
+    /// Evaluate a backdrop-dependent tiling pattern at full coverage (`1.0`)
+    /// onto a backdrop-seeded scratch surface, while rasterizing the outer
+    /// shape (fill path, stroke outline, or glyph run, intersected with the
+    /// active clip) ONCE into a coverage surface, then merge the completed
+    /// pattern back into `self.pixmap` ONCE with `w = opacity * shape_coverage`
+    /// (ISO 32000-1 §11.4.5 / §11.6.7). Prevents anti-aliased outer edges from
+    /// double-blending across multiple segments, overlapping copies, or tiles.
+    fn with_backdrop_shape_coverage(
+        &mut self,
+        alpha: f32,
+        scope_region: Option<PaintedBounds>,
+        rasterize_shape: impl FnOnce(&mut Self) -> Option<PaintedBounds>,
+        draw_pattern: impl FnOnce(&mut Self, PaintedBounds) -> bool,
+    ) -> bool {
+        let opacity = unit(alpha);
+        if opacity <= 0.0 {
+            return false;
+        }
+        let Some(mut backdrop) = self.pixmap.take() else {
+            return false;
+        };
+        let (w, h) = (backdrop.width(), backdrop.height());
+        let initial_region = match (scope_region, self.clip_bounds) {
+            (Some(r), Some(c)) => r.intersect(c),
+            (Some(r), None) => r,
+            (None, Some(c)) => c,
+            (None, None) => PaintedBounds::whole(w, h),
+        };
+        if initial_region.is_empty() {
+            self.pixmap = Some(backdrop);
+            return false;
+        }
+        let surface_bytes = w as u64 * h as u64 * 4;
+        let pooled_count = self
+            .surface_pool
+            .iter()
+            .filter(|p| (p.width(), p.height()) == (w, h))
+            .count();
+        let needed_new_bytes = 2usize.saturating_sub(pooled_count) as u64 * surface_bytes;
+        if needed_new_bytes > 0 && !self.surface_room(needed_new_bytes) {
+            self.pixmap = Some(backdrop);
+            tracing::warn!("tiling shape coverage scratch exceeds memory budget");
+            return false;
+        }
+        let Some(shape_buf) = self.take_surface(w, h) else {
+            self.pixmap = Some(backdrop);
+            return false;
+        };
+        let Some(mut scratch) = self.take_surface(w, h) else {
+            self.recycle_surface(shape_buf, None);
+            self.pixmap = Some(backdrop);
+            return false;
+        };
+
+        let backdrop_dirty = self.dirty.take();
+        self.blend_surface_bytes = self
+            .blend_surface_bytes
+            .saturating_add(surface_bytes.saturating_mul(2));
+
+        // 1. Rasterize the outer shape (under `self.current_clip`) ONCE into
+        //    `shape_buf` so its alpha channel holds exact outer AA coverage.
+        self.pixmap = Some(shape_buf);
+        let shape_dirty = rasterize_shape(self);
+        let shape_buf = self.pixmap.take();
+        let raster_dirty = self.dirty.take();
+
+        let Some(shape_buf) = shape_buf else {
+            self.recycle_surface(scratch, None);
+            self.blend_surface_bytes = self
+                .blend_surface_bytes
+                .saturating_sub(surface_bytes.saturating_mul(2));
+            self.dirty = backdrop_dirty;
+            self.pixmap = Some(backdrop);
+            return false;
+        };
+
+        let active_region = shape_dirty
+            .or(raster_dirty)
+            .map(|r| r.intersect(initial_region))
+            .unwrap_or(initial_region);
+        if active_region.is_empty() {
+            self.recycle_surface(shape_buf, raster_dirty);
+            self.recycle_surface(scratch, None);
+            self.blend_surface_bytes = self
+                .blend_surface_bytes
+                .saturating_sub(surface_bytes.saturating_mul(2));
+            self.dirty = backdrop_dirty;
+            self.pixmap = Some(backdrop);
+            return false;
+        }
+
+        // 2. Seed `scratch` with the live backdrop across `active_region` and
+        //    evaluate the full pattern at unclipped 1.0 coverage.
+        for_region_rows(active_region, w, |range| {
+            scratch.data_mut()[range.clone()].copy_from_slice(&backdrop.data()[range]);
+        });
+        let saved_clip = self.current_clip.take();
+        let saved_clip_bounds = self.clip_bounds.take();
+        self.pixmap = Some(scratch);
+        let painted = draw_pattern(self, active_region);
+        let scratch = self.pixmap.take();
+        let draw_dirty = self.dirty.take();
+        self.current_clip = saved_clip;
+        self.clip_bounds = saved_clip_bounds;
+        self.blend_surface_bytes = self
+            .blend_surface_bytes
+            .saturating_sub(surface_bytes.saturating_mul(2));
+
+        if let Some(scratch) = scratch {
+            if painted {
+                let s_data = shape_buf.data();
+                let src_data = scratch.data();
+                let dst_data = backdrop.data_mut();
+                let stride = w as usize;
+                for y in active_region.y0 as usize..active_region.y1 as usize {
+                    let row = y * stride;
+                    for x in active_region.x0 as usize..active_region.x1 as usize {
+                        let base = (row + x) * 4;
+                        let cov = s_data[base + 3];
+                        if cov == 0 {
+                            continue;
+                        }
+                        let w_eff = opacity * (cov as f32 / 255.0);
+                        if w_eff >= 1.0 {
+                            dst_data[base..base + 4].copy_from_slice(&src_data[base..base + 4]);
+                        } else {
+                            let inv = 1.0 - w_eff;
+                            for ch in 0..4 {
+                                dst_data[base + ch] = (dst_data[base + ch] as f32 * inv
+                                    + src_data[base + ch] as f32 * w_eff)
+                                    .round()
+                                    .clamp(0.0, 255.0)
+                                    as u8;
+                            }
+                        }
+                    }
+                }
+                self.dirty = Some(match backdrop_dirty {
+                    Some(b) => b.union(active_region),
+                    None => active_region,
+                });
+            } else {
+                self.dirty = backdrop_dirty;
+            }
+            let scratch_clear = match draw_dirty {
+                Some(d) if !d.is_empty() => active_region.union(d),
+                _ => active_region,
+            };
+            self.recycle_surface(scratch, Some(scratch_clear));
+        } else {
+            self.dirty = backdrop_dirty;
+        }
+        let shape_clear = match raster_dirty {
+            Some(d) if !d.is_empty() => active_region.union(d),
+            _ => active_region,
+        };
+        self.recycle_surface(shape_buf, Some(shape_clear));
+        self.pixmap = Some(backdrop);
+        painted
+    }
+
+    /// Execute a [`TilingBlendStep`] tree onto `self.pixmap` across `region`
+    /// at full coverage (no outer anti-aliasing), respecting per-copy overlap
+    /// shifts, `intersects_period` culling, and nested `OpacityGroup`s.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tiling_steps_in_region(
+        &mut self,
+        tiling: &TilingPattern,
+        steps: &[TilingBlendStep],
+        overlap_shift: Option<(i64, i64)>,
+        region: PaintedBounds,
+        remaining_passes: &mut usize,
+    ) -> bool {
+        let Some(rect) = region.to_rect() else {
+            return false;
+        };
+        let mut painted = false;
+        for step in steps {
+            if self.over_budget || *remaining_passes == 0 {
+                break;
+            }
+            match step {
+                TilingBlendStep::Segment(seg) => {
+                    if let Some((di, dj)) = overlap_shift {
+                        if !seg.intersects_period(tiling, di, dj) {
+                            continue;
+                        }
+                    }
+                    *remaining_passes = remaining_passes.saturating_sub(1);
+                    let Some((pixmap, transform, quality, opacity)) = self
+                        .prepare_tiling_paint_for(
+                            tiling,
+                            &seg.commands,
+                            seg.segment_id,
+                            overlap_shift,
+                            1.0,
+                        )
+                    else {
+                        continue;
+                    };
+                    let paint = tiny_skia::Paint {
+                        shader: tiny_skia::Pattern::new(
+                            (*pixmap).as_ref(),
+                            tiny_skia::SpreadMode::Repeat,
+                            quality,
+                            opacity,
+                            transform,
+                        ),
+                        blend_mode: Self::blend_mode_to_skia(seg.blend_mode),
+                        anti_alias: false,
+                        ..Default::default()
+                    };
+                    if let Some(ref mut target) = self.pixmap {
+                        target.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+                        painted = true;
+                    }
+                }
+                TilingBlendStep::OpacityGroup {
+                    alpha: inner_alpha,
+                    steps: inner_steps,
+                } => {
+                    if let Some((di, dj)) = overlap_shift {
+                        if !TilingBlendStep::any_intersects_period(inner_steps, tiling, di, dj) {
+                            continue;
+                        }
+                    }
+                    if self.with_backdrop_opacity(*inner_alpha, Some(region), |r| {
+                        let ok = r.paint_tiling_steps_in_region(
+                            tiling,
+                            inner_steps,
+                            overlap_shift,
+                            region,
+                            remaining_passes,
+                        );
+                        if ok {
+                            r.dirty = Some(match r.dirty {
+                                Some(d) => d.union(region),
+                                None => region,
+                            });
+                        }
+                        ok
+                    }) {
+                        painted = true;
+                    }
+                }
+            }
+        }
+        painted
+    }
+
+    fn paint_tiling_plan_in_region(
+        &mut self,
+        tiling: &TilingPattern,
+        steps: &[TilingBlendStep],
+        region: PaintedBounds,
+    ) -> bool {
+        let overlap = tiling.overlap_copy_ranges();
+        let overlap_nx = overlap
+            .di
+            .end()
+            .saturating_sub(*overlap.di.start())
+            .saturating_add(1)
+            .max(0) as usize;
+        let overlap_ny = overlap
+            .dj
+            .end()
+            .saturating_sub(*overlap.dj.start())
+            .saturating_add(1)
+            .max(0) as usize;
+        let overlap_count = overlap_nx.saturating_mul(overlap_ny);
+        let mut remaining_passes = MAX_DENSE_TILING_BLEND_PASSES;
+        let mut painted = false;
+        if overlap_count > 1 {
+            'copies: for dj in overlap.dj.clone() {
+                for di in overlap.di.clone() {
+                    if self.over_budget || remaining_passes == 0 {
+                        break 'copies;
+                    }
+                    if self.paint_tiling_steps_in_region(
+                        tiling,
+                        steps,
+                        Some((di, dj)),
+                        region,
+                        &mut remaining_passes,
+                    ) {
+                        painted = true;
+                    }
+                }
+            }
+        } else {
+            painted = self.paint_tiling_steps_in_region(
+                tiling,
+                steps,
+                None,
+                region,
+                &mut remaining_passes,
+            );
+        }
+        if painted {
+            self.dirty = Some(match self.dirty {
+                Some(d) => d.union(region),
+                None => region,
+            });
+        }
+        painted
+    }
+
     /// Replay a backdrop-dependent [`TilingPattern`] directly onto `self`'s live
     /// destination surface (already clipped to the painted shape) at full outer
     /// opacity, up to [`MAX_DIRECT_TILING_TILES`]. Returns `true` if handled
@@ -1539,126 +1851,117 @@ impl<'a> CpuRenderer<'a> {
         tiling: &TilingPattern,
         alpha: f32,
     ) -> bool {
-        let scope = self
-            .pixmap
-            .as_ref()
-            .map(|p| Self::drawn_extent(skia_path.bounds(), 1.0, p.width(), p.height()));
-        self.with_backdrop_opacity(alpha, scope, |renderer| {
-            let fill_rule = Self::fill_rule_to_skia(rule);
-            let paint_tile = |renderer: &mut Self,
-                              commands: &DisplayList,
-                              seg_idx: usize,
-                              overlap_shift: Option<(i64, i64)>,
-                              blend_mode: BlendMode|
-             -> bool {
-                let Some((pixmap, transform, quality, opacity)) = renderer
-                    .prepare_tiling_paint_for(tiling, commands, seg_idx, overlap_shift, 1.0)
-                else {
-                    return false;
-                };
-                let paint = tiny_skia::Paint {
-                    shader: tiny_skia::Pattern::new(
-                        (*pixmap).as_ref(),
-                        tiny_skia::SpreadMode::Repeat,
-                        quality,
-                        opacity,
-                        transform,
-                    ),
-                    blend_mode: Self::blend_mode_to_skia(blend_mode),
-                    anti_alias: true,
-                    ..Default::default()
-                };
-                if let Some(ref mut target) = renderer.pixmap {
-                    target.fill_path(
-                        skia_path,
-                        &paint,
-                        fill_rule,
-                        tiny_skia::Transform::identity(),
-                        renderer.current_clip.as_ref(),
-                    );
-                    return true;
-                }
-                false
-            };
+        let opacity = unit(alpha);
+        if opacity <= 0.0 {
+            return false;
+        }
+        let fill_rule = Self::fill_rule_to_skia(rule);
+        let steps = tiling.blend_steps();
 
-            let paint_segments = |renderer: &mut Self, segments: &[TilingBlendSegment]| -> bool {
-                let overlap = tiling.overlap_copy_ranges();
-                let overlap_nx = overlap
-                    .di
-                    .end()
-                    .saturating_sub(*overlap.di.start())
-                    .saturating_add(1)
-                    .max(0) as usize;
-                let overlap_ny = overlap
-                    .dj
-                    .end()
-                    .saturating_sub(*overlap.dj.start())
-                    .saturating_add(1)
-                    .max(0) as usize;
-                let overlap_count = overlap_nx.saturating_mul(overlap_ny);
-                let separate_copies = overlap_count > 1
-                    && overlap_count.saturating_mul(segments.len())
-                        <= MAX_DENSE_TILING_BLEND_PASSES;
-
-                let mut painted = false;
-                if separate_copies {
-                    for dj in overlap.dj.clone() {
-                        for di in overlap.di.clone() {
-                            for (seg_idx, seg) in segments.iter().enumerate() {
-                                if paint_tile(
-                                    renderer,
-                                    &seg.commands,
-                                    seg_idx + 1,
-                                    Some((di, dj)),
-                                    seg.blend_mode,
-                                ) {
-                                    painted = true;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    for (seg_idx, seg) in segments.iter().enumerate() {
-                        if paint_tile(renderer, &seg.commands, seg_idx + 1, None, seg.blend_mode) {
-                            painted = true;
-                        }
-                    }
-                }
-                if painted {
-                    renderer.mark_painted(skia_path.bounds(), 1.0);
-                }
-                painted
-            };
-
-            let segments = tiling.blend_segments();
-            if Self::tiling_is_non_overlapping(tiling) {
-                if let Some(ref segments) = segments {
-                    if paint_segments(renderer, segments) {
+        // Fast path: a single non-overlapping segment at full opacity applies
+        // outer shape coverage once directly in a single `fill_path` call.
+        if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
+            if let Some([TilingBlendStep::Segment(seg)]) = steps.as_deref() {
+                if let Some((pixmap, transform, quality, tile_opacity)) =
+                    self.prepare_tiling_paint_for(tiling, &seg.commands, seg.segment_id, None, 1.0)
+                {
+                    let paint = tiny_skia::Paint {
+                        shader: tiny_skia::Pattern::new(
+                            (*pixmap).as_ref(),
+                            tiny_skia::SpreadMode::Repeat,
+                            quality,
+                            tile_opacity,
+                            transform,
+                        ),
+                        blend_mode: Self::blend_mode_to_skia(seg.blend_mode),
+                        anti_alias: true,
+                        ..Default::default()
+                    };
+                    if let Some(ref mut target) = self.pixmap {
+                        target.fill_path(
+                            skia_path,
+                            &paint,
+                            fill_rule,
+                            tiny_skia::Transform::identity(),
+                            self.current_clip.as_ref(),
+                        );
+                        self.mark_painted(skia_path.bounds(), 1.0);
                         return true;
                     }
                 }
             }
+        }
 
-            if let Some(bounds) = Self::page_path_bounds(path) {
-                renderer.push_clip(path, rule);
-                let handled = renderer.render_tiling_direct(tiling, bounds);
-                renderer.pop_clip();
-                if handled {
-                    return true;
+        let scope = self
+            .pixmap
+            .as_ref()
+            .map(|p| Self::drawn_extent(skia_path.bounds(), 1.0, p.width(), p.height()));
+        let white = Self::color_to_paint(&Color::white(), 1.0);
+        self.with_backdrop_shape_coverage(
+            opacity,
+            scope,
+            |renderer| {
+                if let Some(ref mut target) = renderer.pixmap {
+                    target.fill_path(
+                        skia_path,
+                        &white,
+                        fill_rule,
+                        tiny_skia::Transform::identity(),
+                        renderer.current_clip.as_ref(),
+                    );
+                    renderer.mark_painted(skia_path.bounds(), 1.0);
                 }
-            }
-            if let Some(ref segments) = segments {
-                return paint_segments(renderer, segments);
-            }
-            // Bounded backstop when both direct replay (>4,096 tiles) and
-            // blend_segments() decline (e.g., active overprint inside a dense
-            // cell): paint the single rasterized cell rather than dropping blank.
-            let painted = paint_tile(renderer, &tiling.commands, 0, None, BlendMode::Normal);
-            if painted {
-                renderer.mark_painted(skia_path.bounds(), 1.0);
-            }
-            painted
-        })
+                renderer.dirty
+            },
+            |renderer, region| {
+                if Self::tiling_is_non_overlapping(tiling) {
+                    if let Some(ref steps) = steps {
+                        if renderer.paint_tiling_plan_in_region(tiling, steps, region) {
+                            return true;
+                        }
+                    }
+                }
+                if let Some(bounds) = Self::page_path_bounds(path) {
+                    if renderer.render_tiling_direct(tiling, bounds) {
+                        return true;
+                    }
+                }
+                if let Some(ref steps) = steps {
+                    if renderer.paint_tiling_plan_in_region(tiling, steps, region) {
+                        return true;
+                    }
+                }
+                // Bounded backstop when both direct replay (>4,096 tiles) and
+                // blend_steps() decline (e.g., active overprint inside a dense
+                // cell): paint the single rasterized cell rather than dropping blank.
+                if let (Some(rect), Some((pixmap, transform, quality, tile_opacity))) = (
+                    region.to_rect(),
+                    renderer.prepare_tiling_paint_for(tiling, &tiling.commands, 0, None, 1.0),
+                ) {
+                    let paint = tiny_skia::Paint {
+                        shader: tiny_skia::Pattern::new(
+                            (*pixmap).as_ref(),
+                            tiny_skia::SpreadMode::Repeat,
+                            quality,
+                            tile_opacity,
+                            transform,
+                        ),
+                        blend_mode: tiny_skia::BlendMode::SourceOver,
+                        anti_alias: false,
+                        ..Default::default()
+                    };
+                    if let Some(ref mut target) = renderer.pixmap {
+                        target.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+                        renderer.dirty = Some(match renderer.dirty {
+                            Some(d) => d.union(region),
+                            None => region,
+                        });
+                        return true;
+                    }
+                }
+                false
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1674,6 +1977,75 @@ impl<'a> CpuRenderer<'a> {
         tiling: &TilingPattern,
         alpha: f32,
     ) -> bool {
+        let opacity = unit(alpha);
+        if opacity <= 0.0 {
+            return false;
+        }
+        let steps = tiling.blend_steps();
+
+        let draw_stroke_shape = |target: &mut tiny_skia::Pixmap,
+                                 paint: &tiny_skia::Paint<'_>,
+                                 clip: Option<&tiny_skia::Mask>| {
+            if let Some(outline) = anisotropic_outline {
+                target.fill_path(
+                    outline,
+                    paint,
+                    tiny_skia::FillRule::Winding,
+                    tiny_skia::Transform::identity(),
+                    clip,
+                );
+            } else if let Some(hairline) = anisotropic_hairline {
+                let mut hairline_stroke = Self::skia_stroke(style, 1.0, 1.0);
+                hairline_stroke.dash = None;
+                target.stroke_path(
+                    hairline,
+                    paint,
+                    &hairline_stroke,
+                    tiny_skia::Transform::identity(),
+                    clip,
+                );
+            } else {
+                target.stroke_path(
+                    skia_path,
+                    paint,
+                    stroke,
+                    tiny_skia::Transform::identity(),
+                    clip,
+                );
+            }
+        };
+
+        // Fast path: single non-overlapping segment at full opacity.
+        if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
+            if let Some([TilingBlendStep::Segment(seg)]) = steps.as_deref() {
+                if let Some((pixmap, transform, quality, tile_opacity)) =
+                    self.prepare_tiling_paint_for(tiling, &seg.commands, seg.segment_id, None, 1.0)
+                {
+                    let paint = tiny_skia::Paint {
+                        shader: tiny_skia::Pattern::new(
+                            (*pixmap).as_ref(),
+                            tiny_skia::SpreadMode::Repeat,
+                            quality,
+                            tile_opacity,
+                            transform,
+                        ),
+                        blend_mode: Self::blend_mode_to_skia(seg.blend_mode),
+                        anti_alias: true,
+                        ..Default::default()
+                    };
+                    if let Some(ref mut target) = self.pixmap {
+                        draw_stroke_shape(target, &paint, self.current_clip.as_ref());
+                        if let Some(outline) = anisotropic_outline {
+                            self.mark_painted(outline.bounds(), 1.0);
+                        } else {
+                            self.mark_painted(skia_path.bounds(), grow);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+
         let scope = self.pixmap.as_ref().map(|p| {
             if let Some(outline) = anisotropic_outline {
                 Self::drawn_extent(outline.bounds(), 1.0, p.width(), p.height())
@@ -1681,157 +2053,79 @@ impl<'a> CpuRenderer<'a> {
                 Self::drawn_extent(skia_path.bounds(), grow, p.width(), p.height())
             }
         });
-        self.with_backdrop_opacity(alpha, scope, |renderer| {
-            let paint_tile = |renderer: &mut Self,
-                              commands: &DisplayList,
-                              seg_idx: usize,
-                              overlap_shift: Option<(i64, i64)>,
-                              blend_mode: BlendMode|
-             -> bool {
-                let Some((pixmap, transform, quality, opacity)) = renderer
-                    .prepare_tiling_paint_for(tiling, commands, seg_idx, overlap_shift, 1.0)
-                else {
-                    return false;
-                };
-                let paint = tiny_skia::Paint {
-                    shader: tiny_skia::Pattern::new(
-                        (*pixmap).as_ref(),
-                        tiny_skia::SpreadMode::Repeat,
-                        quality,
-                        opacity,
-                        transform,
-                    ),
-                    blend_mode: Self::blend_mode_to_skia(blend_mode),
-                    anti_alias: true,
-                    ..Default::default()
-                };
+        let white = Self::color_to_paint(&Color::white(), 1.0);
+        self.with_backdrop_shape_coverage(
+            opacity,
+            scope,
+            |renderer| {
                 if let Some(ref mut target) = renderer.pixmap {
+                    draw_stroke_shape(target, &white, renderer.current_clip.as_ref());
                     if let Some(outline) = anisotropic_outline {
-                        target.fill_path(
-                            outline,
-                            &paint,
-                            tiny_skia::FillRule::Winding,
-                            tiny_skia::Transform::identity(),
-                            renderer.current_clip.as_ref(),
-                        );
-                    } else if let Some(hairline) = anisotropic_hairline {
-                        let mut hairline_stroke = Self::skia_stroke(style, 1.0, 1.0);
-                        hairline_stroke.dash = None;
-                        target.stroke_path(
-                            hairline,
-                            &paint,
-                            &hairline_stroke,
-                            tiny_skia::Transform::identity(),
-                            renderer.current_clip.as_ref(),
-                        );
+                        renderer.mark_painted(outline.bounds(), 1.0);
                     } else {
-                        target.stroke_path(
-                            skia_path,
-                            &paint,
-                            stroke,
-                            tiny_skia::Transform::identity(),
-                            renderer.current_clip.as_ref(),
-                        );
+                        renderer.mark_painted(skia_path.bounds(), grow);
                     }
-                    return true;
                 }
-                false
-            };
-
-            let mark = |renderer: &mut Self| {
-                if let Some(outline) = anisotropic_outline {
-                    renderer.mark_painted(outline.bounds(), 1.0);
-                } else {
-                    renderer.mark_painted(skia_path.bounds(), grow);
-                }
-            };
-
-            let paint_segments = |renderer: &mut Self, segments: &[TilingBlendSegment]| -> bool {
-                let overlap = tiling.overlap_copy_ranges();
-                let overlap_nx = overlap
-                    .di
-                    .end()
-                    .saturating_sub(*overlap.di.start())
-                    .saturating_add(1)
-                    .max(0) as usize;
-                let overlap_ny = overlap
-                    .dj
-                    .end()
-                    .saturating_sub(*overlap.dj.start())
-                    .saturating_add(1)
-                    .max(0) as usize;
-                let overlap_count = overlap_nx.saturating_mul(overlap_ny);
-                let separate_copies = overlap_count > 1
-                    && overlap_count.saturating_mul(segments.len())
-                        <= MAX_DENSE_TILING_BLEND_PASSES;
-
-                let mut painted = false;
-                if separate_copies {
-                    for dj in overlap.dj.clone() {
-                        for di in overlap.di.clone() {
-                            for (seg_idx, seg) in segments.iter().enumerate() {
-                                if paint_tile(
-                                    renderer,
-                                    &seg.commands,
-                                    seg_idx + 1,
-                                    Some((di, dj)),
-                                    seg.blend_mode,
-                                ) {
-                                    painted = true;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    for (seg_idx, seg) in segments.iter().enumerate() {
-                        if paint_tile(renderer, &seg.commands, seg_idx + 1, None, seg.blend_mode) {
-                            painted = true;
+                renderer.dirty
+            },
+            |renderer, region| {
+                if Self::tiling_is_non_overlapping(tiling) {
+                    if let Some(ref steps) = steps {
+                        if renderer.paint_tiling_plan_in_region(tiling, steps, region) {
+                            return true;
                         }
                     }
                 }
-                if painted {
-                    mark(renderer);
-                }
-                painted
-            };
-
-            let segments = tiling.blend_segments();
-            if Self::tiling_is_non_overlapping(tiling) {
-                if let Some(ref segments) = segments {
-                    if paint_segments(renderer, segments) {
+                if let Some(b) = Self::page_path_bounds(path) {
+                    let reach = match style.join {
+                        LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0),
+                        _ => std::f32::consts::SQRT_2,
+                    };
+                    let pad = (style.width.max(1.0) as f64
+                        * 0.5
+                        * reach.max(std::f32::consts::SQRT_2) as f64)
+                        .max(0.5);
+                    let bounds =
+                        zpdf_core::Rect::new(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad);
+                    if renderer.render_tiling_direct(tiling, bounds) {
                         return true;
                     }
                 }
-            }
-
-            if let Some(b) = Self::page_path_bounds(path) {
-                let reach = match style.join {
-                    LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0),
-                    _ => std::f32::consts::SQRT_2,
-                };
-                let pad = (style.width.max(1.0) as f64
-                    * 0.5
-                    * reach.max(std::f32::consts::SQRT_2) as f64)
-                    .max(0.5);
-                let bounds = zpdf_core::Rect::new(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad);
-                renderer.push_clip_stroke(path, style);
-                let handled = renderer.render_tiling_direct(tiling, bounds);
-                renderer.pop_clip();
-                if handled {
-                    return true;
+                if let Some(ref steps) = steps {
+                    if renderer.paint_tiling_plan_in_region(tiling, steps, region) {
+                        return true;
+                    }
                 }
-            }
-            if let Some(ref segments) = segments {
-                return paint_segments(renderer, segments);
-            }
-            // Bounded backstop when both direct replay (>4,096 tiles) and
-            // blend_segments() decline: paint the single rasterized cell.
-            let painted = paint_tile(renderer, &tiling.commands, 0, None, BlendMode::Normal);
-            if painted {
-                mark(renderer);
-            }
-            painted
-        })
+                // Bounded backstop when both direct replay (>4,096 tiles) and
+                // blend_steps() decline: paint the single rasterized cell.
+                if let (Some(rect), Some((pixmap, transform, quality, tile_opacity))) = (
+                    region.to_rect(),
+                    renderer.prepare_tiling_paint_for(tiling, &tiling.commands, 0, None, 1.0),
+                ) {
+                    let paint = tiny_skia::Paint {
+                        shader: tiny_skia::Pattern::new(
+                            (*pixmap).as_ref(),
+                            tiny_skia::SpreadMode::Repeat,
+                            quality,
+                            tile_opacity,
+                            transform,
+                        ),
+                        blend_mode: tiny_skia::BlendMode::SourceOver,
+                        anti_alias: false,
+                        ..Default::default()
+                    };
+                    if let Some(ref mut target) = renderer.pixmap {
+                        target.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+                        renderer.dirty = Some(match renderer.dirty {
+                            Some(d) => d.union(region),
+                            None => region,
+                        });
+                        return true;
+                    }
+                }
+                false
+            },
+        )
     }
 
     fn render_fill(&mut self, path: &Path, rule: &FillRule, paint_spec: &Paint, alpha: f32) {
@@ -2082,83 +2376,70 @@ impl<'a> CpuRenderer<'a> {
 
         if let Paint::Tiling(tiling) = &run.paint {
             if self.tiling_is_backdrop_dependent(tiling) {
-                if let Some(segments) = tiling.blend_segments() {
+                if let Some(steps) = tiling.blend_steps() {
+                    let opacity = unit(alpha_override);
+                    if opacity <= 0.0 {
+                        return;
+                    }
                     self.count(run.glyphs.len() as u64, |s| &mut s.glyphs);
-                    let overlap = tiling.overlap_copy_ranges();
-                    let overlap_nx = overlap
-                        .di
-                        .end()
-                        .saturating_sub(*overlap.di.start())
-                        .saturating_add(1)
-                        .max(0) as usize;
-                    let overlap_ny = overlap
-                        .dj
-                        .end()
-                        .saturating_sub(*overlap.dj.start())
-                        .saturating_add(1)
-                        .max(0) as usize;
-                    let overlap_count = overlap_nx.saturating_mul(overlap_ny);
-                    let separate_copies = overlap_count > 1
-                        && overlap_count.saturating_mul(segments.len())
-                            <= MAX_DENSE_TILING_BLEND_PASSES;
-                    self.with_backdrop_opacity(alpha_override, None, |renderer| {
-                        let draw_seg = |renderer: &mut Self,
-                                        seg_idx: usize,
-                                        seg: &TilingBlendSegment,
-                                        overlap_shift: Option<(i64, i64)>|
-                         -> bool {
-                            let Some((pixmap, transform, quality, opacity)) = renderer
+                    // Fast path: single non-overlapping segment at full opacity.
+                    if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
+                        if let [TilingBlendStep::Segment(seg)] = steps.as_slice() {
+                            if let Some((pixmap, transform, quality, tile_opacity)) = self
                                 .prepare_tiling_paint_for(
                                     tiling,
                                     &seg.commands,
-                                    seg_idx + 1,
-                                    overlap_shift,
+                                    seg.segment_id,
+                                    None,
                                     1.0,
                                 )
-                            else {
-                                return false;
-                            };
-                            let paint = tiny_skia::Paint {
-                                shader: tiny_skia::Pattern::new(
-                                    (*pixmap).as_ref(),
-                                    tiny_skia::SpreadMode::Repeat,
-                                    quality,
-                                    opacity,
-                                    transform,
-                                ),
-                                blend_mode: Self::blend_mode_to_skia(seg.blend_mode),
-                                anti_alias: true,
-                                ..Default::default()
-                            };
-                            if font.is_type3() {
-                                let t = renderer.tick();
-                                renderer.render_type3_glyphs(run, font, &paint, 1.0);
-                                renderer.tock(t, |s| &mut s.glyph_raster_ns);
-                            } else {
-                                renderer.render_outline_glyphs(run, font, &paint);
-                            }
-                            true
-                        };
-                        let mut any = false;
-                        if separate_copies {
-                            for dj in overlap.dj.clone() {
-                                for di in overlap.di.clone() {
-                                    for (seg_idx, seg) in segments.iter().enumerate() {
-                                        if draw_seg(renderer, seg_idx, seg, Some((di, dj))) {
-                                            any = true;
-                                        }
-                                    }
+                            {
+                                let paint = tiny_skia::Paint {
+                                    shader: tiny_skia::Pattern::new(
+                                        (*pixmap).as_ref(),
+                                        tiny_skia::SpreadMode::Repeat,
+                                        quality,
+                                        tile_opacity,
+                                        transform,
+                                    ),
+                                    blend_mode: Self::blend_mode_to_skia(seg.blend_mode),
+                                    anti_alias: true,
+                                    ..Default::default()
+                                };
+                                if font.is_type3() {
+                                    let t = self.tick();
+                                    self.render_type3_glyphs(run, font, &paint, 1.0);
+                                    self.tock(t, |s| &mut s.glyph_raster_ns);
+                                } else {
+                                    self.render_outline_glyphs(run, font, &paint);
                                 }
-                            }
-                        } else {
-                            for (seg_idx, seg) in segments.iter().enumerate() {
-                                if draw_seg(renderer, seg_idx, seg, None) {
-                                    any = true;
-                                }
+                                return;
                             }
                         }
-                        any
-                    });
+                    }
+
+                    // Multi-pass / overlapping / translucent glyph run: rasterize
+                    // glyph coverage ONCE into a scratch alpha surface, evaluate
+                    // the full pattern plan at 1.0 coverage, and apply glyph AA
+                    // coverage × object opacity ONCE.
+                    let white = Self::color_to_paint(&Color::white(), 1.0);
+                    self.with_backdrop_shape_coverage(
+                        opacity,
+                        None,
+                        |renderer| {
+                            if font.is_type3() {
+                                let t = renderer.tick();
+                                renderer.render_type3_glyphs(run, font, &white, 1.0);
+                                renderer.tock(t, |s| &mut s.glyph_raster_ns);
+                            } else {
+                                renderer.render_outline_glyphs(run, font, &white);
+                            }
+                            renderer.dirty
+                        },
+                        |renderer, region| {
+                            renderer.paint_tiling_plan_in_region(tiling, &steps, region)
+                        },
+                    );
                     return;
                 }
             }
@@ -2605,6 +2886,7 @@ impl<'a> CpuRenderer<'a> {
                     knockout: false,
                     backdrop: None,
                     passthrough: true,
+                    non_isolated: false,
                 });
             }
             return;
@@ -2635,26 +2917,28 @@ impl<'a> CpuRenderer<'a> {
                     knockout: false,
                     backdrop: None,
                     passthrough: true,
+                    non_isolated: false,
                 });
             }
             return;
         }
 
-        // The group renders into its own transparent buffer (isolated). A
-        // non-isolated group that reached this point carries a group-level
-        // effect (alpha/mask/blend) and is approximated as isolated — element
-        // blends against the backdrop are the rare loss. `None` on allocation
-        // failure degrades to a no-op group, which `pop_blend_group` handles.
-        let group = self.take_surface(w, h);
-        // Per-element knockout composites against the (transparent) initial
-        // backdrop preserved here.
-        // This backend currently approximates every non-passthrough group as
-        // isolated, so its initial backdrop is transparent. Do not clone the
-        // full-page transparent pixmap merely to represent that fact.
+        // Non-isolated Normal groups carrying constant alpha and/or a soft mask
+        // (e.g. a masked backdrop-dependent tiling pattern, ISO 32000-1 §11.6.7)
+        // start from a copy of the live backdrop so inner blend modes evaluate
+        // against the real destination, and `pop_blend_group` applies
+        // `alpha * mask` once via `mix(backdrop, group, alpha * mask)`.
+        let non_isolated = !isolated && !knockout && blend_mode == BlendMode::Normal;
+        let mut group = self.take_surface(w, h);
+        if non_isolated {
+            if let Some(ref mut g) = group {
+                g.data_mut().copy_from_slice(pixmap.data());
+            }
+        }
         let backdrop = None;
 
         // The backdrop's painted region is parked with it; the group gets a
-        // fresh, empty surface of its own.
+        // fresh surface of its own.
         let backdrop_dirty = self.dirty.take();
 
         self.blend_stack.push(BlendEntry {
@@ -2666,6 +2950,7 @@ impl<'a> CpuRenderer<'a> {
             knockout,
             backdrop,
             passthrough: false,
+            non_isolated,
         });
 
         self.pixmap = group;
@@ -2707,6 +2992,56 @@ impl<'a> CpuRenderer<'a> {
         // and cannot have been affected.
         let group_dirty = self.dirty.take();
         let region = group_dirty.filter(|r| !r.is_empty());
+
+        if entry.non_isolated {
+            let mut base = entry.pixmap;
+            if let Some(region) = region {
+                let alpha = unit(entry.alpha);
+                let stride = base.width() as usize;
+                let dst_data = base.data_mut();
+                let src_data = group_pixmap.data();
+                for y in region.y0 as usize..region.y1 as usize {
+                    let row = y * stride;
+                    let m_row = entry.mask.as_ref().and_then(|plane| {
+                        plane.get(row + region.x0 as usize..row + region.x1 as usize)
+                    });
+                    for (dx, x) in (region.x0 as usize..region.x1 as usize).enumerate() {
+                        let m = m_row.map_or(1.0, |r| r[dx] as f32 / 255.0);
+                        let w_eff = (alpha * m).clamp(0.0, 1.0);
+                        if w_eff <= 0.0 {
+                            continue;
+                        }
+                        let p = (row + x) * 4;
+                        if w_eff >= 1.0 {
+                            dst_data[p..p + 4].copy_from_slice(&src_data[p..p + 4]);
+                        } else {
+                            let inv = 1.0 - w_eff;
+                            for ch in 0..4 {
+                                dst_data[p + ch] = (dst_data[p + ch] as f32 * inv
+                                    + src_data[p + ch] as f32 * w_eff)
+                                    .round()
+                                    .clamp(0.0, 255.0)
+                                    as u8;
+                            }
+                        }
+                    }
+                }
+            }
+            self.pixmap = Some(base);
+            self.dirty = match (entry.dirty, group_dirty) {
+                (Some(backdrop), Some(group)) => Some(backdrop.union(group)),
+                (backdrop, group) => backdrop.or(group),
+            };
+            self.blend_surface_bytes = self
+                .blend_surface_bytes
+                .saturating_sub(surface_bytes(&group_pixmap));
+            // The entire group surface was seeded with `base`, so clear all of
+            // it when returning it to `surface_pool`.
+            let whole = PaintedBounds::whole(group_pixmap.width(), group_pixmap.height());
+            self.recycle_surface(group_pixmap, Some(whole));
+            self.tock(t, |s| &mut s.soft_mask_ns);
+            return;
+        }
 
         // Fold the soft mask into the group: premultiplied RGBA scales
         // uniformly by the per-pixel mask coverage. Confined to the composite
