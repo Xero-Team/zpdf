@@ -215,6 +215,11 @@ impl PptxWriter {
     }
 
     fn generate_shape_xml(&self, elem: &SlideElement, id: usize) -> String {
+        self.generate_shape_xml_with_alpha(elem, id, 1.0)
+    }
+
+    fn generate_shape_xml_with_alpha(&self, elem: &SlideElement, id: usize, alpha: f32) -> String {
+        let alpha_pct = alpha_to_ooxml_pct(alpha);
         match elem {
             SlideElement::Transformed {
                 element,
@@ -227,15 +232,27 @@ impl PptxWriter {
                 } else {
                     0
                 };
-                self.generate_shape_xml(element, id).replacen(
-                    "<a:xfrm>",
-                    &format!(
-                        "<a:xfrm rot=\"{rotation}\" flipH=\"{}\" flipV=\"{}\">",
-                        u8::from(*flip_h),
-                        u8::from(*flip_v)
-                    ),
-                    1,
-                )
+                self.generate_shape_xml_with_alpha(element, id, alpha)
+                    .replacen(
+                        "<a:xfrm>",
+                        &format!(
+                            "<a:xfrm rot=\"{rotation}\" flipH=\"{}\" flipV=\"{}\">",
+                            u8::from(*flip_h),
+                            u8::from(*flip_v)
+                        ),
+                        1,
+                    )
+            }
+            SlideElement::Opacity {
+                element,
+                alpha: inner_alpha,
+            } => {
+                let combined = if inner_alpha.is_finite() {
+                    alpha * inner_alpha.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                self.generate_shape_xml_with_alpha(element, id, combined)
             }
             SlideElement::TextBox {
                 text,
@@ -249,8 +266,7 @@ impl PptxWriter {
                 bold,
                 italic,
             } => {
-                let color_hex =
-                    format!("{:02X}{:02X}{:02X}", color_rgb.0, color_rgb.1, color_rgb.2);
+                let color_xml = srgb_clr_xml(*color_rgb, alpha_pct);
                 let font_size_hpt = (font_size_pt * 100.0) as i64; // hundredths of a point
                 let bold_attr = if *bold { r#" b="1""# } else { "" };
                 let italic_attr = if *italic { r#" i="1""# } else { "" };
@@ -281,7 +297,7 @@ impl PptxWriter {
             <a:r>
               <a:rPr lang="en-US" sz="{}"{}{}>
               <a:solidFill>
-                <a:srgbClr val="{}"/>
+                {}
               </a:solidFill>
               <a:latin typeface="{}"/>
               </a:rPr>
@@ -300,7 +316,7 @@ impl PptxWriter {
                     font_size_hpt,
                     bold_attr,
                     italic_attr,
-                    color_hex,
+                    color_xml,
                     escape_xml(font_family),
                     escape_xml(text)
                 )
@@ -317,10 +333,10 @@ impl PptxWriter {
                 let fill_xml = if let Some(rgb) = fill_rgb {
                     format!(
                         r#"          <a:solidFill>
-            <a:srgbClr val="{:02X}{:02X}{:02X}"/>
+            {}
           </a:solidFill>
 "#,
-                        rgb.0, rgb.1, rgb.2
+                        srgb_clr_xml(*rgb, alpha_pct)
                     )
                 } else {
                     String::from("          <a:noFill/>\n")
@@ -331,11 +347,12 @@ impl PptxWriter {
                     format!(
                         r#"          <a:ln w="{}">
             <a:solidFill>
-              <a:srgbClr val="{:02X}{:02X}{:02X}"/>
+              {}
             </a:solidFill>
           </a:ln>
 "#,
-                        width_emu, rgb.0, rgb.1, rgb.2
+                        width_emu,
+                        srgb_clr_xml(*rgb, alpha_pct)
                     )
                 } else {
                     String::new()
@@ -379,10 +396,10 @@ impl PptxWriter {
                 let fill_xml = if let Some(rgb) = fill_rgb {
                     format!(
                         r#"          <a:solidFill>
-            <a:srgbClr val="{:02X}{:02X}{:02X}"/>
+            {}
           </a:solidFill>
 "#,
-                        rgb.0, rgb.1, rgb.2
+                        srgb_clr_xml(*rgb, alpha_pct)
                     )
                 } else {
                     String::from("          <a:noFill/>\n")
@@ -393,11 +410,12 @@ impl PptxWriter {
                     format!(
                         r#"          <a:ln w="{}">
             <a:solidFill>
-              <a:srgbClr val="{:02X}{:02X}{:02X}"/>
+              {}
             </a:solidFill>
           </a:ln>
 "#,
-                        width_emu, rgb.0, rgb.1, rgb.2
+                        width_emu,
+                        srgb_clr_xml(*rgb, alpha_pct)
                     )
                 } else {
                     String::new()
@@ -457,7 +475,7 @@ impl PptxWriter {
           </a:prstGeom>
           <a:ln w="{}">
             <a:solidFill>
-              <a:srgbClr val="{:02X}{:02X}{:02X}"/>
+              {}
             </a:solidFill>
           </a:ln>
         </p:spPr>
@@ -472,9 +490,7 @@ impl PptxWriter {
                     (x2_emu - x1_emu).abs(),
                     (y2_emu - y1_emu).abs(),
                     width_emu,
-                    stroke_rgb.0,
-                    stroke_rgb.1,
-                    stroke_rgb.2
+                    srgb_clr_xml(*stroke_rgb, alpha_pct)
                 )
             }
             SlideElement::Image {
@@ -519,8 +535,15 @@ impl PptxWriter {
                 fill_rgb,
                 stroke_rgb,
                 stroke_width_pt,
-            } => freeform_shape(id, path_data, *fill_rgb, *stroke_rgb, *stroke_width_pt)
-                .unwrap_or_default(),
+            } => freeform_shape(
+                id,
+                path_data,
+                *fill_rgb,
+                *stroke_rgb,
+                *stroke_width_pt,
+                alpha_pct,
+            )
+            .unwrap_or_default(),
         }
     }
 
@@ -601,6 +624,29 @@ mod tests {
     }
 }
 
+/// Convert normalized opacity `0.0..=1.0` to OOXML `ST_PositiveFixedPercentage`
+/// (`0..=100_000`, thousandths of a percent).
+fn alpha_to_ooxml_pct(alpha: f32) -> u32 {
+    if !alpha.is_finite() {
+        return 0;
+    }
+    (alpha.clamp(0.0, 1.0) * 100_000.0).round() as u32
+}
+
+fn srgb_clr_xml(rgb: (u8, u8, u8), alpha_pct: u32) -> String {
+    if alpha_pct >= 100_000 {
+        format!(
+            r#"<a:srgbClr val="{:02X}{:02X}{:02X}"/>"#,
+            rgb.0, rgb.1, rgb.2
+        )
+    } else {
+        format!(
+            r#"<a:srgbClr val="{:02X}{:02X}{:02X}"><a:alpha val="{alpha_pct}"/></a:srgbClr>"#,
+            rgb.0, rgb.1, rgb.2
+        )
+    }
+}
+
 /// Convert the SVG-style path data emitted by `SlideConverter::path_to_svg`
 /// into a DrawingML custom-geometry shape. Coordinates in `path_data` are in
 /// point space with y already flipped for PowerPoint.
@@ -610,6 +656,7 @@ fn freeform_shape(
     fill: Option<(u8, u8, u8)>,
     stroke: Option<(u8, u8, u8)>,
     stroke_width_pt: f64,
+    alpha_pct: u32,
 ) -> Option<String> {
     #[derive(Clone, Copy)]
     enum Cmd {
@@ -718,15 +765,17 @@ fn freeform_shape(
     }
 
     let fill_xml = match fill {
-        Some((r, g, b)) => {
-            format!("<a:solidFill><a:srgbClr val=\"{r:02X}{g:02X}{b:02X}\"/></a:solidFill>")
-        }
+        Some(rgb) => format!(
+            "<a:solidFill>{}</a:solidFill>",
+            srgb_clr_xml(rgb, alpha_pct)
+        ),
         None => "<a:noFill/>".to_string(),
     };
     let line_xml = match stroke {
-        Some((r, g, b)) => format!(
-            "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{r:02X}{g:02X}{b:02X}\"/></a:solidFill></a:ln>",
-            line_width_emu(stroke_width_pt)
+        Some(rgb) => format!(
+            "<a:ln w=\"{}\"><a:solidFill>{}</a:solidFill></a:ln>",
+            line_width_emu(stroke_width_pt),
+            srgb_clr_xml(rgb, alpha_pct)
         ),
         None => "<a:ln><a:noFill/></a:ln>".to_string(),
     };
@@ -784,6 +833,7 @@ mod freeform_tests {
             Some((255, 0, 0)),
             Some((0, 0, 0)),
             1.0,
+            100_000,
         )
         .expect("shape");
         assert!(shape.contains("<a:custGeom>"), "{shape}");
@@ -792,11 +842,26 @@ mod freeform_tests {
         assert!(shape.contains("<a:cubicBezTo>"), "{shape}");
         assert!(shape.contains("<a:close/>"), "{shape}");
         assert!(shape.contains("val=\"FF0000\""), "{shape}");
+        assert!(!shape.contains("<a:alpha"), "{shape}");
+
+        let translucent = freeform_shape(
+            8,
+            "M 10 10 L 30 10 L 30 20 Z",
+            Some((0, 0, 255)),
+            None,
+            0.0,
+            50_000,
+        )
+        .expect("translucent shape");
+        assert!(
+            translucent.contains(r#"<a:srgbClr val="0000FF"><a:alpha val="50000"/></a:srgbClr>"#),
+            "{translucent}"
+        );
     }
 
     #[test]
     fn malformed_path_data_is_skipped() {
-        assert!(freeform_shape(1, "M 10", None, None, 0.0).is_none());
-        assert!(freeform_shape(1, "garbage", None, None, 0.0).is_none());
+        assert!(freeform_shape(1, "M 10", None, None, 0.0, 100_000).is_none());
+        assert!(freeform_shape(1, "garbage", None, None, 0.0, 100_000).is_none());
     }
 }

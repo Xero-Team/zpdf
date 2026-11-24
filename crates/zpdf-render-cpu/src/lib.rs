@@ -535,6 +535,22 @@ impl<'a> CpuRenderer<'a> {
         self
     }
 
+    /// Borrow the in-progress root page surface `(width, height, premultiplied_rgba)`
+    /// while a page is open (between `begin_page` and `end_page`) and no
+    /// non-passthrough blend group is currently parked on `blend_stack`.
+    pub fn current_surface(&self) -> Option<(u32, u32, &[u8])> {
+        if self.blend_stack.iter().any(|entry| !entry.passthrough) {
+            return None;
+        }
+        let pixmap = self.pixmap.as_ref()?;
+        Some((pixmap.width(), pixmap.height(), pixmap.data()))
+    }
+
+    /// Effective device pixel scale currently installed by `begin_page`.
+    pub fn current_scale(&self) -> f32 {
+        self.scale
+    }
+
     /// Start a stopwatch, or `None` when not collecting. Pair with [`Self::tock`].
     fn tick(&self) -> Option<zpdf_core::time::Instant> {
         self.stage_stats
