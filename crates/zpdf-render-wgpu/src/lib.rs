@@ -2554,12 +2554,10 @@ fn record_tiling_glyph_run(
     if opacity <= 0.0 || !rec.can_record() {
         return;
     }
-    let paint_masked = |rec: &mut PageRecorder, eff_opacity: f32| {
-        let mut mask_bounds = None;
-        let shape_ops = rec.record_subops_clipped(|r| {
-            mask_bounds =
-                glyph::render_glyph_run_mask_and_bounds_transformed(r, fonts, map, run, outer_ctm);
-        });
+    let paint_shape_ops = |rec: &mut PageRecorder,
+                           shape_ops: Vec<record::PageOp>,
+                           mask_bounds: Option<zpdf_core::Rect>,
+                           eff_opacity: f32| {
         if shape_ops.is_empty() || !rec.can_record() {
             return;
         }
@@ -2609,6 +2607,27 @@ fn record_tiling_glyph_run(
                 );
             });
         }
+    };
+    let is_type3 = fonts.get(run.font_id).is_some_and(|f| f.is_type3());
+    let paint_masked = |rec: &mut PageRecorder, eff_opacity: f32| {
+        if is_type3 {
+            glyph::render_type3_tiling_transformed(
+                rec,
+                fonts,
+                map,
+                run,
+                outer_ctm,
+                eff_opacity,
+                |r, ops, bounds| paint_shape_ops(r, ops, bounds, eff_opacity),
+            );
+            return;
+        }
+        let mut mask_bounds = None;
+        let shape_ops = rec.record_subops_clipped(|r| {
+            mask_bounds =
+                glyph::render_glyph_run_mask_and_bounds_transformed(r, fonts, map, run, outer_ctm);
+        });
+        paint_shape_ops(rec, shape_ops, mask_bounds, eff_opacity);
     };
     match run.overprint {
         Some(op) if op.active != 0 => {
@@ -4756,6 +4775,212 @@ mod resource_tests {
         assert!(
             ref_ids.contains(&record::TYPE3_IMAGE_ID_BASE),
             "mask ops must reference the recorded Type 3 stencil image id, got {ref_ids:?}"
+        );
+    }
+
+    #[test]
+    fn type3_repeated_glyph_reuses_single_texture_within_budget() {
+        // 256×256 1-bit `/IM true` bitmap glyph = 256 KiB RGBA texture.
+        // Nine occurrences would exceed a 2 MiB `max_gpu_texture_bytes` cap if
+        // each occurrence pushed a duplicate texture; reusing one texture ID
+        // lets all nine record cleanly while preserving independent placements.
+        let mut glyph_stream = b"BI /W 256 /H 256 /BPC 1 /IM true ID ".to_vec();
+        glyph_stream.extend(std::iter::repeat_n(0x00u8, 256 * 32));
+        glyph_stream.extend_from_slice(b" EI");
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    std::sync::Arc::<[u8]>::from(glyph_stream),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3Repeated256".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = zpdf_font::FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let glyphs = (0..9)
+            .map(|i| zpdf_display_list::PositionedGlyph {
+                glyph_id: 0,
+                x: i as f32 * 10.0,
+                y: 0.0,
+                code: b'A' as u32,
+                code_len: 1,
+                advance: 10.0,
+            })
+            .collect();
+        let run = zpdf_display_list::GlyphRun {
+            font_id,
+            font_size: 8.0,
+            transform: zpdf_core::Matrix::translate(2.0, 2.0),
+            glyphs,
+            paint: Paint::Solid(zpdf_display_list::Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 0.5,
+            h_scale: 1.0,
+            overprint: None,
+        };
+
+        let limits = zpdf_core::ParseLimits {
+            max_gpu_texture_bytes: 2 * 1024 * 1024, // 2 MiB (holds at most 8 × 256 KiB)
+            ..Default::default()
+        };
+        let page_rect = Rect::new(0.0, 0.0, 120.0, 20.0);
+        let map = PageMap::new(page_rect, 1.0);
+        let mut rec = PageRecorder::default()
+            .with_limits(&limits)
+            .with_page_rect(page_rect);
+        glyph::render_glyph_run(&mut rec, &fonts, &map, &run);
+        assert!(
+            rec.ensure_within_budget().is_ok(),
+            "9 occurrences reusing 1 texture must fit 2 MiB texture quota"
+        );
+        assert_eq!(
+            rec.type3_images.len(),
+            1,
+            "all 9 occurrences must share a single Type 3 texture entry"
+        );
+        let image_ops: Vec<u32> = rec
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                record::PageOp::Image { image_id, .. } => Some(*image_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(image_ops.len(), 9);
+        assert!(
+            image_ops
+                .iter()
+                .all(|&id| id == record::TYPE3_IMAGE_ID_BASE),
+            "all 9 quads must reference the same cached texture ID"
+        );
+        // Verify distinct quad X positions and preserved per-quad opacity (128/255 ≈ 0.5).
+        assert!(
+            (rec.tex_vertices[4].pos[0] - rec.tex_vertices[0].pos[0] - 10.0).abs() < 0.01,
+            "second occurrence must stay translated by 10pt"
+        );
+        assert!(
+            (rec.tex_vertices[0].color[3] - 128.0 / 255.0).abs() < 1e-3,
+            "expected quantized 0.5 opacity on quad, got {}",
+            rec.tex_vertices[0].color[3]
+        );
+        // A second run with the same RGB tint at a different opacity (0.25)
+        // must still reuse the same cached texture ID with its own quad alpha.
+        let mut run2 = run;
+        run2.glyphs.truncate(1);
+        run2.alpha = 0.25;
+        glyph::render_glyph_run(&mut rec, &fonts, &map, &run2);
+        assert_eq!(
+            rec.type3_images.len(),
+            1,
+            "same stencil tint at a different opacity must reuse the same texture"
+        );
+        let last_v = rec.tex_vertices.last().unwrap();
+        assert!(
+            (last_v.color[3] - 64.0 / 255.0).abs() < 1e-3,
+            "second run quad must carry its own 0.25 opacity, got {}",
+            last_v.color[3]
+        );
+    }
+
+    #[test]
+    fn type3_d0_colored_image_under_tiling_paint_keeps_rgb_image_direct() {
+        let d0_stream =
+            b"1 0 d0 BI /W 2 /H 2 /CS /RGB /BPC 8 ID \xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00\x00 EI";
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    std::sync::Arc::<[u8]>::from(&d0_stream[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3ColoredD0Tiling".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = zpdf_font::FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 4.0, 4.0));
+        let mut r = zpdf_display_list::Path::new();
+        r.rect(Rect::new(0.0, 0.0, 4.0, 4.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(zpdf_display_list::Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 4.0, 4.0),
+            x_step: 4.0,
+            y_step: 4.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let run = zpdf_display_list::GlyphRun {
+            font_id,
+            font_size: 12.0,
+            transform: zpdf_core::Matrix::translate(2.0, 2.0),
+            glyphs: vec![zpdf_display_list::PositionedGlyph {
+                glyph_id: 0,
+                x: 0.0,
+                y: 0.0,
+                code: b'A' as u32,
+                code_len: 1,
+                advance: 12.0,
+            }],
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 1.0,
+            h_scale: 1.0,
+            overprint: None,
+        };
+
+        let page_rect = Rect::new(0.0, 0.0, 20.0, 20.0);
+        let map = PageMap::new(page_rect, 1.0);
+        let mut rec = PageRecorder::default()
+            .with_limits(&zpdf_core::ParseLimits::default())
+            .with_page_rect(page_rect);
+        record_tiling_glyph_run(
+            &mut rec,
+            &run,
+            &tiling,
+            &zpdf_core::Matrix::identity(),
+            &fonts,
+            None,
+            &map,
+            0,
+        );
+        assert!(rec.ensure_within_budget().is_ok());
+        assert_eq!(rec.type3_images.len(), 1);
+        assert_eq!(
+            &rec.type3_images[0].data[0..4],
+            &[255, 0, 0, 255],
+            "d0 colored RGB image must preserve intrinsic red pixels"
+        );
+        assert!(
+            !rec.ops
+                .iter()
+                .any(|op| matches!(op, record::PageOp::PushBlend { .. })),
+            "pure d0 colored image must draw directly without masking through tiling pattern"
+        );
+        assert!(
+            rec.ops
+                .iter()
+                .any(|op| matches!(op, record::PageOp::Image { image_id, .. } if *image_id == record::TYPE3_IMAGE_ID_BASE)),
+            "d0 colored image must emit a direct PageOp::Image"
         );
     }
 }

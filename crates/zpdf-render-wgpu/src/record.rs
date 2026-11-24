@@ -262,6 +262,7 @@ pub struct PageRecorder {
     /// Inline decoded images produced while interpreting Type 3 glyph CharProcs
     /// (e.g. `/ImageMask true` bitmap stencils), indexed via `TYPE3_IMAGE_ID_BASE`.
     pub type3_images: Vec<zpdf_image::DecodedImage>,
+    type3_image_cache: std::collections::HashMap<Type3ImageKey, u32>,
     type3_image_bytes: u64,
     /// Per-page memo of `TilingPattern::is_backdrop_dependent()`, retaining
     /// each cell `Arc<DisplayList>` so pointer keys never alias freed memory.
@@ -298,6 +299,19 @@ pub struct PageRecorder {
     /// A failed child or append invalidates the whole page. Latching the error
     /// lets sub-list recording unwind its state before the renderer drops it.
     recording_error: Option<&'static str>,
+}
+
+/// Stable identity for an inline image texture decoded inside a Type 3 CharProc
+/// so repeated occurrences of the same glyph reuse one texture ID while keeping
+/// independent per-quad transforms and opacity.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Type3ImageKey {
+    pub font_id: zpdf_font::FontId,
+    pub glyph_id: u16,
+    pub image_id: zpdf_image::ImageId,
+    /// Straight RGB tint bits for `/ImageMask true` stencils; `None` for
+    /// intrinsic colored (`d0`) images.
+    pub stencil_tint: Option<[u32; 3]>,
 }
 
 /// Base image ID reserved for inline images decoded inside Type 3 CharProcs
@@ -422,12 +436,22 @@ impl PageRecorder {
         self.type3_images.get(idx)
     }
 
-    /// Store a decoded inline Type 3 glyph image (honoring `max_gpu_texture_bytes`)
-    /// and record an image quad referencing it.
-    pub fn add_type3_image(&mut self, quad: [TexturedVertex; 4], img: zpdf_image::DecodedImage) {
+    /// Store (or reuse) a decoded inline Type 3 glyph image under `key`
+    /// (honoring `max_gpu_texture_bytes`) and record an image quad referencing it.
+    pub fn add_type3_image_cached(
+        &mut self,
+        key: Type3ImageKey,
+        quad: [TexturedVertex; 4],
+        make_img: impl FnOnce() -> zpdf_image::DecodedImage,
+    ) {
         if !self.can_record() {
             return;
         }
+        if let Some(&image_id) = self.type3_image_cache.get(&key) {
+            self.add_image(quad, image_id);
+            return;
+        }
+        let img = make_img();
         let img_bytes = (img.width as u64)
             .saturating_mul(img.height as u64)
             .saturating_mul(4);
@@ -446,6 +470,7 @@ impl PageRecorder {
         };
         self.type3_image_bytes = next_bytes;
         self.type3_images.push(img);
+        self.type3_image_cache.insert(key, image_id);
         self.add_image(quad, image_id);
     }
 
@@ -1101,11 +1126,24 @@ impl PageRecorder {
     /// clip stack stamped up front (used to build a single-pass shape+clip AA
     /// coverage mask for backdrop-dependent tiling patterns).
     pub fn record_subops_clipped(&mut self, f: impl FnOnce(&mut Self)) -> Vec<PageOp> {
+        let mut sub = Vec::new();
+        self.record_subops_clipped_into(&mut sub, f);
+        sub
+    }
+
+    /// Append clipped sub-ops into `dst`, stamping the caller's active clip
+    /// stack once when `dst` starts empty. Returns `true` if `f` appended at
+    /// least one op beyond the initial clip stamps.
+    pub fn record_subops_clipped_into(
+        &mut self,
+        dst: &mut Vec<PageOp>,
+        f: impl FnOnce(&mut Self),
+    ) -> bool {
         let nested_offset = self
             .blend_depth_offset
             .saturating_add(self.blend_depth)
             .saturating_add(1);
-        let saved_ops = std::mem::take(&mut self.ops);
+        let saved_ops = std::mem::replace(&mut self.ops, std::mem::take(dst));
         let saved_stack = self.clip_stack.clone();
         let saved_depth = self.clip_depth;
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
@@ -1114,17 +1152,21 @@ impl PageRecorder {
         let saved_blend_frames = std::mem::take(&mut self.blend_frames);
         let saved_opaque_canvas = std::mem::replace(&mut self.opaque_canvas, false);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
-        for entry in &self.clip_stack {
-            if let Some(range) = entry.range {
-                self.ops.push(PageOp::StampClip {
-                    range,
-                    ref_value: entry.ref_value,
-                });
+        if self.ops.is_empty() {
+            for entry in &self.clip_stack {
+                if let Some(range) = entry.range {
+                    self.ops.push(PageOp::StampClip {
+                        range,
+                        ref_value: entry.ref_value,
+                    });
+                }
             }
         }
+        let len_before = self.ops.len();
         f(self);
         self.close_open_blends();
-        let sub = std::mem::replace(&mut self.ops, saved_ops);
+        let added = self.ops.len() > len_before;
+        *dst = std::mem::replace(&mut self.ops, saved_ops);
         self.clip_stack = saved_stack;
         self.clip_depth = saved_depth;
         self.blend_depth = saved_blend_depth;
@@ -1133,7 +1175,7 @@ impl PageRecorder {
         self.blend_frames = saved_blend_frames;
         self.opaque_canvas = saved_opaque_canvas;
         self.isolated_depth = saved_isolated_depth;
-        sub
+        added
     }
 
     /// Record a sub-sequence (a soft mask's commands) into the SHARED geometry

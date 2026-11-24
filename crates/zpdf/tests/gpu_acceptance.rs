@@ -2906,10 +2906,11 @@ fn gpu_type3_bitmap_glyph_tiling_preserves_silhouette() {
         .expect("cpu render");
     let gpu = match render_gpu_shared(&dl, Some(&fonts), None, 1.0) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("skipping GPU Type 3 bitmap glyph test (no adapter?): {e}");
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU Type 3 bitmap glyph test (no adapter)");
             return;
         }
+        Err(e) => panic!("GPU Type 3 bitmap glyph render failed: {e}"),
     };
 
     // Glyph spans PDF [8..32]×[8..32] -> pixel [8..32]×[8..32].
@@ -2989,10 +2990,11 @@ fn gpu_type3_colored_inline_image_applies_text_opacity() {
         .expect("cpu render");
     let gpu = match render_gpu_shared(&dl, Some(&fonts), None, 1.0) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("skipping GPU Type 3 colored inline image opacity test (no adapter?): {e}");
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU Type 3 colored inline image opacity test (no adapter)");
             return;
         }
+        Err(e) => panic!("GPU Type 3 colored inline image opacity render failed: {e}"),
     };
 
     let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
@@ -3109,18 +3111,134 @@ fn pdf_type3_bitmap_glyph_with_tiling_pattern_interprets_and_renders_cpu_and_gpu
     );
     assert_eq!(cpu_bot, [255, 255, 255], "CPU bottom half must stay white");
 
-    if let Ok(gpu) = render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
-        let gpu_red = px(&gpu.data, gpu.width, 10, 14);
-        let gpu_blue = px(&gpu.data, gpu.width, 14, 14);
-        let gpu_bot = px(&gpu.data, gpu.width, 10, 26);
-        assert!(
-            gpu_red[0] > 240 && gpu_red[1] < 15 && gpu_red[2] < 15,
-            "GPU Type 3 bitmap glyph top-left must show red pattern stripe, got {gpu_red:?}"
-        );
-        assert!(
-            gpu_blue[0] < 15 && gpu_blue[1] < 15 && gpu_blue[2] > 240,
-            "GPU Type 3 bitmap glyph top-right must show blue pattern stripe, got {gpu_blue:?}"
-        );
-        assert_eq!(gpu_bot, [255, 255, 255], "GPU bottom half must stay white");
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+        Ok(p) => p,
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU Type 3 PDF tiling bitmap glyph test (no adapter)");
+            return;
+        }
+        Err(e) => panic!("GPU Type 3 PDF tiling bitmap glyph render failed: {e}"),
+    };
+    let gpu_red = px(&gpu.data, gpu.width, 10, 14);
+    let gpu_blue = px(&gpu.data, gpu.width, 14, 14);
+    let gpu_bot = px(&gpu.data, gpu.width, 10, 26);
+    assert!(
+        gpu_red[0] > 240 && gpu_red[1] < 15 && gpu_red[2] < 15,
+        "GPU Type 3 bitmap glyph top-left must show red pattern stripe, got {gpu_red:?}"
+    );
+    assert!(
+        gpu_blue[0] < 15 && gpu_blue[1] < 15 && gpu_blue[2] > 240,
+        "GPU Type 3 bitmap glyph top-right must show blue pattern stripe, got {gpu_blue:?}"
+    );
+    assert_eq!(gpu_bot, [255, 255, 255], "GPU bottom half must stay white");
+}
+
+#[test]
+fn pdf_type3_colored_d0_image_preserves_rgb_under_tiling_pattern() {
+    let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+        let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(b"\nendstream");
+        out
+    };
+    // Colored `d0` glyph 'A': 2×2 opaque red DeviceRGB inline image.
+    let d0_charproc =
+        b"1 0 d0 BI /W 2 /H 2 /CS /RGB /BPC 8 ID \xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00\x00 EI";
+    // Uncolored `d1` glyph 'B': 8×8 stencil (`/IM true`), all opaque ink.
+    let d1_charproc =
+        b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI";
+    // 8×8 opaque blue tiling pattern.
+    let pat_content = b"0 0 1 rg 0 0 8 8 re f";
+    let page_content = b"/Pattern cs /P1 scn BT /F1 20 Tf 8 10 Td (AB) Tj ET";
+
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 60 40] \
+          /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 8 0 R >> >> \
+          /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", page_content),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1 1] \
+          /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R /B 7 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A /B] >> \
+          /FirstChar 65 /LastChar 66 /Widths [1 1] >>"
+            .to_vec(),
+        stream("", d0_charproc),
+        stream("", d1_charproc),
+        stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 8 8] /XStep 8 /YStep 8",
+            pat_content,
+        ),
+    ];
+
+    let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (idx, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
     }
+    let xref = pdf.len();
+    let count = objects.len() + 1;
+    pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+    for off in offsets {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let doc = zpdf::PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+    let mut images = zpdf_image::ImageCache::new();
+    let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+        .with_document(doc.file(), &page.resources)
+        .with_fonts(&mut fonts)
+        .with_images(&mut images);
+    let (dl, _) = interpreter.interpret_with_stats(&content);
+
+    let cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    // Glyph 'A' (d0 red RGB image) spans PDF x=[8..28], y=[10..30] -> pixel (18, 20).
+    // Glyph 'B' (d1 stencil) spans PDF x=[28..48], y=[10..30] -> pixel (38, 20).
+    let cpu_a = px(&cpu.data, cpu.width, 18, 20);
+    let cpu_b = px(&cpu.data, cpu.width, 38, 20);
+    assert!(
+        cpu_a[0] > 240 && cpu_a[1] < 15 && cpu_a[2] < 15,
+        "CPU colored d0 Type 3 RGB image must stay red under blue tiling pattern, got {cpu_a:?}"
+    );
+    assert!(
+        cpu_b[0] < 15 && cpu_b[1] < 15 && cpu_b[2] > 240,
+        "CPU uncolored d1 Type 3 stencil must inherit blue tiling pattern, got {cpu_b:?}"
+    );
+
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+        Ok(p) => p,
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU Type 3 d0/d1 tiling test (no adapter)");
+            return;
+        }
+        Err(e) => panic!("GPU Type 3 d0/d1 tiling render failed: {e}"),
+    };
+    let gpu_a = px(&gpu.data, gpu.width, 18, 20);
+    let gpu_b = px(&gpu.data, gpu.width, 38, 20);
+    assert!(
+        gpu_a[0] > 240 && gpu_a[1] < 15 && gpu_a[2] < 15,
+        "GPU colored d0 Type 3 RGB image must preserve red RGB under blue tiling pattern, got {gpu_a:?}"
+    );
+    assert!(
+        gpu_b[0] < 15 && gpu_b[1] < 15 && gpu_b[2] > 240,
+        "GPU uncolored d1 Type 3 stencil must inherit blue tiling pattern, got {gpu_b:?}"
+    );
 }

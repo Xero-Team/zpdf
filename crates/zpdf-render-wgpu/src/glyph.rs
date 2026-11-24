@@ -18,7 +18,7 @@ use zpdf_font::{FontCache, GlyphOutline, LoadedFont, OutlineCommand};
 
 use crate::glyph_atlas::{self, GlyphKey};
 use crate::path::{fill_lyon_path, stroke_lyon_path, TOLERANCE};
-use crate::record::PageRecorder;
+use crate::record::{PageOp, PageRecorder, Type3ImageKey};
 use crate::transform::{quantize_premul, PageMap};
 
 /// Run-level constants for the glyph-space -> device-pixel transform.
@@ -435,7 +435,7 @@ fn render_type3(
                             font_matrix[5],
                         ))
                         .concat(&draw.transform);
-                    let (upload_img, eff_alpha) = if draw.is_image_mask {
+                    if draw.is_image_mask {
                         let a_scale = color[3].clamp(0.0, 1.0);
                         if a_scale <= 0.0 {
                             continue;
@@ -445,42 +445,310 @@ fn render_type3(
                             (color[1] / a_scale).clamp(0.0, 1.0),
                             (color[2] / a_scale).clamp(0.0, 1.0),
                         );
-                        let mut tinted = src_img.clone();
-                        for px in tinted.data.as_chunks_mut::<4>().0 {
-                            let pa = px[3];
-                            if pa == 0 {
-                                px[0] = 0;
-                                px[1] = 0;
-                                px[2] = 0;
-                                continue;
-                            }
-                            let paf = pa as f32;
-                            px[0] = (r_s * paf).round() as u8;
-                            px[1] = (g_s * paf).round() as u8;
-                            px[2] = (b_s * paf).round() as u8;
+                        let eff_alpha = draw.alpha * a_scale;
+                        if eff_alpha <= 0.0 {
+                            continue;
                         }
-                        (tinted, draw.alpha * a_scale)
+                        let quad = crate::image::image_quad(
+                            src_img.width as f32,
+                            src_img.height as f32,
+                            &glyph_to_page,
+                            map,
+                            eff_alpha,
+                        );
+                        if crate::image::is_safe_quad(&quad) {
+                            let key = Type3ImageKey {
+                                font_id: run.font_id,
+                                glyph_id: g.glyph_id,
+                                image_id: draw.image_id,
+                                stencil_tint: Some([r_s.to_bits(), g_s.to_bits(), b_s.to_bits()]),
+                            };
+                            rec.add_type3_image_cached(key, quad, || {
+                                let mut tinted = src_img.clone();
+                                for px in tinted.data.as_chunks_mut::<4>().0 {
+                                    let pa = px[3];
+                                    if pa == 0 {
+                                        px[0] = 0;
+                                        px[1] = 0;
+                                        px[2] = 0;
+                                        continue;
+                                    }
+                                    let paf = pa as f32;
+                                    px[0] = (r_s * paf).round() as u8;
+                                    px[1] = (g_s * paf).round() as u8;
+                                    px[2] = (b_s * paf).round() as u8;
+                                }
+                                tinted
+                            });
+                        }
                     } else {
                         let eff_alpha = draw.alpha * image_alpha;
                         if eff_alpha <= 0.0 {
                             continue;
                         }
-                        (src_img.clone(), eff_alpha)
-                    };
-                    let quad = crate::image::image_quad(
-                        upload_img.width as f32,
-                        upload_img.height as f32,
-                        &glyph_to_page,
-                        map,
-                        eff_alpha,
-                    );
-                    if crate::image::is_safe_quad(&quad) {
-                        rec.add_type3_image(quad, upload_img);
+                        let quad = crate::image::image_quad(
+                            src_img.width as f32,
+                            src_img.height as f32,
+                            &glyph_to_page,
+                            map,
+                            eff_alpha,
+                        );
+                        if crate::image::is_safe_quad(&quad) {
+                            let key = Type3ImageKey {
+                                font_id: run.font_id,
+                                glyph_id: g.glyph_id,
+                                image_id: draw.image_id,
+                                stencil_tint: None,
+                            };
+                            rec.add_type3_image_cached(key, quad, || src_img.clone());
+                        }
                     }
                 }
                 _ => {}
             }
         }
+    }
+}
+
+/// Record a Type 3 glyph run whose active paint is `Paint::Tiling`, keeping
+/// intrinsic colored (`d0`) non-mask images in their own RGB colors while
+/// batching inherited fills, strokes, and `/ImageMask true` stencils into
+/// alpha coverage masks passed to `paint_masked_batch` in exact painter's order.
+#[allow(clippy::too_many_arguments)]
+pub fn render_type3_tiling_transformed(
+    rec: &mut PageRecorder,
+    fonts: &FontCache,
+    map: &PageMap,
+    run: &GlyphRun,
+    ctm: &Matrix,
+    eff_opacity: f32,
+    mut paint_masked_batch: impl FnMut(&mut PageRecorder, Vec<PageOp>, Option<zpdf_core::Rect>),
+) {
+    let Some(font) = fonts.get(run.font_id) else {
+        return;
+    };
+    if !font.has_font_data() || !font.is_type3() {
+        return;
+    }
+    let tm = if *ctm == Matrix::identity() {
+        run.transform
+    } else {
+        ctm.concat(&run.transform)
+    };
+    let font_size = run.font_size;
+    let h_scale = run.h_scale;
+    let white = [1.0f32, 1.0, 1.0, 1.0];
+    let white_tint = Some([1.0f32.to_bits(); 3]);
+
+    let mut mask_ops: Vec<PageOp> = Vec::new();
+    let mut mask_has_draws = false;
+    let (mut min_px, mut min_py) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_px, mut max_py) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+    let finish_bounds = |min_px: f32, min_py: f32, max_px: f32, max_py: f32| {
+        if map.scale.is_finite()
+            && map.scale > 0.0
+            && min_px.is_finite()
+            && min_py.is_finite()
+            && max_px > min_px
+            && max_py > min_py
+        {
+            let inv = 1.0 / map.scale as f64;
+            let x0 = min_px as f64 * inv + map.x0 as f64 - 1.0;
+            let x1 = max_px as f64 * inv + map.x0 as f64 + 1.0;
+            let y0 = map.y1 as f64 - max_py as f64 * inv - 1.0;
+            let y1 = map.y1 as f64 - min_py as f64 * inv + 1.0;
+            if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() {
+                return Some(zpdf_core::Rect::new(x0, y0, x1, y1));
+            }
+        }
+        None
+    };
+
+    for g in &run.glyphs {
+        if !rec.can_record() {
+            return;
+        }
+        let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
+            continue;
+        };
+        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream(stream) else {
+            return;
+        };
+
+        for cmd in &glyph_dl.commands {
+            if !rec.can_record() {
+                return;
+            }
+            match cmd {
+                RenderCommand::FillPath { path, rule, .. } => {
+                    if let Some(p) = build_type3_path(
+                        path,
+                        &font_matrix,
+                        font_size,
+                        h_scale,
+                        &tm,
+                        (g.x, g.y),
+                        map,
+                    ) {
+                        if let Some(mesh) = fill_lyon_path(&p, *rule, white) {
+                            for v in &mesh.vertices {
+                                if v.pos[0].is_finite() && v.pos[1].is_finite() {
+                                    min_px = min_px.min(v.pos[0]);
+                                    min_py = min_py.min(v.pos[1]);
+                                    max_px = max_px.max(v.pos[0]);
+                                    max_py = max_py.max(v.pos[1]);
+                                }
+                            }
+                            if rec.record_subops_clipped_into(&mut mask_ops, |r| r.add_mesh(mesh)) {
+                                mask_has_draws = true;
+                            }
+                        }
+                    }
+                }
+                RenderCommand::StrokePath { path, style, .. } => {
+                    let width = (style.width * font_matrix[0].abs() as f32 * font_size * map.scale)
+                        .max(0.5);
+                    if let Some(p) = build_type3_path(
+                        path,
+                        &font_matrix,
+                        font_size,
+                        h_scale,
+                        &tm,
+                        (g.x, g.y),
+                        map,
+                    ) {
+                        let opts = StrokeOptions::tolerance(TOLERANCE).with_line_width(width);
+                        if let Some(mesh) = stroke_lyon_path(&p, &opts, white) {
+                            for v in &mesh.vertices {
+                                if v.pos[0].is_finite() && v.pos[1].is_finite() {
+                                    min_px = min_px.min(v.pos[0]);
+                                    min_py = min_py.min(v.pos[1]);
+                                    max_px = max_px.max(v.pos[0]);
+                                    max_py = max_py.max(v.pos[1]);
+                                }
+                            }
+                            if rec.record_subops_clipped_into(&mut mask_ops, |r| r.add_mesh(mesh)) {
+                                mask_has_draws = true;
+                            }
+                        }
+                    }
+                }
+                RenderCommand::DrawImage(draw) => {
+                    let Some(src_img) = glyph_images.get(draw.image_id) else {
+                        continue;
+                    };
+                    if !crate::image::is_valid_decoded_image(src_img) {
+                        continue;
+                    }
+                    let glyph_to_page = tm
+                        .concat(&Matrix::translate(g.x as f64, g.y as f64))
+                        .concat(&Matrix::scale(
+                            font_size as f64 * h_scale as f64,
+                            font_size as f64,
+                        ))
+                        .concat(&Matrix::new(
+                            font_matrix[0],
+                            font_matrix[1],
+                            font_matrix[2],
+                            font_matrix[3],
+                            font_matrix[4],
+                            font_matrix[5],
+                        ))
+                        .concat(&draw.transform);
+
+                    if draw.is_image_mask {
+                        let eff_alpha = if draw.alpha.is_finite() {
+                            draw.alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        if eff_alpha <= 0.0 {
+                            continue;
+                        }
+                        let quad = crate::image::image_quad(
+                            src_img.width as f32,
+                            src_img.height as f32,
+                            &glyph_to_page,
+                            map,
+                            eff_alpha,
+                        );
+                        if crate::image::is_safe_quad(&quad) {
+                            for v in &quad {
+                                min_px = min_px.min(v.pos[0]);
+                                min_py = min_py.min(v.pos[1]);
+                                max_px = max_px.max(v.pos[0]);
+                                max_py = max_py.max(v.pos[1]);
+                            }
+                            let key = Type3ImageKey {
+                                font_id: run.font_id,
+                                glyph_id: g.glyph_id,
+                                image_id: draw.image_id,
+                                stencil_tint: white_tint,
+                            };
+                            if rec.record_subops_clipped_into(&mut mask_ops, |r| {
+                                r.add_type3_image_cached(key, quad, || {
+                                    let mut tinted = src_img.clone();
+                                    for px in tinted.data.as_chunks_mut::<4>().0 {
+                                        let pa = px[3];
+                                        px[0] = pa;
+                                        px[1] = pa;
+                                        px[2] = pa;
+                                    }
+                                    tinted
+                                });
+                            }) {
+                                mask_has_draws = true;
+                            }
+                        }
+                    } else {
+                        // Intrinsic colored (`d0`) image: flush any pending
+                        // inherited-paint mask batch first to keep painter's
+                        // order, then draw the RGB image directly.
+                        if mask_has_draws {
+                            let bounds = finish_bounds(min_px, min_py, max_px, max_py);
+                            paint_masked_batch(rec, std::mem::take(&mut mask_ops), bounds);
+                            mask_has_draws = false;
+                            min_px = f32::INFINITY;
+                            min_py = f32::INFINITY;
+                            max_px = f32::NEG_INFINITY;
+                            max_py = f32::NEG_INFINITY;
+                        } else {
+                            mask_ops.clear();
+                        }
+                        if !rec.can_record() {
+                            return;
+                        }
+                        let eff_alpha = draw.alpha * eff_opacity;
+                        if !(eff_alpha.is_finite() && eff_alpha > 0.0) {
+                            continue;
+                        }
+                        let quad = crate::image::image_quad(
+                            src_img.width as f32,
+                            src_img.height as f32,
+                            &glyph_to_page,
+                            map,
+                            eff_alpha,
+                        );
+                        if crate::image::is_safe_quad(&quad) {
+                            let key = Type3ImageKey {
+                                font_id: run.font_id,
+                                glyph_id: g.glyph_id,
+                                image_id: draw.image_id,
+                                stencil_tint: None,
+                            };
+                            rec.add_type3_image_cached(key, quad, || src_img.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if mask_has_draws && rec.can_record() {
+        let bounds = finish_bounds(min_px, min_py, max_px, max_py);
+        paint_masked_batch(rec, mask_ops, bounds);
     }
 }
 

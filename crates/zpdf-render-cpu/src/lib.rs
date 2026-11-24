@@ -119,8 +119,9 @@ pub struct CpuRenderer<'a> {
     /// Rasterized [`TilingPattern`] cell pixmaps reused across fills/strokes
     /// sharing the same pattern cell and tile pixel dimensions. Stores the cell
     /// `Arc<DisplayList>` alongside the pixmap so the pointer key stays unique
-    /// for as long as the entry lives. Cleared per page.
-    tiling_cache: HashMap<TilingCacheKey, (Arc<DisplayList>, Arc<tiny_skia::Pixmap>)>,
+    /// for as long as the entry lives, plus a cached uniform-opaque color flag.
+    /// Cleared per page.
+    tiling_cache: HashMap<TilingCacheKey, CachedTilingPixmap>,
     tiling_cache_bytes: u64,
     /// Per-page memo of `TilingPattern::is_backdrop_dependent()`, keeping each
     /// cell `Arc<DisplayList>` alive so pointer keys never alias freed memory.
@@ -152,6 +153,28 @@ pub struct CpuRenderer<'a> {
     stage_stats: Option<zpdf_render::StageStats>,
     /// Page start, read only while collecting, for `StageStats::total_ns`.
     page_start: Option<zpdf_core::time::Instant>,
+}
+
+/// Cached rasterized tiling cell pixmap with its owning command list (keeping
+/// `Arc::as_ptr` cache keys unique) and precomputed uniform-opaque color.
+struct CachedTilingPixmap {
+    _commands: Arc<DisplayList>,
+    pixmap: Arc<tiny_skia::Pixmap>,
+    uniform_opaque: Option<[u8; 4]>,
+}
+
+type PreparedTilingPaint = (
+    Arc<tiny_skia::Pixmap>,
+    tiny_skia::Transform,
+    tiny_skia::FilterQuality,
+    f32,
+    Option<[u8; 4]>,
+);
+
+fn pixmap_uniform_opaque(pixmap: &tiny_skia::Pixmap) -> Option<[u8; 4]> {
+    let (pxs, _) = pixmap.data().as_chunks::<4>();
+    let first = *pxs.first()?;
+    (first[3] == 255 && pxs.iter().all(|&p| p == first)).then_some(first)
 }
 
 /// Identity of a [`SoftMask`] up to its offset: command list and transfer
@@ -734,6 +757,13 @@ impl<'a> CpuRenderer<'a> {
         self.scale
     }
 
+    /// True while the renderer is deferring commands inside a recorded
+    /// non-isolated non-`Normal` transparency group until its matching
+    /// `PopBlendGroup` replays them.
+    pub fn is_recording_non_isolated(&self) -> bool {
+        self.recording_non_isolated.is_some()
+    }
+
     /// Copy premultiplied RGBA8 pixels from `[x0..x0+width] × [y0..y0+height]`
     /// of the active page raster without ending the page.
     pub fn copy_subrect(&self, x0: u32, y0: u32, width: u32, height: u32) -> Option<Vec<u8>> {
@@ -1147,6 +1177,7 @@ impl<'a> CpuRenderer<'a> {
             None,
             alpha,
         )
+        .map(|(pixmap, transform, quality, opacity, _)| (pixmap, transform, quality, opacity))
     }
 
     /// Rasterize (or look up in `tiling_cache`) either the whole cell
@@ -1169,12 +1200,7 @@ impl<'a> CpuRenderer<'a> {
         copy_blend_mode: BlendMode,
         copy_filter_bounds: Option<zpdf_core::Rect>,
         alpha: f32,
-    ) -> Option<(
-        Arc<tiny_skia::Pixmap>,
-        tiny_skia::Transform,
-        tiny_skia::FilterQuality,
-        f32,
-    )> {
+    ) -> Option<PreparedTilingPaint> {
         if self.tiling_depth >= MAX_TILING_DEPTH || commands.commands.is_empty() {
             return None;
         }
@@ -1304,8 +1330,8 @@ impl<'a> CpuRenderer<'a> {
             tile_h,
             blend_depth,
         );
-        let tile_pixmap = if let Some((_, cached)) = self.tiling_cache.get(&key) {
-            Arc::clone(cached)
+        let (tile_pixmap, uniform_opaque) = if let Some(cached) = self.tiling_cache.get(&key) {
+            (Arc::clone(&cached.pixmap), cached.uniform_opaque)
         } else {
             let tile_bytes = tile_w as u64 * tile_h as u64 * 4;
             if !self.surface_room(tile_bytes) {
@@ -1448,19 +1474,26 @@ impl<'a> CpuRenderer<'a> {
                 self.over_budget = true;
             }
             let rendered = Arc::new(sub.pixmap.take()?);
+            let uniform_opaque = pixmap_uniform_opaque(&rendered);
             if !sub.over_budget && tile_bytes <= MAX_TILING_CACHE_BYTES {
                 if self.tiling_cache_bytes.saturating_add(tile_bytes) > MAX_TILING_CACHE_BYTES {
                     self.tiling_cache.clear();
                     self.tiling_cache_bytes = 0;
                 }
-                self.tiling_cache
-                    .insert(key, (Arc::clone(&tiling.commands), Arc::clone(&rendered)));
+                self.tiling_cache.insert(
+                    key,
+                    CachedTilingPixmap {
+                        _commands: Arc::clone(&tiling.commands),
+                        pixmap: Arc::clone(&rendered),
+                        uniform_opaque,
+                    },
+                );
                 self.tiling_cache_bytes = self.tiling_cache_bytes.saturating_add(tile_bytes);
             }
-            rendered
+            (rendered, uniform_opaque)
         };
 
-        Some((tile_pixmap, transform, quality, opacity))
+        Some((tile_pixmap, transform, quality, opacity, uniform_opaque))
     }
 
     /// Collapse an affine overlapping dense backdrop-dependent tiling pattern
@@ -1607,15 +1640,15 @@ impl<'a> CpuRenderer<'a> {
             tile_h,
             blend_depth,
         );
-        if let (Some((_, trans_pm)), Some((_, k_pm)), Some((_, f1_pm))) = (
+        if let (Some(trans_entry), Some(k_entry), Some(f1_entry)) = (
             self.tiling_cache.get(&trans_key),
             self.tiling_cache.get(&k_key),
             self.tiling_cache.get(&f1_key),
         ) {
             return Some(PreparedAffineTiles {
-                trans: Arc::clone(trans_pm),
-                k: Arc::clone(k_pm),
-                f1: Arc::clone(f1_pm),
+                trans: Arc::clone(&trans_entry.pixmap),
+                k: Arc::clone(&k_entry.pixmap),
+                f1: Arc::clone(&f1_entry.pixmap),
                 transform,
                 quality,
             });
@@ -1873,12 +1906,28 @@ impl<'a> CpuRenderer<'a> {
             }
             self.tiling_cache.insert(
                 trans_key,
-                (Arc::clone(&tiling.commands), Arc::clone(&trans_arc)),
+                CachedTilingPixmap {
+                    _commands: Arc::clone(&tiling.commands),
+                    pixmap: Arc::clone(&trans_arc),
+                    uniform_opaque: None,
+                },
             );
-            self.tiling_cache
-                .insert(k_key, (Arc::clone(&tiling.commands), Arc::clone(&k_arc)));
-            self.tiling_cache
-                .insert(f1_key, (Arc::clone(&tiling.commands), Arc::clone(&f1_arc)));
+            self.tiling_cache.insert(
+                k_key,
+                CachedTilingPixmap {
+                    _commands: Arc::clone(&tiling.commands),
+                    pixmap: Arc::clone(&k_arc),
+                    uniform_opaque: None,
+                },
+            );
+            self.tiling_cache.insert(
+                f1_key,
+                CachedTilingPixmap {
+                    _commands: Arc::clone(&tiling.commands),
+                    pixmap: Arc::clone(&f1_arc),
+                    uniform_opaque: None,
+                },
+            );
             self.tiling_cache_bytes = self.tiling_cache_bytes.saturating_add(cache_bytes);
         }
         Some(PreparedAffineTiles {
@@ -2378,7 +2427,7 @@ impl<'a> CpuRenderer<'a> {
                         continue;
                     }
                     *remaining_passes = remaining_passes.saturating_sub(1);
-                    let Some((pixmap, transform, quality, opacity)) = self
+                    let Some((pixmap, transform, quality, opacity, tile_uniform_opaque)) = self
                         .prepare_tiling_paint_for(
                             tiling,
                             &seg.commands,
@@ -2395,13 +2444,7 @@ impl<'a> CpuRenderer<'a> {
                     else {
                         continue;
                     };
-                    let uniform_opaque = (opacity >= 1.0)
-                        .then(|| {
-                            let (pxs, _) = pixmap.data().as_chunks::<4>();
-                            let first = *pxs.first()?;
-                            (first[3] == 255 && pxs.iter().all(|&p| p == first)).then_some(first)
-                        })
-                        .flatten();
+                    let uniform_opaque = (opacity >= 1.0).then_some(tile_uniform_opaque).flatten();
                     if let (Some(c), Some(ref mut target)) = (uniform_opaque, self.pixmap.as_mut())
                     {
                         if region_opaque
@@ -2480,7 +2523,7 @@ impl<'a> CpuRenderer<'a> {
                             *inner_alpha,
                             Some(region),
                             |r, _band_offset| {
-                                if let Some((pixmap, transform, quality, tile_opacity)) = r
+                                if let Some((pixmap, transform, quality, tile_opacity, _)) = r
                                     .prepare_tiling_paint_for(
                                         tiling,
                                         &m_seg.commands,
@@ -2935,7 +2978,7 @@ impl<'a> CpuRenderer<'a> {
         // outer shape coverage once directly in a single `fill_path` call.
         if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
             if let Some([TilingBlendStep::Segment(seg)]) = steps.as_deref() {
-                if let Some((pixmap, transform, quality, tile_opacity)) = self
+                if let Some((pixmap, transform, quality, tile_opacity, _)) = self
                     .prepare_tiling_paint_for(
                         tiling,
                         &seg.commands,
@@ -3007,7 +3050,7 @@ impl<'a> CpuRenderer<'a> {
                 // Bounded backstop when both direct replay (>4,096 tiles) and
                 // blend_steps() decline (e.g., active overprint inside a dense
                 // cell): paint the single rasterized cell rather than dropping blank.
-                if let (Some(rect), Some((pixmap, transform, quality, tile_opacity))) = (
+                if let (Some(rect), Some((pixmap, transform, quality, tile_opacity, _))) = (
                     region.to_rect(),
                     renderer.prepare_tiling_paint_for(
                         tiling,
@@ -3082,7 +3125,7 @@ impl<'a> CpuRenderer<'a> {
         // Fast path: single non-overlapping segment at full opacity.
         if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
             if let Some([TilingBlendStep::Segment(seg)]) = steps.as_deref() {
-                if let Some((pixmap, transform, quality, tile_opacity)) = self
+                if let Some((pixmap, transform, quality, tile_opacity, _)) = self
                     .prepare_tiling_paint_for(
                         tiling,
                         &seg.commands,
@@ -3202,7 +3245,7 @@ impl<'a> CpuRenderer<'a> {
                 }
                 // Bounded backstop when both direct replay (>4,096 tiles) and
                 // blend_steps() decline: paint the single rasterized cell.
-                if let (Some(rect), Some((pixmap, transform, quality, tile_opacity))) = (
+                if let (Some(rect), Some((pixmap, transform, quality, tile_opacity, _))) = (
                     region.to_rect(),
                     renderer.prepare_tiling_paint_for(
                         tiling,
@@ -3497,7 +3540,7 @@ impl<'a> CpuRenderer<'a> {
                     // Fast path: single non-overlapping segment at full opacity.
                     if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
                         if let [TilingBlendStep::Segment(seg)] = steps.as_slice() {
-                            if let Some((pixmap, transform, quality, tile_opacity)) = self
+                            if let Some((pixmap, transform, quality, tile_opacity, _)) = self
                                 .prepare_tiling_paint_for(
                                     tiling,
                                     &seg.commands,
@@ -3536,19 +3579,19 @@ impl<'a> CpuRenderer<'a> {
                     // glyph coverage ONCE into a region-sized scratch alpha
                     // surface, evaluate the full pattern plan at 1.0 coverage,
                     // and apply glyph AA coverage × object opacity ONCE.
+                    // For Type 3 fonts, preserve intrinsic colored (`d0`) non-mask
+                    // images instead of feeding them into the tiling coverage mask.
+                    if font.is_type3() {
+                        self.render_type3_backdrop_tiling(run, font, tiling, &steps, opacity);
+                        return;
+                    }
                     let scope = self.outline_glyph_run_scope(run, font);
                     let white = Self::color_to_paint(&Color::white(), 1.0);
                     self.with_backdrop_shape_coverage(
                         opacity,
                         scope,
                         |renderer, _band_offset| {
-                            if font.is_type3() {
-                                let t = renderer.tick();
-                                renderer.render_type3_glyphs(run, font, &white, 1.0);
-                                renderer.tock(t, |s| &mut s.glyph_raster_ns);
-                            } else {
-                                renderer.render_outline_glyphs(run, font, &white);
-                            }
+                            renderer.render_outline_glyphs(run, font, &white);
                         },
                         |renderer, region| {
                             renderer.paint_tiling_plan_in_region(tiling, &steps, region)
@@ -5967,6 +6010,209 @@ impl<'a> CpuRenderer<'a> {
         (px, py)
     }
 
+    /// Render a Type 3 glyph run with a backdrop-dependent tiling pattern,
+    /// keeping intrinsic colored (`d0`) non-mask images in their own RGB colors
+    /// while compositing inherited fills, strokes, and `/ImageMask true`
+    /// stencils through `tiling`.
+    fn render_type3_backdrop_tiling(
+        &mut self,
+        run: &GlyphRun,
+        font: &zpdf_font::LoadedFont,
+        tiling: &TilingPattern,
+        steps: &[TilingBlendStep],
+        opacity: f32,
+    ) {
+        let mut has_colored_image = false;
+        for glyph in &run.glyphs {
+            if let Some(program) = self.type3_glyph(run.font_id, font, glyph.glyph_id) {
+                if program
+                    .list
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, RenderCommand::DrawImage(d) if !d.is_image_mask))
+                {
+                    has_colored_image = true;
+                    break;
+                }
+            }
+        }
+        let white = Self::color_to_paint(&Color::white(), 1.0);
+        if !has_colored_image {
+            self.with_backdrop_shape_coverage(
+                opacity,
+                None,
+                |renderer, _band_offset| {
+                    let t = renderer.tick();
+                    renderer.render_type3_glyphs(run, font, &white, 1.0);
+                    renderer.tock(t, |s| &mut s.glyph_raster_ns);
+                },
+                |renderer, region| renderer.paint_tiling_plan_in_region(tiling, steps, region),
+            );
+            return;
+        }
+        for glyph in &run.glyphs {
+            if self
+                .deadline
+                .is_some_and(|deadline| zpdf_core::time::Instant::now() >= deadline)
+            {
+                self.over_budget = true;
+                return;
+            }
+            let Some(program) = self.type3_glyph(run.font_id, font, glyph.glyph_id) else {
+                continue;
+            };
+            let cmds = &program.list.commands;
+            let mut seg_start = 0usize;
+            let flush_inherited = |r: &mut Self, start: usize, end: usize| {
+                if start >= end {
+                    return;
+                }
+                r.with_backdrop_shape_coverage(
+                    opacity,
+                    None,
+                    |renderer, _band_offset| {
+                        let t = renderer.tick();
+                        renderer.render_type3_glyph_commands(
+                            glyph,
+                            &program,
+                            &cmds[start..end],
+                            run,
+                            &white,
+                            1.0,
+                        );
+                        renderer.tock(t, |s| &mut s.glyph_raster_ns);
+                    },
+                    |renderer, region| renderer.paint_tiling_plan_in_region(tiling, steps, region),
+                );
+            };
+            for (i, cmd) in cmds.iter().enumerate() {
+                if matches!(cmd, RenderCommand::DrawImage(d) if !d.is_image_mask) {
+                    flush_inherited(self, seg_start, i);
+                    let t = self.tick();
+                    self.render_type3_glyph_commands(
+                        glyph,
+                        &program,
+                        &cmds[i..=i],
+                        run,
+                        &white,
+                        opacity,
+                    );
+                    self.tock(t, |s| &mut s.glyph_raster_ns);
+                    seg_start = i + 1;
+                }
+            }
+            flush_inherited(self, seg_start, cmds.len());
+        }
+    }
+
+    fn render_type3_glyph_commands(
+        &mut self,
+        glyph: &PositionedGlyph,
+        program: &Type3Glyph,
+        commands: &[RenderCommand],
+        run: &GlyphRun,
+        paint: &tiny_skia::Paint<'_>,
+        alpha_override: f32,
+    ) {
+        let tm = &run.transform;
+        let font_size = run.font_size;
+        let h_scale = run.h_scale;
+        let font_matrix = program.font_matrix;
+        let glyph_images = &program.images;
+        // Glyph space → device pixels, for scaling stroke widths.
+        let glyph_to_page = tm
+            .concat(&zpdf_core::Matrix::scale(
+                font_size as f64 * h_scale as f64,
+                font_size as f64,
+            ))
+            .concat(&zpdf_core::Matrix::new(
+                font_matrix[0],
+                font_matrix[1],
+                font_matrix[2],
+                font_matrix[3],
+                font_matrix[4],
+                font_matrix[5],
+            ));
+        let stroke_scale = ((glyph_to_page.a * glyph_to_page.d - glyph_to_page.b * glyph_to_page.c)
+            .abs()
+            .sqrt()
+            * self.stroke_scale() as f64) as f32;
+
+        for cmd in commands {
+            match cmd {
+                RenderCommand::FillPath { path, rule, .. } => {
+                    if let Some(skia_path) = self.build_type3_transformed_path(
+                        path,
+                        &font_matrix,
+                        font_size,
+                        h_scale,
+                        tm,
+                        glyph.x,
+                    ) {
+                        if let Some(ref mut pixmap) = self.pixmap {
+                            pixmap.fill_path(
+                                &skia_path,
+                                paint,
+                                Self::fill_rule_to_skia(rule),
+                                tiny_skia::Transform::identity(),
+                                self.current_clip.as_ref(),
+                            );
+                        }
+                        self.mark_painted(skia_path.bounds(), 1.0);
+                    }
+                }
+                RenderCommand::StrokePath { path, style, .. } => {
+                    if let Some(skia_path) = self.build_type3_transformed_path(
+                        path,
+                        &font_matrix,
+                        font_size,
+                        h_scale,
+                        tm,
+                        glyph.x,
+                    ) {
+                        let stroke = Self::skia_stroke(style, stroke_scale, 0.5);
+                        if let Some(ref mut pixmap) = self.pixmap {
+                            pixmap.stroke_path(
+                                &skia_path,
+                                paint,
+                                &stroke,
+                                tiny_skia::Transform::identity(),
+                                self.current_clip.as_ref(),
+                            );
+                        }
+                        let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
+                        self.mark_painted(skia_path.bounds(), grow);
+                    }
+                }
+                RenderCommand::DrawImage(draw) => {
+                    let img_to_page = tm
+                        .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
+                        .concat(&zpdf_core::Matrix::scale(
+                            font_size as f64 * h_scale as f64,
+                            font_size as f64,
+                        ))
+                        .concat(&zpdf_core::Matrix::new(
+                            font_matrix[0],
+                            font_matrix[1],
+                            font_matrix[2],
+                            font_matrix[3],
+                            font_matrix[4],
+                            font_matrix[5],
+                        ))
+                        .concat(&draw.transform);
+                    let draw = ImageDraw {
+                        image_id: draw.image_id,
+                        transform: img_to_page,
+                        alpha: draw.alpha,
+                        is_image_mask: draw.is_image_mask,
+                    };
+                    self.render_type3_image(glyph_images, &draw, paint, alpha_override);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn render_type3_glyphs(
         &mut self,
         run: &GlyphRun,
@@ -5974,14 +6220,6 @@ impl<'a> CpuRenderer<'a> {
         paint: &tiny_skia::Paint<'_>,
         alpha_override: f32,
     ) {
-        // run.transform = CTM * Tm (already includes all coordinate transforms)
-        // The CTM may already flip Y (e.g., Skia PDFs use negative y scale).
-        // We must apply the full transform chain: FontMatrix * glyph_coords → text space,
-        // then Tm * text_coords → CTM-transformed space, then to pixels.
-        let tm = &run.transform;
-        let font_size = run.font_size;
-        let h_scale = run.h_scale;
-
         for glyph in &run.glyphs {
             // One run can hold many glyphs, each a whole content program, so
             // the page deadline is checked per glyph, not just per command.
@@ -5996,111 +6234,14 @@ impl<'a> CpuRenderer<'a> {
             let Some(program) = self.type3_glyph(run.font_id, font, glyph.glyph_id) else {
                 continue;
             };
-            let font_matrix = program.font_matrix;
-            let glyph_dl = &program.list;
-            let glyph_images = &program.images;
-            // Glyph space → device pixels, for scaling stroke widths.
-            let glyph_to_page = tm
-                .concat(&zpdf_core::Matrix::scale(
-                    font_size as f64 * h_scale as f64,
-                    font_size as f64,
-                ))
-                .concat(&zpdf_core::Matrix::new(
-                    font_matrix[0],
-                    font_matrix[1],
-                    font_matrix[2],
-                    font_matrix[3],
-                    font_matrix[4],
-                    font_matrix[5],
-                ));
-            let stroke_scale = ((glyph_to_page.a * glyph_to_page.d
-                - glyph_to_page.b * glyph_to_page.c)
-                .abs()
-                .sqrt()
-                * self.stroke_scale() as f64) as f32;
-
-            // Build the full transform: glyph_space → page_space → pixel_space
-            // FontMatrix transforms glyph coords to text space (typically 0.001 scale)
-            // Then the text matrix (tm) transforms text space to page space (already in run.transform)
-            // glyph.x is the accumulated horizontal offset in page space from the interpreter
-
-            for cmd in &glyph_dl.commands {
-                match cmd {
-                    RenderCommand::FillPath { path, rule, .. } => {
-                        if let Some(skia_path) = self.build_type3_transformed_path(
-                            path,
-                            &font_matrix,
-                            font_size,
-                            h_scale,
-                            tm,
-                            glyph.x,
-                        ) {
-                            if let Some(ref mut pixmap) = self.pixmap {
-                                pixmap.fill_path(
-                                    &skia_path,
-                                    paint,
-                                    Self::fill_rule_to_skia(rule),
-                                    tiny_skia::Transform::identity(),
-                                    self.current_clip.as_ref(),
-                                );
-                            }
-                            // Type3 ink is an ordinary device path here, so it
-                            // bounds exactly like any other fill's.
-                            self.mark_painted(skia_path.bounds(), 1.0);
-                        }
-                    }
-                    RenderCommand::StrokePath { path, style, .. } => {
-                        if let Some(skia_path) = self.build_type3_transformed_path(
-                            path,
-                            &font_matrix,
-                            font_size,
-                            h_scale,
-                            tm,
-                            glyph.x,
-                        ) {
-                            // The glyph's stroke style is in glyph space; scale
-                            // it by the whole glyph-to-device transform.
-                            let stroke = Self::skia_stroke(style, stroke_scale, 0.5);
-                            if let Some(ref mut pixmap) = self.pixmap {
-                                pixmap.stroke_path(
-                                    &skia_path,
-                                    paint,
-                                    &stroke,
-                                    tiny_skia::Transform::identity(),
-                                    self.current_clip.as_ref(),
-                                );
-                            }
-                            let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
-                            self.mark_painted(skia_path.bounds(), grow);
-                        }
-                    }
-                    RenderCommand::DrawImage(draw) => {
-                        let glyph_to_page = tm
-                            .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
-                            .concat(&zpdf_core::Matrix::scale(
-                                font_size as f64 * h_scale as f64,
-                                font_size as f64,
-                            ))
-                            .concat(&zpdf_core::Matrix::new(
-                                font_matrix[0],
-                                font_matrix[1],
-                                font_matrix[2],
-                                font_matrix[3],
-                                font_matrix[4],
-                                font_matrix[5],
-                            ))
-                            .concat(&draw.transform);
-                        let draw = ImageDraw {
-                            image_id: draw.image_id,
-                            transform: glyph_to_page,
-                            alpha: draw.alpha,
-                            is_image_mask: draw.is_image_mask,
-                        };
-                        self.render_type3_image(glyph_images, &draw, paint, alpha_override);
-                    }
-                    _ => {}
-                }
-            }
+            self.render_type3_glyph_commands(
+                glyph,
+                &program,
+                &program.list.commands,
+                run,
+                paint,
+                alpha_override,
+            );
         }
     }
 
@@ -10388,5 +10529,172 @@ mod tests {
             "{top_blue:?}"
         );
         assert_eq!(bot_white, &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn tiling_cache_stores_uniform_opaque_color_once_and_reuses_it() {
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 16.0, 16.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 16.0, 16.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.2, 0.4, 0.8)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 16.0, 16.0),
+            x_step: 16.0,
+            y_step: 16.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 32.0, 32.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        let (_, _, _, _, u1) = renderer
+            .prepare_tiling_paint_for(
+                &tiling,
+                &tiling.commands,
+                0,
+                None,
+                BlendMode::Normal,
+                None,
+                1.0,
+            )
+            .expect("first prepare");
+        assert!(u1.is_some(), "uniform opaque tile must cache Some(rgba)");
+        assert_eq!(renderer.tiling_cache.len(), 1);
+        let cached_entry = renderer.tiling_cache.values().next().unwrap();
+        assert_eq!(cached_entry.uniform_opaque, u1);
+        let (_, _, _, _, u2) = renderer
+            .prepare_tiling_paint_for(
+                &tiling,
+                &tiling.commands,
+                0,
+                None,
+                BlendMode::Normal,
+                None,
+                1.0,
+            )
+            .expect("cached prepare");
+        assert_eq!(u2, u1, "cache hit must reuse stored uniform_opaque color");
+    }
+
+    #[test]
+    fn type3_d0_colored_image_preserves_rgb_under_backdrop_dependent_tiling() {
+        let d0_stream =
+            b"1 0 d0 BI /W 2 /H 2 /CS /RGB /BPC 8 ID \xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00\x00 EI";
+        let d1_stream =
+            b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI";
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), Arc::<[u8]>::from(&d0_stream[..])),
+                    ("B".into(), Arc::<[u8]>::from(&d1_stream[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![1.0, 1.0],
+                first_char: 0,
+            },
+            "Type3MixedBackdrop".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        // Backdrop-dependent Multiply blue tiling pattern with 0.5 glyph opacity
+        // so it enters the multi-pass coverage branch.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 40.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 20.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'A' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 20.0,
+                },
+                PositionedGlyph {
+                    glyph_id: 1,
+                    code_len: 1,
+                    code: b'B' as u32,
+                    x: 20.0,
+                    y: 0.0,
+                    advance: 20.0,
+                },
+            ],
+            paint: Paint::Tiling(tiling),
+            alpha: 0.5,
+            overprint: None,
+            transform: zpdf_core::Matrix::translate(8.0, 10.0),
+            h_scale: 1.0,
+        }));
+
+        let rendered = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .render_display_list(&dl, 1.0)
+            .expect("cpu render");
+        let px = |x: u32, y: u32| -> [u8; 3] {
+            let off = ((y * rendered.width + x) * 4) as usize;
+            [
+                rendered.data[off],
+                rendered.data[off + 1],
+                rendered.data[off + 2],
+            ]
+        };
+        // 'A' (d0 opaque red image at alpha 0.5 over white) = pink [255, ~128, ~128].
+        let a_px = px(18, 20);
+        assert!(
+            a_px[0] > 245 && (118..=138).contains(&a_px[1]) && (118..=138).contains(&a_px[2]),
+            "d0 red image at 0.5 alpha under backdrop-dependent blue tiling must stay pink, got {a_px:?}"
+        );
+        // 'B' (d1 stencil with Multiply blue at alpha 0.5 over white) = light blue [~128, ~128, 255].
+        let b_px = px(38, 20);
+        assert!(
+            (118..=138).contains(&b_px[0]) && (118..=138).contains(&b_px[1]) && b_px[2] > 245,
+            "d1 stencil with backdrop-dependent blue tiling at 0.5 alpha must be light blue, got {b_px:?}"
+        );
     }
 }

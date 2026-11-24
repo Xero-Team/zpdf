@@ -146,7 +146,7 @@ pub fn display_list_to_svg(
 /// element itself) and referenced from every painted element, which keeps
 /// blend groups siblings of their true backdrop. Clip frames record the state
 /// to restore on the matching pop.
-enum Frame {
+enum Frame<'a> {
     Clip {
         prev_clip: Option<u32>,
         prev_mask: Option<u32>,
@@ -162,11 +162,17 @@ enum Frame {
         prev_out: String,
         prev_pending: Option<PendingBackdrop>,
         prev_non_isolated_depth: usize,
+        prev_non_isolated_ga_depth: usize,
+        prev_backdrop_cpu: Option<Box<SvgBackdropCpu<'a>>>,
+        prev_backdrop_cpu_start_idx: usize,
+        prev_backdrop_cpu_transparent: bool,
+        swapped_backdrop_cpu: bool,
     },
     NonIsolatedFilterGroup {
         blend_mode: BlendMode,
         alpha: f32,
         mask_id: Option<u32>,
+        trailing_reserve: usize,
     },
 }
 
@@ -191,10 +197,21 @@ struct SvgWriter<'a> {
     page_background: Color,
     current_page_cmd_idx: Option<usize>,
     svg_backdrop_diverged_depth: usize,
-    backdrop_cpu: Option<SvgBackdropCpu<'a>>,
+    backdrop_cpu: Option<Box<SvgBackdropCpu<'a>>>,
+    backdrop_cpu_start_idx: usize,
+    backdrop_cpu_transparent: bool,
+    active_clip_cmd_indices: Vec<usize>,
     blend_depth: usize,
     isolated_depth: usize,
     non_isolated_filter_depth: usize,
+    /// Number of enclosing `NonIsolatedFilterGroup` frames (NOT reset across
+    /// isolated children, unlike `non_isolated_filter_depth`), used to detect
+    /// when `CpuRenderer` is deferring commands inside an outer non-isolated group.
+    non_isolated_ancestor_depth: usize,
+    /// Number of active non-`Normal` `NonIsolatedFilterGroup` frames in the
+    /// current `pending_backdrop` filter chain (which require `ga` alpha-tracking
+    /// primitives on every step inside them).
+    non_isolated_ga_depth: usize,
     backdrop_snapshots: usize,
     /// Cumulative multiplicative fan-out across backdrop `<use>` snapshots that
     /// reference the prior page more than once; capped by [`MAX_BACKDROP_FANOUT`]
@@ -532,9 +549,14 @@ impl<'a> SvgWriter<'a> {
             current_page_cmd_idx: None,
             svg_backdrop_diverged_depth: 0,
             backdrop_cpu: None,
+            backdrop_cpu_start_idx: 0,
+            backdrop_cpu_transparent: false,
+            active_clip_cmd_indices: Vec::new(),
             blend_depth: 0,
             isolated_depth: 0,
             non_isolated_filter_depth: 0,
+            non_isolated_ancestor_depth: 0,
+            non_isolated_ga_depth: 0,
             backdrop_snapshots: 0,
             backdrop_fanout: 1,
             pending_backdrop: None,
@@ -597,9 +619,36 @@ impl<'a> SvgWriter<'a> {
         self.over_budget
     }
 
+    /// Exact filter primitive count needed to open a `NonIsolatedFilterGroup`,
+    /// absorb one trailing overlay inside it, and close it. Reserving all three
+    /// upfront guarantees `close_non_isolated_filter_group` never exceeds the
+    /// active `<filter>` intermediate-pixel budget.
+    fn non_isolated_group_primitives(
+        blend_mode: BlendMode,
+        alpha: f32,
+        has_mask: bool,
+        outer_tracks_ga: bool,
+    ) -> (usize, usize, usize) {
+        let push_prims = if blend_mode != BlendMode::Normal {
+            1
+        } else {
+            0
+        };
+        let inner_tracks_ga = outer_tracks_ga || blend_mode != BlendMode::Normal;
+        let trailing_reserve = if inner_tracks_ga { 3 } else { 2 };
+        let pop_prims = if blend_mode == BlendMode::Normal {
+            4 + if outer_tracks_ga { 3 } else { 0 }
+        } else {
+            3 + if alpha < 1.0 || has_mask { 2 } else { 0 } + if outer_tracks_ga { 1 } else { 0 }
+        };
+        (push_prims, trailing_reserve, pop_prims)
+    }
+
     fn emit_commands(&mut self, commands: &[RenderCommand], depth: u8) {
-        let mut frames: Vec<Frame> = Vec::new();
-        for (idx, cmd) in commands.iter().enumerate() {
+        let mut frames: Vec<Frame<'a>> = Vec::new();
+        let mut idx = 0usize;
+        while idx < commands.len() {
+            let cmd = &commands[idx];
             if depth == 0 {
                 self.current_page_cmd_idx = Some(idx);
             }
@@ -644,6 +693,9 @@ impl<'a> SvgWriter<'a> {
                         prev_bounds: self.clip_bounds,
                     };
                     self.push_clip(path, rule);
+                    if depth == 0 {
+                        self.active_clip_cmd_indices.push(idx);
+                    }
                     frames.push(frame);
                 }
                 RenderCommand::PushClipStroke { path, style } => {
@@ -653,6 +705,9 @@ impl<'a> SvgWriter<'a> {
                         prev_bounds: self.clip_bounds,
                     };
                     self.push_clip_stroke(path, style);
+                    if depth == 0 {
+                        self.active_clip_cmd_indices.push(idx);
+                    }
                     frames.push(frame);
                 }
                 RenderCommand::PopClip => match frames.last() {
@@ -664,6 +719,9 @@ impl<'a> SvgWriter<'a> {
                         self.clip = *prev_clip;
                         self.stroke_mask = *prev_mask;
                         self.clip_bounds = *prev_bounds;
+                        if depth == 0 {
+                            self.active_clip_cmd_indices.pop();
+                        }
                         frames.pop();
                     }
                     _ => tracing::warn!("unbalanced PopClip ignored"),
@@ -692,6 +750,16 @@ impl<'a> SvgWriter<'a> {
                         *isolated || eff_alpha < 1.0 || blend.is_some() || mask_id.is_some();
                     let is_non_isolated_group =
                         !*isolated && (eff_alpha < 1.0 || mask_id.is_some() || blend.is_some());
+                    let (push_prims, trailing_reserve, pop_prims) =
+                        Self::non_isolated_group_primitives(
+                            *blend_mode,
+                            eff_alpha,
+                            mask_id.is_some(),
+                            self.non_isolated_ga_depth > 0,
+                        );
+                    let group_prims = push_prims
+                        .saturating_add(trailing_reserve)
+                        .saturating_add(pop_prims);
                     if depth == 0
                         && is_non_isolated_group
                         && (self.pending_backdrop.is_some() || !self.out.is_empty())
@@ -699,25 +767,45 @@ impl<'a> SvgWriter<'a> {
                             BackdropStep::PushNonIsolatedGroup {
                                 blend_mode: *blend_mode,
                             },
-                            if *blend_mode != BlendMode::Normal {
-                                6
-                            } else {
-                                4
-                            },
+                            group_prims,
                             None,
                             false,
                         )
                     {
                         self.blend_depth += 1;
                         self.non_isolated_filter_depth += 1;
+                        self.non_isolated_ancestor_depth += 1;
                         if *blend_mode != BlendMode::Normal {
                             self.isolated_depth += 1;
+                            self.non_isolated_ga_depth += 1;
                         }
                         frames.push(Frame::NonIsolatedFilterGroup {
                             blend_mode: *blend_mode,
                             alpha: eff_alpha,
                             mask_id,
+                            trailing_reserve,
                         });
+                    } else if depth == 0
+                        && is_non_isolated_group
+                        && self.non_isolated_filter_depth == 0
+                        && self.svg_backdrop_diverged_depth == 0
+                        && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                        && {
+                            let end_idx = svg_find_matching_pop_blend(commands, idx);
+                            let affected =
+                                self.clip_bounds.unwrap_or_else(|| self.full_page_rect());
+                            let handled =
+                                svg_slice_needs_non_isolated_backdrop(&commands[idx + 1..end_idx])
+                                    && self.emit_raster_backdrop_range_fallback(
+                                        idx, end_idx, affected,
+                                    );
+                            if handled {
+                                idx = end_idx + 1;
+                            }
+                            handled
+                        }
+                    {
+                        continue;
                     } else if !isolates {
                         // Full-opacity, non-isolated Normal group with no active soft mask
                         // is a transparent passthrough: keep the active canvas backdrop and
@@ -733,6 +821,11 @@ impl<'a> SvgWriter<'a> {
                             prev_out: String::new(),
                             prev_pending: None,
                             prev_non_isolated_depth: 0,
+                            prev_non_isolated_ga_depth: 0,
+                            prev_backdrop_cpu: None,
+                            prev_backdrop_cpu_start_idx: 0,
+                            prev_backdrop_cpu_transparent: false,
+                            swapped_backdrop_cpu: false,
                         });
                     } else {
                         self.flush_disjoint_backdrop();
@@ -740,6 +833,23 @@ impl<'a> SvgWriter<'a> {
                         let prev_pending = self.pending_backdrop.take();
                         let prev_non_isolated_depth =
                             std::mem::replace(&mut self.non_isolated_filter_depth, 0);
+                        let prev_non_isolated_ga_depth =
+                            std::mem::replace(&mut self.non_isolated_ga_depth, 0);
+                        let (
+                            swapped_backdrop_cpu,
+                            prev_backdrop_cpu,
+                            prev_backdrop_cpu_start_idx,
+                            prev_backdrop_cpu_transparent,
+                        ) = if depth == 0 && *isolated && self.non_isolated_ancestor_depth > 0 {
+                            (
+                                true,
+                                self.backdrop_cpu.take(),
+                                std::mem::replace(&mut self.backdrop_cpu_start_idx, idx + 1),
+                                std::mem::replace(&mut self.backdrop_cpu_transparent, true),
+                            )
+                        } else {
+                            (false, None, 0, false)
+                        };
                         self.blend_depth += 1;
                         self.isolated_depth += 1;
                         if !*isolated {
@@ -755,6 +865,11 @@ impl<'a> SvgWriter<'a> {
                             prev_out,
                             prev_pending,
                             prev_non_isolated_depth,
+                            prev_non_isolated_ga_depth,
+                            prev_backdrop_cpu,
+                            prev_backdrop_cpu_start_idx,
+                            prev_backdrop_cpu_transparent,
+                            swapped_backdrop_cpu,
                         });
                     }
                 }
@@ -764,9 +879,15 @@ impl<'a> SvgWriter<'a> {
                             blend_mode,
                             alpha,
                             mask_id,
+                            trailing_reserve,
                         }) = frames.pop()
                         {
-                            self.close_non_isolated_filter_group(blend_mode, alpha, mask_id);
+                            self.close_non_isolated_filter_group(
+                                blend_mode,
+                                alpha,
+                                mask_id,
+                                trailing_reserve,
+                            );
                         }
                     }
                     Some(Frame::Blend { .. }) => {
@@ -780,6 +901,11 @@ impl<'a> SvgWriter<'a> {
                             prev_out,
                             prev_pending,
                             prev_non_isolated_depth,
+                            prev_non_isolated_ga_depth,
+                            prev_backdrop_cpu,
+                            prev_backdrop_cpu_start_idx,
+                            prev_backdrop_cpu_transparent,
+                            swapped_backdrop_cpu,
                         }) = frames.pop()
                         {
                             self.close_blend_group(
@@ -792,6 +918,11 @@ impl<'a> SvgWriter<'a> {
                                 prev_out,
                                 prev_pending,
                                 prev_non_isolated_depth,
+                                prev_non_isolated_ga_depth,
+                                prev_backdrop_cpu,
+                                prev_backdrop_cpu_start_idx,
+                                prev_backdrop_cpu_transparent,
+                                swapped_backdrop_cpu,
                                 depth,
                             );
                         }
@@ -799,6 +930,7 @@ impl<'a> SvgWriter<'a> {
                     _ => tracing::warn!("unbalanced PopBlendGroup ignored"),
                 },
             }
+            idx += 1;
         }
         // A malformed stream can leave frames unclosed; keep the SVG well-formed.
         for frame in frames.drain(..).rev() {
@@ -807,8 +939,14 @@ impl<'a> SvgWriter<'a> {
                     blend_mode,
                     alpha,
                     mask_id,
+                    trailing_reserve,
                 } => {
-                    self.close_non_isolated_filter_group(blend_mode, alpha, mask_id);
+                    self.close_non_isolated_filter_group(
+                        blend_mode,
+                        alpha,
+                        mask_id,
+                        trailing_reserve,
+                    );
                 }
                 Frame::Blend {
                     open,
@@ -820,6 +958,11 @@ impl<'a> SvgWriter<'a> {
                     prev_out,
                     prev_pending,
                     prev_non_isolated_depth,
+                    prev_non_isolated_ga_depth,
+                    prev_backdrop_cpu,
+                    prev_backdrop_cpu_start_idx,
+                    prev_backdrop_cpu_transparent,
+                    swapped_backdrop_cpu,
                 } => {
                     self.close_blend_group(
                         open,
@@ -831,6 +974,11 @@ impl<'a> SvgWriter<'a> {
                         prev_out,
                         prev_pending,
                         prev_non_isolated_depth,
+                        prev_non_isolated_ga_depth,
+                        prev_backdrop_cpu,
+                        prev_backdrop_cpu_start_idx,
+                        prev_backdrop_cpu_transparent,
+                        swapped_backdrop_cpu,
                         depth,
                     );
                 }
@@ -842,6 +990,9 @@ impl<'a> SvgWriter<'a> {
                     self.clip = prev_clip;
                     self.stroke_mask = prev_mask;
                     self.clip_bounds = prev_bounds;
+                    if depth == 0 {
+                        self.active_clip_cmd_indices.pop();
+                    }
                 }
             }
         }
@@ -2665,36 +2816,35 @@ impl<'a> SvgWriter<'a> {
     ///   alpha (never duplicating path geometry per pass, zero `<use>` fan-out,
     ///   and O(1) raster memory).
     fn emit_raster_backdrop_tiling_fallback(&mut self, affected: SvgRect) -> bool {
-        const MAX_RASTER_DIM: f64 = 1024.0;
-        const MAX_RASTER_PIXELS: f64 = 1_048_576.0;
-
-        if self.non_isolated_filter_depth > 0 || self.svg_backdrop_diverged_depth > 0 {
-            return false;
-        }
         let Some(cmd_idx) = self.current_page_cmd_idx else {
             return false;
         };
-        if cmd_idx >= self.page_commands.len() {
+        self.emit_raster_backdrop_range_fallback(cmd_idx, cmd_idx, affected)
+    }
+
+    fn emit_raster_backdrop_range_fallback(
+        &mut self,
+        start_idx: usize,
+        end_idx: usize,
+        affected: SvgRect,
+    ) -> bool {
+        const MAX_RASTER_DIM: u32 = 1024;
+        const MAX_RASTER_PIXELS: u64 = 1_048_576;
+
+        if self.non_isolated_filter_depth > 0
+            || self.svg_backdrop_diverged_depth > 0
+            || start_idx > end_idx
+            || end_idx >= self.page_commands.len()
+        {
             return false;
         }
 
         if self.backdrop_cpu.is_none() {
             let page = self.page_rect.normalize();
-            if !(page.x0.is_finite()
-                && page.y0.is_finite()
-                && page.x1.is_finite()
-                && page.y1.is_finite()
-                && page.width() > 0.0
-                && page.height() > 0.0)
-            {
+            let Some(scale) = svg_clamp_raster_scale(page, MAX_RASTER_DIM, MAX_RASTER_PIXELS)
+            else {
                 return false;
-            }
-            let scale = svg_clamp_raster_scale(
-                page.width(),
-                page.height(),
-                MAX_RASTER_DIM,
-                MAX_RASTER_PIXELS,
-            );
+            };
             let mut renderer = CpuRenderer::new()
                 .with_fonts(self.fonts)
                 .with_images(self.images);
@@ -2709,10 +2859,15 @@ impl<'a> SvgWriter<'a> {
             } else {
                 renderer = renderer.with_render_budget(None);
             }
+            let bg = if self.backdrop_cpu_transparent {
+                Color::rgba(0.0, 0.0, 0.0, 0.0)
+            } else {
+                self.page_background
+            };
             let info = PageRenderInfo {
                 page_rect: page,
                 scale,
-                background: self.page_background,
+                background: bg,
             };
             if renderer.begin_page(&info).is_err() {
                 return false;
@@ -2720,21 +2875,34 @@ impl<'a> SvgWriter<'a> {
             let Some((width, height)) = renderer.pixmap_dimensions() else {
                 return false;
             };
+            if width > MAX_RASTER_DIM
+                || height > MAX_RASTER_DIM
+                || (width as u64) * (height as u64) > MAX_RASTER_PIXELS
+            {
+                return false;
+            }
             let actual_scale = renderer.actual_scale() as f64;
             if !actual_scale.is_finite() || actual_scale <= 0.0 {
                 return false;
             }
-            self.backdrop_cpu = Some(SvgBackdropCpu {
+            if self.backdrop_cpu_start_idx > 0 {
+                for &clip_idx in &self.active_clip_cmd_indices {
+                    if clip_idx < self.backdrop_cpu_start_idx {
+                        let _ = renderer.execute(&self.page_commands[clip_idx]);
+                    }
+                }
+            }
+            self.backdrop_cpu = Some(Box::new(SvgBackdropCpu {
                 renderer,
-                cursor: 0,
+                cursor: self.backdrop_cpu_start_idx,
                 scale: actual_scale,
                 width,
                 height,
                 exhausted: false,
-            });
+            }));
         }
 
-        let (before, after, ix0, iy0, rw, rh, bs, covers_whole_page) = {
+        let (before, after, ix0, iy0, rw, rh, bs, state_width, state_height, covers_whole_page) = {
             let Some(state) = self.backdrop_cpu.as_mut() else {
                 return false;
             };
@@ -2743,10 +2911,10 @@ impl<'a> SvgWriter<'a> {
                 self.over_budget = true;
                 return true;
             }
-            if state.cursor > cmd_idx {
+            if state.cursor > start_idx {
                 return false;
             }
-            while state.cursor < cmd_idx {
+            while state.cursor < start_idx {
                 let _ = state.renderer.execute(&self.page_commands[state.cursor]);
                 state.cursor += 1;
                 if state.renderer.is_over_budget() {
@@ -2755,62 +2923,189 @@ impl<'a> SvgWriter<'a> {
                     return true;
                 }
             }
+            if state.renderer.is_recording_non_isolated() {
+                return false;
+            }
             let bs = state.scale;
-            let ix0 = (affected.x0 * bs).floor().clamp(0.0, state.width as f64) as u32;
-            let ix1 = (affected.x1 * bs).ceil().clamp(0.0, state.width as f64) as u32;
-            let iy0 = (affected.y0 * bs).floor().clamp(0.0, state.height as f64) as u32;
-            let iy1 = (affected.y1 * bs).ceil().clamp(0.0, state.height as f64) as u32;
+            let state_w = state.width;
+            let state_h = state.height;
+            let ix0 = (affected.x0 * bs).floor().clamp(0.0, state_w as f64) as u32;
+            let ix1 = (affected.x1 * bs).ceil().clamp(0.0, state_w as f64) as u32;
+            let iy0 = (affected.y0 * bs).floor().clamp(0.0, state_h as f64) as u32;
+            let iy1 = (affected.y1 * bs).ceil().clamp(0.0, state_h as f64) as u32;
             if ix1 <= ix0 || iy1 <= iy0 {
-                let _ = state.renderer.execute(&self.page_commands[cmd_idx]);
-                state.cursor = cmd_idx + 1;
+                for c in &self.page_commands[start_idx..=end_idx] {
+                    let _ = state.renderer.execute(c);
+                }
+                state.cursor = end_idx + 1;
                 return true;
             }
             let rw = ix1 - ix0;
             let rh = iy1 - iy0;
-            let covers_whole_page = ix0 == 0 && iy0 == 0 && rw == state.width && rh == state.height;
+            let covers_whole_page = ix0 == 0 && iy0 == 0 && rw == state_w && rh == state_h;
             let Some(before) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
                 return false;
             };
-            let _ = state.renderer.execute(&self.page_commands[cmd_idx]);
-            state.cursor = cmd_idx + 1;
+            let mut open_blends = 0usize;
+            for c in &self.page_commands[start_idx..=end_idx] {
+                match c {
+                    RenderCommand::PushBlendGroup { .. } => open_blends += 1,
+                    RenderCommand::PopBlendGroup => open_blends = open_blends.saturating_sub(1),
+                    _ => {}
+                }
+                let _ = state.renderer.execute(c);
+                if state.renderer.is_over_budget() {
+                    state.exhausted = true;
+                    self.over_budget = true;
+                    return true;
+                }
+            }
+            for _ in 0..open_blends {
+                let _ = state.renderer.execute(&RenderCommand::PopBlendGroup);
+            }
+            state.cursor = end_idx + 1;
             if state.renderer.is_over_budget() {
                 state.exhausted = true;
                 self.over_budget = true;
                 return true;
             }
+            if state.renderer.is_recording_non_isolated() {
+                return false;
+            }
             let Some(after) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
                 return false;
             };
-            (before, after, ix0, iy0, rw, rh, bs, covers_whole_page)
+            (
+                before,
+                after,
+                ix0,
+                iy0,
+                rw,
+                rh,
+                bs,
+                state_w,
+                state_h,
+                covers_whole_page,
+            )
         };
 
-        // When at top level on an opaque page and the fallback covers the entire
-        // page with opaque pixels, replacing the occluded prior `<use>` tree with
-        // this single leaf `<image>` resets `backdrop_fanout` to 1 and prevents
-        // redundant evaluation of the occluded snapshots beneath it.
-        let replace_whole_page = covers_whole_page
+        // Tighten to the actual changed pixel bounding box so conservative
+        // full-page bounds (e.g. unclipped Type 3 glyphs) never replace
+        // untouched earlier vector text/linework with a full-page raster.
+        let (mut rel_x0, mut rel_y0) = (rw, rh);
+        let (mut rel_x1, mut rel_y1) = (0u32, 0u32);
+        let mut changed_count = 0usize;
+        let rw_usize = rw as usize;
+        for y in 0..rh as usize {
+            let row_start = y * rw_usize * 4;
+            let row_end = row_start + rw_usize * 4;
+            let b_row = before[row_start..row_end].as_chunks::<4>().0;
+            let f_row = after[row_start..row_end].as_chunks::<4>().0;
+            for (x, (bp, fp)) in b_row.iter().zip(f_row.iter()).enumerate() {
+                if fp != bp {
+                    changed_count += 1;
+                    let xu = x as u32;
+                    let yu = y as u32;
+                    rel_x0 = rel_x0.min(xu);
+                    rel_y0 = rel_y0.min(yu);
+                    rel_x1 = rel_x1.max(xu + 1);
+                    rel_y1 = rel_y1.max(yu + 1);
+                }
+            }
+        }
+        if changed_count == 0 {
+            return true;
+        }
+        let cx0 = ix0 + rel_x0;
+        let cy0 = iy0 + rel_y0;
+        let cw = rel_x1 - rel_x0;
+        let ch = rel_y1 - rel_y0;
+        let (before_crop, after_crop) = if cw == rw && ch == rh {
+            (before, after)
+        } else {
+            let cw_bytes = (cw as usize) * 4;
+            let mut b_sub = vec![0u8; (ch as usize) * cw_bytes];
+            let mut f_sub = vec![0u8; (ch as usize) * cw_bytes];
+            for row in 0..ch as usize {
+                let src_off = ((rel_y0 as usize + row) * rw_usize + rel_x0 as usize) * 4;
+                let dst_off = row * cw_bytes;
+                b_sub[dst_off..dst_off + cw_bytes]
+                    .copy_from_slice(&before[src_off..src_off + cw_bytes]);
+                f_sub[dst_off..dst_off + cw_bytes]
+                    .copy_from_slice(&after[src_off..src_off + cw_bytes]);
+            }
+            (b_sub, f_sub)
+        };
+
+        // Only replace the entire vector page when this mark demonstrably
+        // painted/changed EVERY pixel of the page with opaque output (so an
+        // incremental overlay would already be 100% opaque everywhere).
+        let all_page_pixels_changed = covers_whole_page
+            && cw == state_width
+            && ch == state_height
+            && changed_count == (state_width as usize) * (state_height as usize);
+        let after_all_opaque = after_crop.as_chunks::<4>().0.iter().all(|px| px[3] == 255);
+        let replace_whole_page = all_page_pixels_changed
             && self.blend_depth == 0
             && self.has_opaque_background
-            && after.as_chunks::<4>().0.iter().all(|px| px[3] == 255);
-        let rgba_data = if replace_whole_page {
-            after
+            && after_all_opaque;
+
+        let (img, replace_hole) = if replace_whole_page {
+            (
+                DecodedImage {
+                    width: cw,
+                    height: ch,
+                    data: after_crop,
+                    has_alpha: false,
+                    is_image_mask: false,
+                    premultiplied: false,
+                },
+                false,
+            )
+        } else if let Some(overlay) = svg_compute_incremental_overlay(&before_crop, &after_crop) {
+            (
+                DecodedImage {
+                    width: cw,
+                    height: ch,
+                    data: overlay,
+                    has_alpha: true,
+                    is_image_mask: false,
+                    premultiplied: false,
+                },
+                false,
+            )
         } else {
-            let overlay = svg_compute_incremental_overlay(&before, &after);
-            if !overlay.as_chunks::<4>().0.iter().any(|px| px[3] > 0) {
-                return true;
-            }
-            overlay
-        };
-        let img = DecodedImage {
-            width: rw,
-            height: rh,
-            data: rgba_data,
-            has_alpha: !replace_whole_page,
-            is_image_mask: false,
-            premultiplied: false,
+            // At least one changed pixel cannot be expressed as SourceOver on
+            // the translucent backdrop (e.g. unchanged/reduced alpha): clip out
+            // ONLY the tight changed region from `self.out` and emit the actual
+            // unpremultiplied `after` RGBA preserving its true alpha.
+            (
+                DecodedImage {
+                    width: cw,
+                    height: ch,
+                    data: after_crop,
+                    has_alpha: true,
+                    is_image_mask: false,
+                    premultiplied: true,
+                },
+                true,
+            )
         };
         let Some(png) = encode_png(&img) else {
             return false;
+        };
+
+        let x = cx0 as f64 / bs;
+        let y = cy0 as f64 / bs;
+        let w = if replace_whole_page {
+            self.page_width
+        } else {
+            cw as f64 / bs
+        };
+        let h = if replace_whole_page {
+            self.page_height
+        } else {
+            ch as f64 / bs
         };
 
         if replace_whole_page {
@@ -2821,19 +3116,42 @@ impl<'a> SvgWriter<'a> {
         } else {
             self.flush_pending_backdrop();
             self.flush_disjoint_backdrop();
+            if replace_hole && !self.out.is_empty() {
+                if cx0 == 0 && cy0 == 0 && cw == state_width && ch == state_height {
+                    self.out.clear();
+                } else {
+                    let hx1 = if cx0 + cw == state_width {
+                        self.page_width
+                    } else {
+                        (x + w).min(self.page_width)
+                    };
+                    let hy1 = if cy0 + ch == state_height {
+                        self.page_height
+                    } else {
+                        (y + h).min(self.page_height)
+                    };
+                    let hole_clip = self.fresh_id();
+                    let _ = write!(self.defs, "<clipPath id=\"c{hole_clip}\"><path d=\"M0 0H");
+                    push_num(&mut self.defs, self.page_width);
+                    self.defs.push('V');
+                    push_num(&mut self.defs, self.page_height);
+                    self.defs.push_str("H0ZM");
+                    push_pair(&mut self.defs, x, y);
+                    self.defs.push('H');
+                    push_num(&mut self.defs, hx1);
+                    self.defs.push('V');
+                    push_num(&mut self.defs, hy1);
+                    self.defs.push('H');
+                    push_num(&mut self.defs, x);
+                    self.defs
+                        .push_str("Z\" clip-rule=\"evenodd\"/></clipPath>\n");
+                    let prior = std::mem::take(&mut self.out);
+                    let _ = writeln!(self.out, "<g clip-path=\"url(#c{hole_clip})\">");
+                    self.out.push_str(&prior);
+                    self.out.push_str("</g>\n");
+                }
+            }
         }
-        let x = ix0 as f64 / bs;
-        let y = iy0 as f64 / bs;
-        let w = if replace_whole_page {
-            self.page_width
-        } else {
-            rw as f64 / bs
-        };
-        let h = if replace_whole_page {
-            self.page_height
-        } else {
-            rh as f64 / bs
-        };
         self.out.push_str("<image x=\"");
         push_num(&mut self.out, x);
         self.out.push_str("\" y=\"");
@@ -3340,16 +3658,20 @@ impl<'a> SvgWriter<'a> {
 
     /// Fold any intervening Normal-blended content in `self.out` into an
     /// `Overlay` step on the currently open `pending_backdrop` so subsequent
-    /// backdrop steps see it without starting a new snapshot.
-    fn absorb_out_into_pending(&mut self) {
+    /// backdrop steps see it without starting a new snapshot. When `charge` is
+    /// `false`, the caller already reserved primitive capacity for this overlay.
+    fn absorb_out_into_pending(&mut self, charge: bool) {
         if self.pending_backdrop.is_some() && !self.out.is_empty() {
             let mid = std::mem::take(&mut self.out);
             let ov_id = self.fresh_id();
             let _ = write!(self.defs, "<g id=\"ov{ov_id}\">\n{mid}</g>\n");
             let full = self.full_page_rect();
+            let ov_prims = if self.non_isolated_ga_depth > 0 { 3 } else { 2 };
             if let Some(ref mut p) = self.pending_backdrop {
                 p.steps.push(BackdropStep::Overlay(ov_id));
-                p.total_primitives = p.total_primitives.saturating_add(3);
+                if charge {
+                    p.total_primitives = p.total_primitives.saturating_add(ov_prims);
+                }
                 p.region = full;
             }
         }
@@ -3370,7 +3692,15 @@ impl<'a> SvgWriter<'a> {
         let step_region = region.unwrap_or(full);
         if let Some(ref p) = self.pending_backdrop {
             let has_out = !self.out.is_empty();
-            let extra_prims = if has_out { 3 } else { 0 };
+            let extra_prims = if has_out {
+                if self.non_isolated_ga_depth > 0 {
+                    3
+                } else {
+                    2
+                }
+            } else {
+                0
+            };
             let candidate_region = if has_out || self.non_isolated_filter_depth > 0 {
                 full
             } else {
@@ -3390,7 +3720,7 @@ impl<'a> SvgWriter<'a> {
                 .saturating_add(step_primitives)
                 <= prim_limit
             {
-                self.absorb_out_into_pending();
+                self.absorb_out_into_pending(true);
                 if let Some(ref mut p) = self.pending_backdrop {
                     p.total_primitives = p.total_primitives.saturating_add(step_primitives);
                     p.region = candidate_region;
@@ -3518,6 +3848,11 @@ impl<'a> SvgWriter<'a> {
                     push_opacity(&mut self.defs, "fill-opacity", opacity);
                     self.defs.push_str(&placement);
                     self.defs.push_str("/></g>\n");
+                    let affine_prims = if self.non_isolated_ga_depth > 0 {
+                        18
+                    } else {
+                        14
+                    };
                     if self.enqueue_backdrop_step(
                         BackdropStep::Affine {
                             t_id,
@@ -3525,10 +3860,15 @@ impl<'a> SvgWriter<'a> {
                             mk_id,
                             shape_id,
                         },
-                        14,
+                        affine_prims,
                         Some(affected),
                         true,
                     ) {
+                        return;
+                    }
+                    if (self.pending_backdrop.is_some() || !self.out.is_empty())
+                        && self.emit_raster_backdrop_tiling_fallback(affected)
+                    {
                         return;
                     }
                     self.flush_pending_backdrop();
@@ -3762,6 +4102,11 @@ impl<'a> SvgWriter<'a> {
                             push_stroke_attrs(&mut self.defs, style, self.scale);
                             self.defs.push_str(&placement);
                             self.defs.push_str("/></g>\n");
+                            let affine_prims = if self.non_isolated_ga_depth > 0 {
+                                18
+                            } else {
+                                14
+                            };
                             if self.enqueue_backdrop_step(
                                 BackdropStep::Affine {
                                     t_id,
@@ -3769,10 +4114,15 @@ impl<'a> SvgWriter<'a> {
                                     mk_id,
                                     shape_id,
                                 },
-                                14,
+                                affine_prims,
                                 Some(affected),
                                 true,
                             ) {
+                                return;
+                            }
+                            if (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                && self.emit_raster_backdrop_tiling_fallback(affected)
+                            {
                                 return;
                             }
                             self.flush_pending_backdrop();
@@ -4015,12 +4365,19 @@ impl<'a> SvgWriter<'a> {
         blend_mode: BlendMode,
         alpha: f32,
         mask_id: Option<u32>,
+        trailing_reserve: usize,
     ) {
-        self.absorb_out_into_pending();
+        if !self.out.is_empty() {
+            self.absorb_out_into_pending(false);
+        } else if let Some(ref mut p) = self.pending_backdrop {
+            p.total_primitives = p.total_primitives.saturating_sub(trailing_reserve);
+        }
         self.blend_depth = self.blend_depth.saturating_sub(1);
         self.non_isolated_filter_depth = self.non_isolated_filter_depth.saturating_sub(1);
+        self.non_isolated_ancestor_depth = self.non_isolated_ancestor_depth.saturating_sub(1);
         if blend_mode != BlendMode::Normal {
             self.isolated_depth = self.isolated_depth.saturating_sub(1);
+            self.non_isolated_ga_depth = self.non_isolated_ga_depth.saturating_sub(1);
         }
         let weight_id = if alpha < 1.0 || mask_id.is_some() || blend_mode == BlendMode::Normal {
             let id = self.fresh_id();
@@ -4043,7 +4400,6 @@ impl<'a> SvgWriter<'a> {
                 blend_mode,
                 weight_id,
             });
-            p.total_primitives = p.total_primitives.saturating_add(6);
         }
     }
 
@@ -4059,6 +4415,11 @@ impl<'a> SvgWriter<'a> {
         prev_out: String,
         prev_pending: Option<PendingBackdrop>,
         prev_non_isolated_depth: usize,
+        prev_non_isolated_ga_depth: usize,
+        prev_backdrop_cpu: Option<Box<SvgBackdropCpu<'a>>>,
+        prev_backdrop_cpu_start_idx: usize,
+        prev_backdrop_cpu_transparent: bool,
+        swapped_backdrop_cpu: bool,
         depth: u8,
     ) {
         if !open {
@@ -4069,6 +4430,12 @@ impl<'a> SvgWriter<'a> {
         let inner_body = std::mem::replace(&mut self.out, prev_out);
         self.pending_backdrop = prev_pending;
         self.non_isolated_filter_depth = prev_non_isolated_depth;
+        self.non_isolated_ga_depth = prev_non_isolated_ga_depth;
+        if swapped_backdrop_cpu {
+            self.backdrop_cpu = prev_backdrop_cpu;
+            self.backdrop_cpu_start_idx = prev_backdrop_cpu_start_idx;
+            self.backdrop_cpu_transparent = prev_backdrop_cpu_transparent;
+        }
         self.blend_depth = self.blend_depth.saturating_sub(1);
         if isolates {
             self.isolated_depth = self.isolated_depth.saturating_sub(1);
@@ -4090,9 +4457,10 @@ impl<'a> SvgWriter<'a> {
             self.defs.push_str(">\n");
             self.defs.push_str(&inner_body);
             self.defs.push_str("</g>\n");
+            let ov_prims = if self.non_isolated_ga_depth > 0 { 3 } else { 2 };
             if self.enqueue_backdrop_step(
                 BackdropStep::BlendOverlay { ov_id, blend_mode },
-                3,
+                ov_prims,
                 None,
                 false,
             ) {
@@ -4132,6 +4500,10 @@ impl<'a> SvgWriter<'a> {
         let saved_pending = self.pending_backdrop.take();
         let saved_disjoint = self.disjoint_backdrop.take();
         let saved_non_isolated = std::mem::replace(&mut self.non_isolated_filter_depth, 0);
+        let saved_non_isolated_ancestor =
+            std::mem::replace(&mut self.non_isolated_ancestor_depth, 0);
+        let saved_non_isolated_ga = std::mem::replace(&mut self.non_isolated_ga_depth, 0);
+        let saved_clip_indices = std::mem::take(&mut self.active_clip_cmd_indices);
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
         // Mask content is self-contained (geometry fixed at `gs` time); it must
@@ -4177,6 +4549,9 @@ impl<'a> SvgWriter<'a> {
         self.pending_backdrop = saved_pending;
         self.disjoint_backdrop = saved_disjoint;
         self.non_isolated_filter_depth = saved_non_isolated;
+        self.non_isolated_ancestor_depth = saved_non_isolated_ancestor;
+        self.non_isolated_ga_depth = saved_non_isolated_ga;
+        self.active_clip_cmd_indices = saved_clip_indices;
         self.blend_depth = saved_blend_depth;
         self.isolated_depth = saved_isolated_depth;
         self.clip = saved_clip;
@@ -4371,9 +4746,10 @@ impl<'a> SvgWriter<'a> {
         self.out.push_str("/>\n");
     }
 
-    /// Type 3 glyph runs painted with a [`TilingPattern`]: render the glyph
-    /// coverage as opaque white into a shape/mask def and composite the pattern
-    /// through that coverage.
+    /// Type 3 glyph runs painted with a [`TilingPattern`]: keep intrinsic
+    /// colored (`d0`) non-mask images in their own RGB colors while rendering
+    /// inherited fills, strokes, and `/ImageMask true` stencils as opaque white
+    /// masks composited with `tiling` in exact painter's order.
     fn emit_tiling_type3_run(
         &mut self,
         run: &GlyphRun,
@@ -4382,125 +4758,414 @@ impl<'a> SvgWriter<'a> {
         opacity: f32,
         depth: u8,
     ) {
+        enum Type3TilingPart {
+            InheritedShape {
+                body: String,
+                bounds: Option<SvgRect>,
+            },
+            ColoredImage {
+                key: ImageDefKey,
+                program: Rc<Type3Glyph>,
+                image_id: ImageId,
+                transform: zpdf_core::Matrix,
+                alpha: f32,
+            },
+        }
+
+        let mut parts: Vec<Type3TilingPart> = Vec::new();
+        let mut cur_body = String::new();
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut cur_pad = 2.0_f64;
+
         let saved_out = std::mem::take(&mut self.out);
         let saved_pending = self.pending_backdrop.take();
         let saved_disjoint = self.disjoint_backdrop.take();
         let saved_non_isolated = std::mem::replace(&mut self.non_isolated_filter_depth, 0);
-        self.emit_type3_run(run, font, &Color::white(), 1.0);
-        self.flush_pending_backdrop();
-        self.flush_disjoint_backdrop();
-        let shape_body = std::mem::replace(&mut self.out, saved_out);
+        let saved_non_isolated_ga = std::mem::replace(&mut self.non_isolated_ga_depth, 0);
+
+        let flush_shape = |writer: &mut Self,
+                           parts: &mut Vec<Type3TilingPart>,
+                           cur_body: &mut String,
+                           min_x: &mut f64,
+                           min_y: &mut f64,
+                           max_x: &mut f64,
+                           max_y: &mut f64,
+                           cur_pad: &mut f64| {
+            writer.flush_pending_backdrop();
+            writer.flush_disjoint_backdrop();
+            cur_body.push_str(&std::mem::take(&mut writer.out));
+            if !cur_body.is_empty() {
+                let bounds = SvgRect::from_bounds_clamped(
+                    *min_x,
+                    *min_y,
+                    *max_x,
+                    *max_y,
+                    *cur_pad,
+                    writer.page_width,
+                    writer.page_height,
+                );
+                parts.push(Type3TilingPart::InheritedShape {
+                    body: std::mem::take(cur_body),
+                    bounds,
+                });
+            }
+            *min_x = f64::INFINITY;
+            *min_y = f64::INFINITY;
+            *max_x = f64::NEG_INFINITY;
+            *max_y = f64::NEG_INFINITY;
+            *cur_pad = 2.0;
+        };
+
+        let white = Color::white();
+        for glyph in &run.glyphs {
+            if self.check_over_budget() {
+                break;
+            }
+            let Some(program) = self.type3_glyph(run.font_id, font, glyph.glyph_id) else {
+                continue;
+            };
+            let font_matrix = program.font_matrix;
+            let glyph_to_page = run
+                .transform
+                .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
+                .concat(&zpdf_core::Matrix::scale(
+                    run.font_size as f64 * run.h_scale as f64,
+                    run.font_size as f64,
+                ))
+                .concat(&zpdf_core::Matrix::new(
+                    font_matrix[0],
+                    font_matrix[1],
+                    font_matrix[2],
+                    font_matrix[3],
+                    font_matrix[4],
+                    font_matrix[5],
+                ));
+            let stroke_scale = (glyph_to_page.a * glyph_to_page.d
+                - glyph_to_page.b * glyph_to_page.c)
+                .abs()
+                .sqrt();
+
+            let (x0, y1, scale) = (self.x0, self.y1, self.scale);
+            let map_glyph_pt = |gx: f64, gy: f64| -> Option<(f64, f64)> {
+                let tx = font_matrix[0] * gx + font_matrix[2] * gy + font_matrix[4];
+                let ty = font_matrix[1] * gx + font_matrix[3] * gy + font_matrix[5];
+                let tx = tx * run.font_size as f64 * run.h_scale as f64 + glyph.x as f64;
+                let ty = ty * run.font_size as f64;
+                let tm = &run.transform;
+                let px = tm.a * tx + tm.c * ty + tm.e;
+                let py = tm.b * tx + tm.d * ty + tm.f;
+                let (sx, sy) = ((px - x0) * scale, (y1 - py) * scale);
+                (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
+            };
+
+            for cmd in &program.list.commands {
+                if self.check_over_budget() {
+                    break;
+                }
+                match cmd {
+                    RenderCommand::FillPath { path, rule, .. } => {
+                        let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
+                            continue;
+                        };
+                        for p in path.points() {
+                            if let Some((sx, sy)) = map_glyph_pt(p.x, p.y) {
+                                min_x = min_x.min(sx);
+                                min_y = min_y.min(sy);
+                                max_x = max_x.max(sx);
+                                max_y = max_y.max(sy);
+                            }
+                        }
+                        self.out.push_str("<path d=\"");
+                        self.out.push_str(&d);
+                        self.out.push_str("\" fill=\"#ffffff\"");
+                        if *rule == FillRule::EvenOdd {
+                            self.out.push_str(" fill-rule=\"evenodd\"");
+                        }
+                        let placement = self.placement_attrs();
+                        self.out.push_str(&placement);
+                        self.out.push_str("/>\n");
+                    }
+                    RenderCommand::StrokePath { path, style, .. } => {
+                        let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
+                            continue;
+                        };
+                        let width = (style.width as f64 * stroke_scale * self.scale).max(0.05);
+                        if !width.is_finite() {
+                            continue;
+                        }
+                        cur_pad = cur_pad.max(width + 2.0);
+                        for p in path.points() {
+                            if let Some((sx, sy)) = map_glyph_pt(p.x, p.y) {
+                                min_x = min_x.min(sx);
+                                min_y = min_y.min(sy);
+                                max_x = max_x.max(sx);
+                                max_y = max_y.max(sy);
+                            }
+                        }
+                        self.out.push_str("<path d=\"");
+                        self.out.push_str(&d);
+                        self.out
+                            .push_str("\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"");
+                        push_num(&mut self.out, width);
+                        self.out.push('"');
+                        let placement = self.placement_attrs();
+                        self.out.push_str(&placement);
+                        self.out.push_str("/>\n");
+                    }
+                    RenderCommand::DrawImage(draw) => {
+                        let Some(image) = program.images.get(draw.image_id) else {
+                            continue;
+                        };
+                        let transform = glyph_to_page.concat(&draw.transform);
+                        let alpha = if draw.alpha.is_finite() {
+                            draw.alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        if alpha <= 0.0 {
+                            continue;
+                        }
+                        if draw.is_image_mask {
+                            for &(ux, uy) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                                let p = zpdf_core::Point::new(ux, uy).transform(&transform);
+                                let (sx, sy) = ((p.x - x0) * scale, (y1 - p.y) * scale);
+                                if coord_ok(sx) && coord_ok(sy) {
+                                    min_x = min_x.min(sx);
+                                    min_y = min_y.min(sy);
+                                    max_x = max_x.max(sx);
+                                    max_y = max_y.max(sy);
+                                }
+                            }
+                            let tint = [white.r, white.g, white.b, white.a].map(f32::to_bits);
+                            let key = ImageDefKey::Type3Stencil {
+                                font: run.font_id,
+                                glyph: glyph.glyph_id,
+                                image: draw.image_id,
+                                tint,
+                            };
+                            self.place_image(key, image, Some(&white), &transform, alpha);
+                        } else {
+                            flush_shape(
+                                self,
+                                &mut parts,
+                                &mut cur_body,
+                                &mut min_x,
+                                &mut min_y,
+                                &mut max_x,
+                                &mut max_y,
+                                &mut cur_pad,
+                            );
+                            let key = ImageDefKey::Type3Stencil {
+                                font: run.font_id,
+                                glyph: glyph.glyph_id,
+                                image: draw.image_id,
+                                tint: [u32::MAX; 4],
+                            };
+                            parts.push(Type3TilingPart::ColoredImage {
+                                key,
+                                program: Rc::clone(&program),
+                                image_id: draw.image_id,
+                                transform,
+                                alpha,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        flush_shape(
+            self,
+            &mut parts,
+            &mut cur_body,
+            &mut min_x,
+            &mut min_y,
+            &mut max_x,
+            &mut max_y,
+            &mut cur_pad,
+        );
+        self.out = saved_out;
         self.pending_backdrop = saved_pending;
         self.disjoint_backdrop = saved_disjoint;
         self.non_isolated_filter_depth = saved_non_isolated;
-        if shape_body.is_empty() {
+        self.non_isolated_ga_depth = saved_non_isolated_ga;
+
+        if parts.is_empty() {
             return;
         }
-        let affected = self.clip_bounds.unwrap_or_else(|| self.full_page_rect());
-        let plan = self.emit_tiling_plan(tiling, depth);
-        match plan {
-            TilingPassPlan::Affine { t_id, k_id, mk_id } => {
-                if depth == 0 {
-                    let shape_id = self.fresh_id();
-                    let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
-                    push_opacity(&mut self.defs, "opacity", opacity);
-                    self.defs.push_str(">\n");
-                    self.defs.push_str(&shape_body);
-                    self.defs.push_str("</g>\n");
-                    if self.enqueue_backdrop_step(
-                        BackdropStep::Affine {
-                            t_id,
-                            k_id,
-                            mk_id,
-                            shape_id,
-                        },
-                        14,
-                        Some(affected),
-                        true,
-                    ) {
-                        return;
-                    }
-                    self.flush_pending_backdrop();
-                }
-                let mask_id = self.fresh_id();
-                let _ = write!(
-                    self.defs,
-                    "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
-                );
-                self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                push_num(&mut self.out, self.page_width);
-                self.out.push_str("\" height=\"");
-                push_num(&mut self.out, self.page_height);
-                let _ = write!(
-                    self.out,
-                    "\" fill=\"url(#p{t_id})\" mask=\"url(#m{mask_id})\""
-                );
-                push_opacity(&mut self.out, "fill-opacity", opacity);
-                self.out.push_str("/>\n");
-            }
-            TilingPassPlan::Ops(ops) => {
-                if ops.is_empty() {
-                    return;
-                }
-                let single_pattern = match ops.as_slice() {
-                    [TilingPlanOp::Pattern { pat_id, blend_mode }] => Some((*pat_id, *blend_mode)),
-                    _ => None,
-                };
-                if depth == 0
-                    && (single_pattern.is_none()
-                        || (self.pending_backdrop.is_some()
-                            && single_pattern.is_some_and(|(_, m)| m != BlendMode::Normal)))
+        let has_inherited = parts
+            .iter()
+            .any(|p| matches!(p, Type3TilingPart::InheritedShape { .. }));
+        if !has_inherited {
+            for part in parts {
+                if let Type3TilingPart::ColoredImage {
+                    key,
+                    program,
+                    image_id,
+                    transform,
+                    alpha,
+                } = part
                 {
-                    let mut wrapped_shape = String::with_capacity(shape_body.len() + 48);
-                    wrapped_shape.push_str("<g");
-                    push_opacity(&mut wrapped_shape, "opacity", opacity);
-                    wrapped_shape.push_str(">\n");
-                    wrapped_shape.push_str(&shape_body);
-                    wrapped_shape.push_str("</g>\n");
-                    if self.emit_tiling_multi_pass_backdrop(
-                        &ops,
-                        &wrapped_shape,
-                        affected,
-                        affected,
-                    ) {
-                        return;
+                    if let Some(image) = program.images.get(image_id) {
+                        self.place_image(key, image, None, &transform, alpha * opacity);
                     }
-                    if single_pattern.is_none()
-                        && (self.pending_backdrop.is_some() || !self.out.is_empty())
-                        && self.emit_raster_backdrop_tiling_fallback(affected)
-                    {
-                        return;
-                    }
-                    self.flush_pending_backdrop();
                 }
-                let mask_id = self.fresh_id();
-                let _ = write!(
-                    self.defs,
-                    "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
-                );
-                if let Some((id, blend_mode)) = single_pattern {
-                    self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                    push_num(&mut self.out, self.page_width);
-                    self.out.push_str("\" height=\"");
-                    push_num(&mut self.out, self.page_height);
-                    let _ = write!(
-                        self.out,
-                        "\" fill=\"url(#p{id})\" mask=\"url(#m{mask_id})\""
-                    );
-                    push_opacity(&mut self.out, "fill-opacity", opacity);
-                    if let Some(name) = blend_css(blend_mode) {
-                        let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+            }
+            return;
+        }
+        let has_colored = parts
+            .iter()
+            .any(|p| matches!(p, Type3TilingPart::ColoredImage { .. }));
+        let plan = self.emit_tiling_plan(tiling, depth);
+        let allow_raster = !has_colored;
+
+        for part in parts {
+            match part {
+                Type3TilingPart::ColoredImage {
+                    key,
+                    program,
+                    image_id,
+                    transform,
+                    alpha,
+                } => {
+                    if let Some(image) = program.images.get(image_id) {
+                        self.place_image(key, image, None, &transform, alpha * opacity);
                     }
-                    self.out.push_str("/>\n");
-                } else {
-                    self.out.push_str("<g");
-                    push_opacity(&mut self.out, "opacity", opacity);
-                    let _ = writeln!(
-                        self.out,
-                        " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
-                    );
-                    self.emit_isolated_tiling_ops(&ops);
-                    self.out.push_str("</g>\n");
+                }
+                Type3TilingPart::InheritedShape {
+                    body: shape_body,
+                    bounds,
+                } => {
+                    let affected = match (bounds, self.clip_bounds) {
+                        (Some(gb), Some(cb)) => gb.intersect(cb).unwrap_or(gb),
+                        (Some(gb), None) => gb,
+                        (None, Some(cb)) => cb,
+                        (None, None) => self.full_page_rect(),
+                    };
+                    match &plan {
+                        TilingPassPlan::Affine { t_id, k_id, mk_id } => {
+                            let (t_id, k_id, mk_id) = (*t_id, *k_id, *mk_id);
+                            if depth == 0 {
+                                let shape_id = self.fresh_id();
+                                let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
+                                push_opacity(&mut self.defs, "opacity", opacity);
+                                self.defs.push_str(">\n");
+                                self.defs.push_str(&shape_body);
+                                self.defs.push_str("</g>\n");
+                                let affine_prims = if self.non_isolated_ga_depth > 0 {
+                                    18
+                                } else {
+                                    14
+                                };
+                                if self.enqueue_backdrop_step(
+                                    BackdropStep::Affine {
+                                        t_id,
+                                        k_id,
+                                        mk_id,
+                                        shape_id,
+                                    },
+                                    affine_prims,
+                                    Some(affected),
+                                    true,
+                                ) {
+                                    continue;
+                                }
+                                if allow_raster
+                                    && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                    && self.emit_raster_backdrop_tiling_fallback(affected)
+                                {
+                                    continue;
+                                }
+                                self.flush_pending_backdrop();
+                            }
+                            let mask_id = self.fresh_id();
+                            let _ = write!(
+                                self.defs,
+                                "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
+                            );
+                            self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                            push_num(&mut self.out, self.page_width);
+                            self.out.push_str("\" height=\"");
+                            push_num(&mut self.out, self.page_height);
+                            let _ = write!(
+                                self.out,
+                                "\" fill=\"url(#p{t_id})\" mask=\"url(#m{mask_id})\""
+                            );
+                            push_opacity(&mut self.out, "fill-opacity", opacity);
+                            self.out.push_str("/>\n");
+                        }
+                        TilingPassPlan::Ops(ops) => {
+                            if ops.is_empty() {
+                                continue;
+                            }
+                            let single_pattern = match ops.as_slice() {
+                                [TilingPlanOp::Pattern { pat_id, blend_mode }] => {
+                                    Some((*pat_id, *blend_mode))
+                                }
+                                _ => None,
+                            };
+                            if depth == 0
+                                && (single_pattern.is_none()
+                                    || (self.pending_backdrop.is_some()
+                                        && single_pattern
+                                            .is_some_and(|(_, m)| m != BlendMode::Normal)))
+                            {
+                                let mut wrapped_shape =
+                                    String::with_capacity(shape_body.len() + 48);
+                                wrapped_shape.push_str("<g");
+                                push_opacity(&mut wrapped_shape, "opacity", opacity);
+                                wrapped_shape.push_str(">\n");
+                                wrapped_shape.push_str(&shape_body);
+                                wrapped_shape.push_str("</g>\n");
+                                if self.emit_tiling_multi_pass_backdrop(
+                                    ops,
+                                    &wrapped_shape,
+                                    affected,
+                                    affected,
+                                ) {
+                                    continue;
+                                }
+                                if allow_raster
+                                    && single_pattern.is_none()
+                                    && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                    && self.emit_raster_backdrop_tiling_fallback(affected)
+                                {
+                                    continue;
+                                }
+                                self.flush_pending_backdrop();
+                            }
+                            let mask_id = self.fresh_id();
+                            let _ = write!(
+                                self.defs,
+                                "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
+                            );
+                            if let Some((id, blend_mode)) = single_pattern {
+                                self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                                push_num(&mut self.out, self.page_width);
+                                self.out.push_str("\" height=\"");
+                                push_num(&mut self.out, self.page_height);
+                                let _ = write!(
+                                    self.out,
+                                    "\" fill=\"url(#p{id})\" mask=\"url(#m{mask_id})\""
+                                );
+                                push_opacity(&mut self.out, "fill-opacity", opacity);
+                                if let Some(name) = blend_css(blend_mode) {
+                                    let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                                }
+                                self.out.push_str("/>\n");
+                            } else {
+                                self.out.push_str("<g");
+                                push_opacity(&mut self.out, "opacity", opacity);
+                                let _ = writeln!(
+                                    self.out,
+                                    " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
+                                );
+                                self.emit_isolated_tiling_ops(ops);
+                                self.out.push_str("</g>\n");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -5075,23 +5740,100 @@ fn tinted(image: &DecodedImage, color: &Color) -> DecodedImage {
     out
 }
 
-fn svg_clamp_raster_scale(width_pt: f64, height_pt: f64, max_dim: f64, max_pixels: f64) -> f32 {
+fn svg_find_matching_pop_blend(commands: &[RenderCommand], start_idx: usize) -> usize {
+    let mut depth = 0usize;
+    for (i, cmd) in commands.iter().enumerate().skip(start_idx) {
+        match cmd {
+            RenderCommand::PushBlendGroup { .. } => depth += 1,
+            RenderCommand::PopBlendGroup => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    commands.len().saturating_sub(1)
+}
+
+fn svg_slice_needs_non_isolated_backdrop(commands: &[RenderCommand]) -> bool {
+    commands.iter().any(|cmd| match cmd {
+        RenderCommand::FillPath {
+            paint: Paint::Tiling(_),
+            ..
+        }
+        | RenderCommand::StrokePath {
+            paint: Paint::Tiling(_),
+            ..
+        }
+        | RenderCommand::DrawGlyphRun(GlyphRun {
+            paint: Paint::Tiling(_),
+            ..
+        }) => true,
+        RenderCommand::PushBlendGroup {
+            blend_mode,
+            knockout,
+            ..
+        } => *blend_mode != BlendMode::Normal || *knockout,
+        _ => false,
+    })
+}
+
+fn svg_clamp_raster_scale(page: zpdf_core::Rect, max_dim: u32, max_pixels: u64) -> Option<f32> {
+    let page = page.normalize();
+    let width_pt = page.width();
+    let height_pt = page.height();
+    if !(page.x0.is_finite()
+        && page.y0.is_finite()
+        && page.x1.is_finite()
+        && page.y1.is_finite()
+        && width_pt.is_finite()
+        && height_pt.is_finite()
+        && width_pt > 0.0
+        && height_pt > 0.0)
+    {
+        return None;
+    }
     let mut scale = 1.0_f64;
     let max_side = (width_pt * scale).max(height_pt * scale);
-    if max_side > max_dim {
-        scale *= max_dim / max_side;
+    if max_side > max_dim as f64 {
+        scale *= max_dim as f64 / max_side;
     }
     let pixels = (width_pt * scale) * (height_pt * scale);
-    if pixels > max_pixels {
-        scale *= (max_pixels / pixels).sqrt();
+    if pixels > max_pixels as f64 {
+        scale *= (max_pixels as f64 / pixels).sqrt();
     }
-    (scale as f32).max(1e-4)
+    let mut scale_f32 = scale as f32;
+    for _ in 0..8 {
+        if !scale_f32.is_finite() || scale_f32 <= 0.0 {
+            return None;
+        }
+        let info = PageRenderInfo {
+            page_rect: page,
+            scale: scale_f32,
+            background: Color::white(),
+        };
+        if let Ok((w, h)) = info.raster_dimensions() {
+            if w <= max_dim && h <= max_dim && (w as u64) * (h as u64) <= max_pixels {
+                return Some(scale_f32);
+            }
+        }
+        scale_f32 *= 0.99;
+    }
+    None
 }
 
 /// Solve for the straight RGBA8 overlay pixel `X` such that Porter-Duff
 /// `SourceOver(X, B) == F` (premultiplied `before`/`after`), leaving unchanged
 /// pixels transparent so surrounding SVG vector content stays untouched.
-fn svg_compute_incremental_overlay(before_premul: &[u8], after_premul: &[u8]) -> Vec<u8> {
+///
+/// Returns `None` when any changed pixel cannot be represented via `SourceOver`
+/// (e.g., unchanged/reduced alpha on a translucent backdrop such as
+/// `[0, 0, 0, 204] -> [1, 1, 1, 204]`), signalling the caller to replace that
+/// bounded subregion directly with its true RGBA and alpha instead of baking
+/// opaque white.
+fn svg_compute_incremental_overlay(before_premul: &[u8], after_premul: &[u8]) -> Option<Vec<u8>> {
     let mut out = vec![0u8; before_premul.len()];
     for ((b, f), dst) in before_premul
         .as_chunks::<4>()
@@ -5151,16 +5893,9 @@ fn svg_compute_incremental_overlay(before_premul: &[u8], after_premul: &[u8]) ->
                 continue;
             }
         }
-        // Fallback when `F != B` cannot be expressed as SourceOver (e.g. alpha reduction).
-        let inv_fa = 255u32 - fa as u32;
-        *dst = [
-            (f[0] as u32 + inv_fa).min(255) as u8,
-            (f[1] as u32 + inv_fa).min(255) as u8,
-            (f[2] as u32 + inv_fa).min(255) as u8,
-            255,
-        ];
+        return None;
     }
-    out
+    Some(out)
 }
 
 fn encode_png(image: &DecodedImage) -> Option<Vec<u8>> {
@@ -8885,6 +9620,675 @@ mod tests {
             margin.red() > 245 && margin.green() > 245 && margin.blue() > 245,
             "margin outside detailed path must stay white, got {:?}",
             [margin.red(), margin.green(), margin.blue()]
+        );
+    }
+
+    #[test]
+    fn svg_transparent_fallback_preserves_alpha_when_rgb_changes_at_equal_alpha() {
+        let rect_path = |x0, y0, x1, y1| {
+            let mut p = Path::new();
+            p.rect(Rect::new(x0, y0, x1, y1));
+            p
+        };
+        // Dense pattern (74 alternating Darken(white)/Lighten(white) passes > 64):
+        // at fill alpha = 0.005 over premultiplied [0, 0, 0, 204], full-coverage
+        // Lighten(white) yields [255, 255, 255, 255], and 0.5% mix takes
+        // [0, 0, 0, 204] -> [1, 1, 1, 204] (color changes while alpha stays 204).
+        let mut faint_cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        for _ in 0..37 {
+            faint_cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Darken,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            faint_cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 20.0, 20.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            faint_cell.push(RenderCommand::PopBlendGroup);
+            faint_cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Lighten,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            faint_cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 20.0, 20.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            faint_cell.push(RenderCommand::PopBlendGroup);
+        }
+        let faint_dense = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(faint_cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Direct unit check on svg_compute_incremental_overlay: [0,0,0,204] -> [1,1,1,204]
+        // must return None instead of baking opaque white [52,52,52,255].
+        assert!(
+            svg_compute_incremental_overlay(&[0, 0, 0, 204], &[1, 1, 1, 204]).is_none(),
+            "unchanged translucent alpha with RGB change must not bake opaque white"
+        );
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 400.0, 400.0));
+        // 80%-opaque black backdrop over transparent SVG canvas -> [0, 0, 0, 204].
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 400.0, 400.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 0.8,
+            overprint: None,
+        });
+        // Three small overlapping fills on [10..20]² exhaust MAX_BACKDROP_FANOUT
+        // (1 -> 3 -> 9 -> 27) via `emit_flat_blend_group_tiling_ops` (74 > 64 ops).
+        for _ in 0..3 {
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(10.0, 10.0, 20.0, 20.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&faint_dense)),
+                alpha: 0.005,
+                overprint: None,
+            });
+        }
+        // 4th fill on [40..380]² (prim_limit = 141 < 153) exceeds MAX_BACKDROP_FANOUT
+        // and enters `emit_raster_backdrop_tiling_fallback`, taking [0,0,0,204] -> [1,1,1,204].
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(40.0, 40.0, 380.0, 380.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(faint_dense),
+            alpha: 0.005,
+            overprint: None,
+        });
+
+        let opts = SvgOptions {
+            background: None,
+            budget: None,
+        };
+        let svg = display_list_to_svg(&dl, &FontCache::new(), &ImageCache::new(), &opts);
+        assert!(
+            svg.contains("href=\"data:image/png;base64,"),
+            "expected raster fallback PNG on translucent canvas"
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(100, 100).expect("pixmap");
+        let s = 100.0 / tree.size().width();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(s, s),
+            &mut pixmap.as_mut(),
+        );
+        // Inside [40..380]² (scaled to [10..95]²): must keep alpha ~204 and dark RGB ~1
+        // (NEVER opaque [52, 52, 52, 255]).
+        let inside = pixmap.pixel(50, 50).expect("in bounds");
+        // Untouched corner PDF [0..40]×[360..400] -> SVG [0..40]×[0..40] -> pixel (2, 2).
+        let outside = pixmap.pixel(2, 2).expect("in bounds");
+        assert!(
+            (200..=208).contains(&inside.alpha()) && (1..=5).contains(&inside.red()),
+            "transparent SVG fallback must preserve ~204 alpha and faint mark ~[1,1,1,204] (not opaque ~52), got {:?}",
+            [inside.red(), inside.green(), inside.blue(), inside.alpha()]
+        );
+        assert!(
+            (200..=208).contains(&outside.alpha()) && outside.red() == 0,
+            "surrounding vector backdrop must stay ~204 alpha black, got {:?}",
+            [
+                outside.red(),
+                outside.green(),
+                outside.blue(),
+                outside.alpha()
+            ]
+        );
+    }
+
+    #[test]
+    fn svg_unclipped_type3_fallback_preserves_earlier_vector_content() {
+        let rect_path = |x0, y0, x1, y1| {
+            let mut p = Path::new();
+            p.rect(Rect::new(x0, y0, x1, y1));
+            p
+        };
+        let charproc =
+            b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([(
+                    "A".into(),
+                    std::sync::Arc::<[u8]>::from(&charproc[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3KeepVectors".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dense_cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        for _ in 0..70 {
+            dense_cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Darken,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            dense_cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dense_cell.push(RenderCommand::PopBlendGroup);
+            dense_cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Lighten,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            dense_cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dense_cell.push(RenderCommand::PopBlendGroup);
+        }
+        let dense_red = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(dense_cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        // Distinct earlier vector artwork at [10..50]×[10..50].
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(10.0, 10.0, 50.0, 50.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.5, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        // Exhaust MAX_BACKDROP_FANOUT on overlapping fills at [100..150]×[100..150].
+        for _ in 0..5 {
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(100.0, 100.0, 150.0, 150.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&dense_red)),
+                alpha: 1.0,
+                overprint: None,
+            });
+        }
+        // Small unclipped Type 3 glyph at [160..176]×[160..176] hitting raster fallback.
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 16.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 16.0,
+            }],
+            paint: Paint::Tiling(dense_red),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::translate(160.0, 160.0),
+            h_scale: 1.0,
+        }));
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        assert!(
+            svg.contains("fill=\"#0080ff\""),
+            "small unclipped Type 3 glyph fallback must NOT wipe earlier vector artwork from the SVG"
+        );
+        assert!(
+            svg.contains("href=\"data:image/png;base64,"),
+            "Type 3 glyph past MAX_BACKDROP_FANOUT must emit bounded raster overlay"
+        );
+    }
+
+    #[test]
+    fn svg_isolated_child_inside_non_isolated_multiply_preserves_fallback_mark() {
+        let rect_path = |x0, y0, x1, y1| {
+            let mut p = Path::new();
+            p.rect(Rect::new(x0, y0, x1, y1));
+            p
+        };
+        let make_dense = |darken_color: Color| {
+            let mut dense_cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+            for _ in 0..37 {
+                dense_cell.push(RenderCommand::PushBlendGroup {
+                    blend_mode: BlendMode::Darken,
+                    isolated: false,
+                    knockout: false,
+                    bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+                    alpha: 1.0,
+                    mask: None,
+                });
+                dense_cell.push(RenderCommand::FillPath {
+                    path: rect_path(0.0, 0.0, 20.0, 20.0),
+                    rule: FillRule::NonZero,
+                    paint: Paint::Solid(darken_color),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+                dense_cell.push(RenderCommand::PopBlendGroup);
+                dense_cell.push(RenderCommand::PushBlendGroup {
+                    blend_mode: BlendMode::Lighten,
+                    isolated: false,
+                    knockout: false,
+                    bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+                    alpha: 1.0,
+                    mask: None,
+                });
+                dense_cell.push(RenderCommand::FillPath {
+                    path: rect_path(0.0, 0.0, 20.0, 20.0),
+                    rule: FillRule::NonZero,
+                    paint: Paint::Solid(Color::black()),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+                dense_cell.push(RenderCommand::PopBlendGroup);
+            }
+            std::sync::Arc::new(zpdf_display_list::TilingPattern {
+                commands: std::sync::Arc::new(dense_cell),
+                bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+                x_step: 20.0,
+                y_step: 20.0,
+                matrix: zpdf_core::Matrix::identity(),
+                tiling_type: 1,
+            })
+        };
+        let dense_white = make_dense(Color::white());
+        let dense_cyan = make_dense(Color::rgb(0.0, 1.0, 1.0));
+
+        // 400×400 page: outer non-isolated Multiply fits in `NonIsolatedFilterGroup`
+        // (prim_limit = 104 >= 7). Inside the isolated child, 3 small overlapping
+        // fills on [10..20]² exhaust MAX_BACKDROP_FANOUT (1 -> 3 -> 9 -> 27) via
+        // `emit_flat_blend_group_tiling_ops` (74 > 64 ops), and fill 4 on [40..380]²
+        // (prim_limit = 141 < 153) MUST enter `emit_raster_backdrop_tiling_fallback`
+        // and paint cyan (never silently omitted while outer CPU group is deferred).
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 400.0, 400.0));
+        // Yellow outer backdrop [255, 255, 0].
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 400.0, 400.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 1.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        // Non-isolated Multiply outer group (causes CpuRenderer to enter recording_non_isolated).
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 400.0, 400.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        // Isolated Normal child inside the non-isolated Multiply group.
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 400.0, 400.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        // White fill inside isolated child so Darken(cyan) yields cyan inside the child.
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(40.0, 40.0, 380.0, 380.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        // Exhaust MAX_BACKDROP_FANOUT inside the isolated child using small fills.
+        for _ in 0..3 {
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(10.0, 10.0, 20.0, 20.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&dense_white)),
+                alpha: 1.0,
+                overprint: None,
+            });
+        }
+        // 4th fill hits raster fallback inside the isolated child and turns [40..380]² cyan.
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(40.0, 40.0, 380.0, 380.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(dense_cyan),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions {
+                background: Some(Color::white()),
+                budget: None,
+            },
+        );
+        assert!(
+            svg.contains("href=\"data:image/png;base64,"),
+            "4th dense fill inside isolated child must exercise raster fallback"
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(100, 100).expect("pixmap");
+        let s = 100.0 / tree.size().width();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(s, s),
+            &mut pixmap.as_mut(),
+        );
+        // Inside [20..380]²: cyan [0,255,255] Multiply over yellow [255,255,0] = green [0,255,0].
+        // If the 4th fill had been omitted while the outer Multiply group was deferred,
+        // the isolated child would have stayed white and the pixel would be yellow [255,255,0].
+        let mid = pixmap.pixel(50, 50).expect("in bounds");
+        let rgb = [mid.red(), mid.green(), mid.blue()];
+        assert!(
+            rgb[0] < 15 && rgb[1] > 240 && rgb[2] < 15,
+            "fallback mark inside isolated child of non-isolated Multiply group must produce green [0,255,0], not omitted yellow, got {rgb:?}"
+        );
+    }
+
+    #[test]
+    fn svg_affine_filter_over_budget_uses_live_backdrop_instead_of_transparent_seed() {
+        let rect_path = |x0, y0, x1, y1| {
+            let mut p = Path::new();
+            p.rect(Rect::new(x0, y0, x1, y1));
+            p
+        };
+        // Six overlapping copies (bbox 60×10, step 10×10) × 176 alternating white Multiply
+        // and black Screen marks -> 1056 > MAX_SVG_TILING_BLEND_PASSES (1024), selecting
+        // the 3-seed affine plan. On a 1200×1200 page, max_filter_primitives = 11 < 14,
+        // so enqueue fails and must use the live CPU backdrop (keeping opaque blue unchanged)
+        // instead of painting the opaque-white transparent seed over blue.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 10.0));
+        for _ in 0..88 {
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 60.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 60.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Screen,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 60.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 60.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 60.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 1200.0, 1200.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 1200.0, 1200.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 1200.0, 1200.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(60, 60).expect("pixmap");
+        let s = 60.0 / tree.size().width();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(s, s),
+            &mut pixmap.as_mut(),
+        );
+        let mid = pixmap.pixel(30, 30).expect("in bounds");
+        let rgb = [mid.red(), mid.green(), mid.blue()];
+        assert!(
+            rgb[0] < 15 && rgb[1] < 15 && rgb[2] > 240,
+            "over-budget affine filter on 1200x1200 blue page must keep blue via CPU backdrop, not paint white seed, got {rgb:?}"
+        );
+    }
+
+    #[test]
+    fn svg_non_isolated_group_reserves_close_primitives_within_budget() {
+        let rect_path = |x0, y0, x1, y1| {
+            let mut p = Path::new();
+            p.rect(Rect::new(x0, y0, x1, y1));
+            p
+        };
+        // On a 2048×2048 page, max_filter_primitives = 4. A non-isolated Normal
+        // 50%-opacity group containing a solid fill needs 6 primitives (2 for the
+        // trailing overlay + 4 for PopNonIsolatedGroup), so it must NOT emit a
+        // filter exceeding the 4-primitive budget.
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 2048.0, 2048.0));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 2048.0, 2048.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 2048.0, 2048.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        assert!(
+            !svg.contains("<filter "),
+            "2048x2048 non-isolated Normal group requiring 6 primitives must not emit a filter exceeding the 4-primitive budget"
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(32, 32).expect("pixmap");
+        let s = 32.0 / tree.size().width();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(s, s),
+            &mut pixmap.as_mut(),
+        );
+        let mid = pixmap.pixel(16, 16).expect("in bounds");
+        let rgb = [mid.red(), mid.green(), mid.blue()];
+        assert!(
+            rgb[0] > 245 && (118..=138).contains(&rgb[1]) && (118..=138).contains(&rgb[2]),
+            "50%-opaque red non-isolated group over white must render pink [255,~128,~128], got {rgb:?}"
+        );
+    }
+
+    #[test]
+    fn svg_clamp_raster_scale_honors_fallback_limits_without_floor() {
+        let huge = Rect::new(0.0, 0.0, 40_000_000.0, 40_000_000.0);
+        let scale = svg_clamp_raster_scale(huge, 1024, 1_048_576)
+            .expect("40M×40M page fits 1024×1024 without 1e-4 floor");
+        let (w, h) = PageRenderInfo {
+            page_rect: huge,
+            scale,
+            background: Color::white(),
+        }
+        .raster_dimensions()
+        .expect("valid raster dimensions");
+        assert!(
+            w <= 1024 && h <= 1024 && (w as u64) * (h as u64) <= 1_048_576,
+            "raster dimensions must stay within 1024×1024 / 1M pixels, got {w}×{h} at scale {scale}"
+        );
+        // Unrepresentable scale (underflows f32 to 0) declines fallback cleanly.
+        let absurd = Rect::new(0.0, 0.0, 1e45, 1e45);
+        assert!(svg_clamp_raster_scale(absurd, 1024, 1_048_576).is_none());
+    }
+
+    #[test]
+    fn svg_type3_d0_colored_image_preserves_rgb_under_tiling_pattern() {
+        let d0_stream =
+            b"1 0 d0 BI /W 2 /H 2 /CS /RGB /BPC 8 ID \xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00\x00 EI";
+        let d1_stream =
+            b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), std::sync::Arc::<[u8]>::from(&d0_stream[..])),
+                    ("B".into(), std::sync::Arc::<[u8]>::from(&d1_stream[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![1.0, 1.0],
+                first_char: 0,
+            },
+            "Type3MixedSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 40.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 20.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'A' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 20.0,
+                },
+                PositionedGlyph {
+                    glyph_id: 1,
+                    code_len: 1,
+                    code: b'B' as u32,
+                    x: 20.0,
+                    y: 0.0,
+                    advance: 20.0,
+                },
+            ],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::translate(8.0, 10.0),
+            h_scale: 1.0,
+        }));
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(60, 40).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::identity(),
+            &mut pixmap.as_mut(),
+        );
+        let a = pixmap.pixel(18, 20).expect("in bounds");
+        let b = pixmap.pixel(38, 20).expect("in bounds");
+        assert!(
+            a.red() > 240 && a.green() < 15 && a.blue() < 15,
+            "SVG d0 colored RGB Type 3 image must stay red under blue tiling pattern, got {:?}",
+            [a.red(), a.green(), a.blue()]
+        );
+        assert!(
+            b.red() < 15 && b.green() < 15 && b.blue() > 240,
+            "SVG d1 stencil Type 3 glyph must inherit blue tiling pattern, got {:?}",
+            [b.red(), b.green(), b.blue()]
         );
     }
 }
