@@ -23,6 +23,7 @@ use crate::record::{MeshRange, PageOp};
 enum BatchKey {
     Draw(u32),       // clip_ref
     Image(u32, u32), // image_id, clip_ref
+    Tile(u32, u32),  // tile_id, clip_ref
     Glyph(u32),      // clip_ref — a page has exactly one atlas, no id needed
     StampClip(u32),  // ref_value
     Other,
@@ -34,6 +35,9 @@ fn key_of(op: &PageOp) -> BatchKey {
         PageOp::Image {
             image_id, clip_ref, ..
         } => BatchKey::Image(*image_id, *clip_ref),
+        PageOp::Tile {
+            tile_id, clip_ref, ..
+        } => BatchKey::Tile(*tile_id, *clip_ref),
         PageOp::Glyph { clip_ref, .. } => BatchKey::Glyph(*clip_ref),
         PageOp::StampClip { ref_value, .. } => BatchKey::StampClip(*ref_value),
         PageOp::ResetStencil | PageOp::PushBlend { .. } | PageOp::PopBlend => BatchKey::Other,
@@ -73,6 +77,21 @@ fn try_merge(op: &mut PageOp, next: &PageOp) -> bool {
                 clip_ref: c2,
             },
         ) if image_id == i2 && clip_ref == c2 && contiguous(range, r2) => {
+            range.index_count += r2.index_count;
+            true
+        }
+        (
+            PageOp::Tile {
+                range,
+                tile_id,
+                clip_ref,
+            },
+            PageOp::Tile {
+                range: r2,
+                tile_id: t2,
+                clip_ref: c2,
+            },
+        ) if tile_id == t2 && clip_ref == c2 && contiguous(range, r2) => {
             range.index_count += r2.index_count;
             true
         }

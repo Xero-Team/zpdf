@@ -10,9 +10,13 @@ mod text_grouper;
 
 use image::ImageEncoder;
 use zpdf_core::{Rect, Result};
-use zpdf_display_list::{DisplayList, RenderCommand};
+use zpdf_display_list::{
+    Color, DisplayList, FillRule, LineJoin, Overprint, Paint, Path, RenderCommand, StrokeStyle,
+};
 use zpdf_font::FontCache;
 use zpdf_image::ImageCache;
+use zpdf_render::{PageRenderInfo, RenderBackend};
+use zpdf_render_cpu::CpuRenderer;
 
 pub use ooxml::PptxWriter;
 
@@ -170,6 +174,7 @@ pub fn display_list_to_slide(
         options,
         elements: Vec::new(),
         image_counter: 0,
+        clip_stack: Vec::new(),
     };
 
     converter.convert_commands(&display_list.commands)?;
@@ -189,6 +194,8 @@ struct SlideConverter<'a> {
     options: &'a ConversionOptions,
     elements: Vec<SlideElement>,
     image_counter: usize,
+    /// Active clip stack replayed when rasterizing `Paint::Tiling` commands.
+    clip_stack: Vec<(RenderCommand, Option<Rect>)>,
 }
 
 impl<'a> SlideConverter<'a> {
@@ -198,18 +205,47 @@ impl<'a> SlideConverter<'a> {
                 RenderCommand::DrawGlyphRun(glyph_run) => {
                     self.convert_glyph_run(glyph_run)?;
                 }
-                RenderCommand::FillPath { path, paint, .. } => {
-                    self.convert_fill_path(path, paint)?;
+                RenderCommand::FillPath {
+                    path,
+                    rule,
+                    paint,
+                    alpha,
+                    overprint,
+                } => {
+                    self.convert_fill_path(path, *rule, paint, *alpha, *overprint)?;
                 }
                 RenderCommand::StrokePath {
-                    path, style, paint, ..
+                    path,
+                    style,
+                    paint,
+                    alpha,
+                    overprint,
                 } => {
-                    self.convert_stroke_path(path, style, paint)?;
+                    self.convert_stroke_path(path, style, paint, *alpha, *overprint)?;
                 }
                 RenderCommand::DrawImage(image_draw) => {
                     self.convert_image(image_draw)?;
                 }
-                // Skip clip/blend commands - we're extracting content only
+                RenderCommand::PushClip { path, .. } => {
+                    let bounds = if path.is_empty() {
+                        Some(Rect::new(0.0, 0.0, 0.0, 0.0))
+                    } else {
+                        path_bounds(path)
+                    };
+                    self.clip_stack.push((cmd.clone(), bounds));
+                }
+                RenderCommand::PushClipStroke { path, style } => {
+                    let bounds = if path.is_empty() {
+                        Some(Rect::new(0.0, 0.0, 0.0, 0.0))
+                    } else {
+                        stroke_bounds(path, style)
+                    };
+                    self.clip_stack.push((cmd.clone(), bounds));
+                }
+                RenderCommand::PopClip => {
+                    self.clip_stack.pop();
+                }
+                // Skip blend commands - we're extracting content only
                 _ => {}
             }
         }
@@ -314,10 +350,28 @@ impl<'a> SlideConverter<'a> {
 
     fn convert_fill_path(
         &mut self,
-        path: &zpdf_display_list::Path,
-        paint: &zpdf_display_list::Paint,
+        path: &Path,
+        rule: FillRule,
+        paint: &Paint,
+        alpha: f32,
+        overprint: Option<Overprint>,
     ) -> Result<()> {
-        use zpdf_display_list::Paint;
+        if let Paint::Tiling(_) = paint {
+            if overprint.is_some_and(|op| op.active == 0) {
+                return Ok(());
+            }
+            if let Some(bounds) = path_bounds(path) {
+                let cmd = RenderCommand::FillPath {
+                    path: path.clone(),
+                    rule,
+                    paint: paint.clone(),
+                    alpha,
+                    overprint,
+                };
+                self.rasterize_pattern_command(&cmd, bounds)?;
+            }
+            return Ok(());
+        }
 
         let fill_rgb = match paint {
             Paint::Solid(c) => Some((
@@ -375,11 +429,28 @@ impl<'a> SlideConverter<'a> {
 
     fn convert_stroke_path(
         &mut self,
-        path: &zpdf_display_list::Path,
-        style: &zpdf_display_list::StrokeStyle,
-        paint: &zpdf_display_list::Paint,
+        path: &Path,
+        style: &StrokeStyle,
+        paint: &Paint,
+        alpha: f32,
+        overprint: Option<Overprint>,
     ) -> Result<()> {
-        use zpdf_display_list::Paint;
+        if let Paint::Tiling(_) = paint {
+            if overprint.is_some_and(|op| op.active == 0) {
+                return Ok(());
+            }
+            if let Some(bounds) = stroke_bounds(path, style) {
+                let cmd = RenderCommand::StrokePath {
+                    path: path.clone(),
+                    style: style.clone(),
+                    paint: paint.clone(),
+                    alpha,
+                    overprint,
+                };
+                self.rasterize_pattern_command(&cmd, bounds)?;
+            }
+            return Ok(());
+        }
 
         let stroke_rgb = match paint {
             Paint::Solid(c) => Some((
@@ -414,6 +485,97 @@ impl<'a> SlideConverter<'a> {
             stroke_width_pt: style.width as f64,
         });
 
+        Ok(())
+    }
+
+    /// Rasterize a clipped `Paint::Tiling` fill or stroke into a transparent
+    /// PNG `SlideElement::Image` positioned at its clipped page-space bounds.
+    fn rasterize_pattern_command(&mut self, cmd: &RenderCommand, raw_bounds: Rect) -> Result<()> {
+        const MAX_PATTERN_DIM: f64 = 2048.0;
+        const MAX_PATTERN_PIXELS: f64 = 4_194_304.0;
+
+        let mut bounds = match intersect_rect(raw_bounds, self.page_rect) {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        for (_, clip_bounds) in &self.clip_stack {
+            if let Some(cb) = clip_bounds {
+                match intersect_rect(bounds, *cb) {
+                    Some(b) => bounds = b,
+                    None => return Ok(()),
+                }
+            }
+        }
+        if !bounds.x0.is_finite()
+            || !bounds.y0.is_finite()
+            || !bounds.x1.is_finite()
+            || !bounds.y1.is_finite()
+            || bounds.width() <= 0.0
+            || bounds.height() <= 0.0
+        {
+            return Ok(());
+        }
+
+        let mut scale = 2.0_f64;
+        let max_dim = (bounds.width() * scale).max(bounds.height() * scale);
+        if max_dim > MAX_PATTERN_DIM {
+            scale *= MAX_PATTERN_DIM / max_dim;
+        }
+        let pixels = (bounds.width() * scale) * (bounds.height() * scale);
+        if pixels > MAX_PATTERN_PIXELS {
+            scale *= (MAX_PATTERN_PIXELS / pixels).sqrt();
+        }
+        let scale = (scale as f32).max(1e-4);
+
+        let mut renderer = CpuRenderer::new()
+            .with_fonts(self.font_cache)
+            .with_images(self.image_cache);
+        let info = PageRenderInfo {
+            page_rect: bounds,
+            scale,
+            background: Color::rgba(0.0, 0.0, 0.0, 0.0),
+        };
+        if renderer.begin_page(&info).is_err() {
+            return Ok(());
+        }
+        for (clip_cmd, _) in &self.clip_stack {
+            let _ = renderer.execute(clip_cmd);
+        }
+        let _ = renderer.execute(cmd);
+        for _ in &self.clip_stack {
+            let _ = renderer.execute(&RenderCommand::PopClip);
+        }
+        let Ok(mut rendered) = renderer.end_page() else {
+            return Ok(());
+        };
+
+        // Skip empty / fully transparent pattern outputs.
+        if !rendered.data.as_chunks::<4>().0.iter().any(|px| px[3] > 0) {
+            return Ok(());
+        }
+
+        // Convert tiny-skia premultiplied RGBA8 into straight RGBA8 for PNG.
+        for px in rendered.data.as_chunks_mut::<4>().0 {
+            let a = px[3] as u32;
+            if a > 0 && a < 255 {
+                px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+                px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+                px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+
+        let png_data = rgba_to_png(&rendered.data, rendered.width, rendered.height)?;
+        self.image_counter += 1;
+        let image_id = format!("image{}", self.image_counter);
+        let (x_ppt, y_ppt) = self.pdf_to_ppt_coords(bounds.x0, bounds.y1);
+        self.elements.push(SlideElement::Image {
+            x_emu: pt_to_emu(x_ppt),
+            y_emu: pt_to_emu(y_ppt),
+            width_emu: pt_to_emu(bounds.width()),
+            height_emu: pt_to_emu(bounds.height()),
+            image_data: png_data,
+            image_id,
+        });
         Ok(())
     }
 
@@ -506,17 +668,62 @@ fn pt_to_emu(pt: f64) -> i64 {
 
 /// Convert an image to PNG format
 fn image_to_png(image: &zpdf_image::DecodedImage) -> Result<Vec<u8>> {
+    rgba_to_png(&image.data, image.width, image.height)
+}
+
+fn rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     let mut png_data = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
     encoder
-        .write_image(
-            &image.data,
-            image.width,
-            image.height,
-            image::ExtendedColorType::Rgba8,
-        )
+        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| zpdf_core::Error::StreamDecode(format!("PNG encode: {e}")))?;
     Ok(png_data)
+}
+
+fn path_bounds(path: &Path) -> Option<Rect> {
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for p in path.points() {
+        if !p.x.is_finite() || !p.y.is_finite() {
+            return None;
+        }
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+        .then(|| Rect::new(x0, y0, x1, y1))
+}
+
+fn stroke_bounds(path: &Path, style: &StrokeStyle) -> Option<Rect> {
+    let b = path_bounds(path)?;
+    let reach = match style.join {
+        LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0),
+        _ => std::f32::consts::SQRT_2,
+    };
+    let grow =
+        (style.width.max(1.0) as f64 * 0.5 * reach.max(std::f32::consts::SQRT_2) as f64).max(0.5);
+    Some(Rect::new(
+        b.x0 - grow,
+        b.y0 - grow,
+        b.x1 + grow,
+        b.y1 + grow,
+    ))
+}
+
+fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let a = a.normalize();
+    let b = b.normalize();
+    let x0 = a.x0.max(b.x0);
+    let y0 = a.y0.max(b.y0);
+    let x1 = a.x1.min(b.x1);
+    let y1 = a.y1.min(b.y1);
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1, y1))
 }
 
 #[cfg(test)]
@@ -1664,5 +1871,143 @@ mod export_tests {
             parsed_text, "AB",
             "parsed slide XML must retain both 'A' and 'B' without XML-forbidden U+000B"
         );
+    }
+
+    #[test]
+    fn tiling_pattern_fill_and_stroke_export_as_clipped_slide_images() {
+        use std::sync::Arc;
+        use zpdf_core::Point;
+        use zpdf_display_list::{FillRule, Path, StrokeStyle, TilingPattern};
+
+        // Two-color 20×20 tile: red left half [0..10], blue right half [10..20].
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let mut left = Path::new();
+        left.rect(Rect::new(0.0, 0.0, 10.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: left,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut right = Path::new();
+        right.rect(Rect::new(10.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: right,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        // 1) Pattern-filled rectangle [20..100] × [100..160].
+        let mut rect_path = Path::new();
+        rect_path.rect(Rect::new(20.0, 100.0, 100.0, 160.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect_path,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        // 2) Pattern-stroked diagonal line from (20, 20) to (100, 80) with width 16.
+        let mut line_path = Path::new();
+        line_path.move_to(Point::new(20.0, 20.0));
+        line_path.line_to(Point::new(100.0, 80.0));
+        dl.push(RenderCommand::StrokePath {
+            path: line_path,
+            style: StrokeStyle {
+                width: 16.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let fonts = FontCache::new();
+        let images = ImageCache::new();
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("display_list_to_slide");
+
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "patterned fill and stroke must emit two slide elements"
+        );
+
+        let mut decoded_images = Vec::new();
+        for elem in &slide.elements {
+            match elem.base() {
+                SlideElement::Image {
+                    width_emu,
+                    height_emu,
+                    image_data,
+                    ..
+                } => {
+                    assert!(*width_emu > 0 && *height_emu > 0);
+                    let img = image::load_from_memory(image_data)
+                        .expect("valid PNG")
+                        .to_rgba8();
+                    decoded_images.push(img);
+                }
+                other => panic!(
+                    "expected SlideElement::Image for tiling pattern fill/stroke, got {other:?}"
+                ),
+            }
+        }
+
+        // Fill image must contain both opaque red and opaque blue pixels from the tile.
+        let fill_img = &decoded_images[0];
+        let has_red = fill_img
+            .pixels()
+            .any(|p| p[0] > 200 && p[1] < 40 && p[2] < 40 && p[3] > 200);
+        let has_blue = fill_img
+            .pixels()
+            .any(|p| p[0] < 40 && p[1] < 40 && p[2] > 200 && p[3] > 200);
+        assert!(
+            has_red && has_blue,
+            "patterned fill image must preserve both tile colors"
+        );
+
+        // Stroke image must contain both red and blue along the diagonal stroke
+        // AND transparent pixels in the off-stroke corners (clipped to stroke outline).
+        let stroke_img = &decoded_images[1];
+        let stroke_has_red = stroke_img
+            .pixels()
+            .any(|p| p[0] > 200 && p[1] < 40 && p[2] < 40 && p[3] > 200);
+        let stroke_has_blue = stroke_img
+            .pixels()
+            .any(|p| p[0] < 40 && p[1] < 40 && p[2] > 200 && p[3] > 200);
+        let stroke_has_transparent = stroke_img.pixels().any(|p| p[3] == 0);
+        assert!(
+            stroke_has_red && stroke_has_blue,
+            "patterned stroke image must preserve both tile colors instead of defaulting to black"
+        );
+        assert!(
+            stroke_has_transparent,
+            "patterned stroke image must stay transparent outside the stroked outline"
+        );
+
+        // Ensure the serialized PPTX archive embeds both rendered PNG media entries.
+        let bytes = PptxWriter::new(PptxPresentation {
+            slides: vec![slide],
+            width_emu: pt_to_emu(200.0),
+            height_emu: pt_to_emu(200.0),
+        })
+        .write_to_bytes()
+        .expect("pptx bytes");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        assert!(!zip_entry(&mut archive, "ppt/media/image1.png").is_empty());
+        assert!(!zip_entry(&mut archive, "ppt/media/image2.png").is_empty());
     }
 }

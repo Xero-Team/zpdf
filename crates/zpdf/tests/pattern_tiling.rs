@@ -947,3 +947,91 @@ fn overlapping_tiling_cell_soft_mask_rebuilds_per_shifted_origin() {
         "unmasked region at period x=7.5 must stay white",
     );
 }
+
+/// Regression: a small pattern cell (0.5×0.5 in pattern space) magnified by
+/// `/Matrix [200 0 0 200 0 0]` to 100×100 pt on the page must size any shading
+/// raster inside the cell from the transformed page-space footprint rather than
+/// pattern-space units, so an axial gradient preserves distinct colors at
+/// opposite ends instead of collapsing to a single 1×1 pixel.
+#[test]
+fn magnified_tiling_cell_preserves_axial_gradient_resolution() {
+    // Type 2 axial shading across x in [0, 0.5]: red (1,0,0) -> blue (0,0,1).
+    let fn_obj = b"<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>".to_vec();
+    let shading_obj =
+        b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 0.5 0] /Function 7 0 R /Extend [true true] >>"
+            .to_vec();
+    // 0.5×0.5 cell enlarged 200× to 100×100 pt per tile.
+    let pat_large = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 0.5 0.5] /XStep 0.5 /YStep 0.5 \
+         /Matrix [200 0 0 200 0 0] \
+         /Resources << /Shading << /Sh1 6 0 R >> >>",
+        b"/Sh1 sh",
+    );
+    // Also exercise the same cell object in a form at tiny 1× scale first, then
+    // a form at 200× scale, to ensure tiling_cell_cache distinguishes cell scale.
+    let pat_shared = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 0.5 0.5] /XStep 0.5 /YStep 0.5 \
+         /Resources << /Shading << /Sh1 6 0 R >> >>",
+        b"/Sh1 sh",
+    );
+    let form_tiny = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+         /Resources << /Pattern << /PS 8 0 R >> >>",
+        b"/Pattern cs /PS scn 0 0 1 1 re f",
+    );
+    let form_large = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 1 1] \
+         /Matrix [200 0 0 200 100 0] \
+         /Resources << /Pattern << /PS 8 0 R >> >>",
+        b"/Pattern cs /PS scn 0 0 0.5 0.5 re f",
+    );
+    // Left half [0..100] uses pat_large (/Matrix [200 0 0 200 0 0]);
+    // right half [100..200] draws form_tiny then form_large with pat_shared.
+    let content = stream_obj("", b"/Pattern cs /PL scn 0 0 100 100 re f\n/FT Do\n/FL Do");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /PL 5 0 R >> /XObject << /FT 9 0 R /FL 10 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        pat_large,                                     // 5
+        shading_obj,                                   // 6
+        fn_obj,                                        // 7
+        pat_shared,                                    // 8
+        form_tiny,                                     // 9
+        form_large,                                    // 10
+    ]);
+    let page = render(pdf);
+
+    // Left tile [0..100]: left end (x=5) is red, middle (x=50) is purple, right end (x=95) is blue.
+    assert_rgbish(
+        px(&page, 5.0, 50.0),
+        [242, 0, 13],
+        "magnified cell left end red",
+    );
+    let mid = px(&page, 50.0, 50.0);
+    assert!(
+        (95..=160).contains(&mid[0]) && mid[1] < 20 && (95..=160).contains(&mid[2]),
+        "magnified cell midpoint should blend red+blue, got {mid:?}"
+    );
+    assert_rgbish(
+        px(&page, 95.0, 50.0),
+        [13, 0, 242],
+        "magnified cell right end blue",
+    );
+
+    // Right tile [100..200]: shared pattern magnified after a tiny draw must still preserve gradient.
+    assert_rgbish(
+        px(&page, 105.0, 50.0),
+        [242, 0, 13],
+        "shared magnified cell left end red",
+    );
+    assert_rgbish(
+        px(&page, 195.0, 50.0),
+        [13, 0, 242],
+        "shared magnified cell right end blue",
+    );
+}

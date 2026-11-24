@@ -67,6 +67,13 @@ pub enum PageOp {
         image_id: u32,
         clip_ref: u32,
     },
+    /// Draw a repeating rasterized tiling-pattern quad (from the textured arena,
+    /// sampling `synthetic_tiles[tile_id]`), testing `stencil == clip_ref`.
+    Tile {
+        range: MeshRange,
+        tile_id: u32,
+        clip_ref: u32,
+    },
     /// Draw a rasterized-glyph quad (from the glyph arena, sampling the
     /// page's single atlas texture), testing `stencil == clip_ref`. Unlike
     /// `Image`, no texture id is carried — a page has exactly one atlas.
@@ -121,6 +128,66 @@ fn arena_fits_u32(current: usize, additional: usize) -> bool {
         .is_some()
 }
 
+/// Identity of a GPU-rasterized [`zpdf_display_list::TilingPattern`] cell texture.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyntheticTileKey {
+    commands: usize,
+    bbox: [u64; 4],
+    steps: [u64; 2],
+    width: u32,
+    height: u32,
+    nearest: bool,
+    blend_depth: usize,
+}
+
+impl SyntheticTileKey {
+    pub fn new(
+        tiling: &zpdf_display_list::TilingPattern,
+        width: u32,
+        height: u32,
+        nearest: bool,
+        blend_depth: usize,
+    ) -> Self {
+        Self {
+            commands: std::sync::Arc::as_ptr(&tiling.commands) as *const () as usize,
+            bbox: [
+                tiling.bbox.x0.to_bits(),
+                tiling.bbox.y0.to_bits(),
+                tiling.bbox.x1.to_bits(),
+                tiling.bbox.y1.to_bits(),
+            ],
+            steps: [tiling.x_step.to_bits(), tiling.y_step.to_bits()],
+            width,
+            height,
+            nearest,
+            blend_depth,
+        }
+    }
+}
+
+/// Recorded cell content for a dense tiling pattern (> 4,096 visible tiles),
+/// rendered once into an offscreen tile texture and sampled with `Repeat`.
+pub struct SyntheticTile {
+    pub width: u32,
+    pub height: u32,
+    pub nearest: bool,
+    pub ops: Vec<PageOp>,
+    /// Retains the source cell commands so `Arc::as_ptr` keys stay unique for the page.
+    pub _keep_commands: std::sync::Arc<zpdf_display_list::DisplayList>,
+}
+
+impl SyntheticTile {
+    pub fn has_blend_groups(&self) -> bool {
+        self.ops
+            .iter()
+            .any(|o| matches!(o, PageOp::PushBlend { .. }))
+    }
+
+    pub fn uses_reset(&self) -> bool {
+        self.ops.iter().any(|o| matches!(o, PageOp::ResetStencil))
+    }
+}
+
 /// Accumulates geometry + ops for one page.
 #[derive(Default)]
 pub struct PageRecorder {
@@ -138,6 +205,12 @@ pub struct PageRecorder {
     pub glyph_indices: Vec<u32>,
     pub glyph_atlas: GlyphAtlas,
     pub ops: Vec<PageOp>,
+    /// Offscreen cell textures for dense tiling patterns, ordered bottom-up so
+    /// nested dense tiles always precede their enclosing tile.
+    pub synthetic_tiles: Vec<SyntheticTile>,
+    synthetic_tile_cache: std::collections::HashMap<SyntheticTileKey, u32>,
+    synthetic_tile_bytes: u64,
+    page_rect: Option<zpdf_core::Rect>,
     clip_stack: Vec<ClipEntry>,
     clip_depth: u32,
     /// `None` keeps the standalone recorder utility unlimited; renderers set a
@@ -167,6 +240,47 @@ impl PageRecorder {
         self.limits = limits.clone();
         self.deadline = Some(Instant::now() + RECORD_BUDGET);
         self.with_max_blend_depth(limits.max_blend_group_depth as usize)
+    }
+
+    pub fn with_page_rect(mut self, rect: zpdf_core::Rect) -> Self {
+        self.page_rect = Some(rect);
+        self
+    }
+
+    pub fn page_rect(&self) -> Option<zpdf_core::Rect> {
+        self.page_rect
+    }
+
+    pub fn replace_page_rect(&mut self, rect: Option<zpdf_core::Rect>) -> Option<zpdf_core::Rect> {
+        std::mem::replace(&mut self.page_rect, rect)
+    }
+
+    pub fn blend_depth_total(&self) -> usize {
+        self.blend_depth_offset.saturating_add(self.blend_depth)
+    }
+
+    pub fn cached_synthetic_tile(&self, key: &SyntheticTileKey) -> Option<u32> {
+        self.synthetic_tile_cache.get(key).copied()
+    }
+
+    pub fn insert_synthetic_tile(
+        &mut self,
+        key: SyntheticTileKey,
+        tile: SyntheticTile,
+    ) -> Option<u32> {
+        let tile_bytes = (tile.width as u64)
+            .saturating_mul(tile.height as u64)
+            .saturating_mul(4);
+        let next_bytes = self.synthetic_tile_bytes.saturating_add(tile_bytes);
+        if next_bytes > self.limits.max_gpu_texture_bytes {
+            self.recording_error = Some("GPU tiling cell textures exceed max_gpu_texture_bytes");
+            return None;
+        }
+        let id = u32::try_from(self.synthetic_tiles.len()).ok()?;
+        self.synthetic_tile_bytes = next_bytes;
+        self.synthetic_tiles.push(tile);
+        self.synthetic_tile_cache.insert(key, id);
+        Some(id)
     }
 
     /// Check at command/glyph boundaries and before appends. All nested work
@@ -346,6 +460,38 @@ impl PageRecorder {
         });
     }
 
+    /// Record a repeating tiling-pattern quad (4 textured vertices) at the current clip depth.
+    pub fn add_tile(&mut self, quad: [TexturedVertex; 4], tile_id: u32) {
+        if !self.reserve_geometry::<TexturedVertex>(
+            self.tex_vertices.len(),
+            self.tex_indices.len(),
+            4,
+            6,
+        ) {
+            return;
+        }
+        let base_vertex = self.tex_vertices.len() as u32;
+        let first_index = self.tex_indices.len() as u32;
+        self.tex_vertices.extend_from_slice(&quad);
+        self.tex_indices.extend_from_slice(&[
+            base_vertex,
+            base_vertex + 1,
+            base_vertex + 2,
+            base_vertex,
+            base_vertex + 2,
+            base_vertex + 3,
+        ]);
+        self.ops.push(PageOp::Tile {
+            range: MeshRange {
+                first_index,
+                index_count: 6,
+                base_vertex: 0,
+            },
+            tile_id,
+            clip_ref: self.clip_depth,
+        });
+    }
+
     /// Record a glyph-atlas quad (4 textured vertices) at the current clip
     /// depth. Indices are rebased to absolute (mirroring `append()`, unlike
     /// `add_image`'s per-quad `base_vertex`) so consecutive glyph quads are
@@ -478,6 +624,12 @@ impl PageRecorder {
             .collect();
         for (range, ref_value) in remaining {
             self.ops.push(PageOp::StampClip { range, ref_value });
+        }
+    }
+
+    pub fn pop_all_clips(&mut self) {
+        while !self.clip_stack.is_empty() {
+            self.pop_clip();
         }
     }
 

@@ -578,3 +578,123 @@ fn glyph_atlas_path_is_genuinely_exercised() {
          the glyph atlas path does not appear to be engaging"
     );
 }
+
+/// Regression: a fill covering 65×65 = 4,225 opaque tiling cells (just above
+/// `MAX_GPU_TILES = 4,096`) and a dense patterned stroke must paint via a
+/// repeating GPU-rasterized cell texture instead of leaving the region blank,
+/// and match the CPU oracle within <1%.
+#[test]
+fn gpu_dense_tiling_pattern_above_4096_tiles_matches_cpu() {
+    // 4×4 pt opaque two-color cell (red left half [0..2], blue right half [2..4]),
+    // tiled over a 260×260 pt rect = 65×65 = 4,225 visible tiles.
+    let cell: &[u8] = b"1 0 0 rg 0 0 2 4 re f\n0 0 1 rg 2 0 2 4 re f";
+    let pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+               /BBox [0 0 4 4] /XStep 4 /YStep 4 /Resources << >>";
+    // Also draw a dense patterned stroke (width 20, spanning 260 pt on a 2×2
+    // dense pattern, 130×10 = 1,300 or with 1×1 pattern -> 260×20 = 5,200 tiles!).
+    let fine_cell: &[u8] = b"0 1 0 rg 0 0 0.5 1 re f\n1 1 0 rg 0.5 0 0.5 1 re f";
+    let fine_pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                    /BBox [0 0 1 1] /XStep 1 /YStep 1 /Resources << >>";
+    let content: &[u8] = b"/Pattern cs /P0 scn 0 0 260 260 re f\n\
+                           /Pattern CS /P1 SCN 20 w 0 130 m 260 130 l S";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 260 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R /P1 6 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(pat, cell),
+        stream_obj(fine_pat, fine_cell),
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU dense tiling acceptance (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+
+    assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+    let px = |data: &[u8], x: f64, y: f64| -> [u8; 3] {
+        let ix = (x * SCALE as f64) as u32;
+        let iy = ((260.0 - y) * SCALE as f64) as u32;
+        let off = ((iy * gpu.width + ix) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    // Sample opposite corners of the 65×65 fill (must NOT be blank white):
+    // tile (0,0) and tile (64,64) both have red left half and blue right half.
+    let g_red_bl = px(&gpu.data, 1.0, 2.0);
+    let g_blue_bl = px(&gpu.data, 3.0, 2.0);
+    let g_red_tr = px(&gpu.data, 257.0, 258.0);
+    let g_blue_tr = px(&gpu.data, 259.0, 258.0);
+    assert!(
+        g_red_bl[0] > 200 && g_red_bl[1] < 40 && g_red_bl[2] < 40,
+        "GPU tile (0,0) left half must be red, got {g_red_bl:?}"
+    );
+    assert!(
+        g_blue_bl[0] < 40 && g_blue_bl[1] < 40 && g_blue_bl[2] > 200,
+        "GPU tile (0,0) right half must be blue, got {g_blue_bl:?}"
+    );
+    assert!(
+        g_red_tr[0] > 200 && g_red_tr[1] < 40 && g_red_tr[2] < 40,
+        "GPU tile (64,64) left half must be red, got {g_red_tr:?}"
+    );
+    assert!(
+        g_blue_tr[0] < 40 && g_blue_tr[1] < 40 && g_blue_tr[2] > 200,
+        "GPU tile (64,64) right half must be blue, got {g_blue_tr:?}"
+    );
+
+    // Sample inside the dense patterned stroke band (y=130): green left / yellow right.
+    let g_stroke_l = px(&gpu.data, 100.25, 130.0);
+    let g_stroke_r = px(&gpu.data, 100.75, 130.0);
+    assert!(
+        g_stroke_l[1] > 200 && g_stroke_l[2] < 40,
+        "GPU dense patterned stroke must paint green/yellow, got {g_stroke_l:?}"
+    );
+    assert!(
+        g_stroke_r[0] > 200 && g_stroke_r[1] > 200 && g_stroke_r[2] < 40,
+        "GPU dense patterned stroke right half must paint yellow, got {g_stroke_r:?}"
+    );
+
+    // Overall GPU vs CPU parity across the entire 520×520 raster.
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  dense_tiling_65x65: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "dense 65x65 tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}

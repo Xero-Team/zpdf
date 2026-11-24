@@ -96,11 +96,15 @@ fn estimate_page_target_bytes(width: u32, height: u32, sample_count: u32) -> u64
 }
 
 /// Unique image textures referenced by a page, including images nested in any
-/// soft-mask op list. Preserve first-use order for deterministic upload traces.
-fn referenced_image_ids(ops: &[PageOp]) -> Vec<u32> {
+/// soft-mask op list or rasterized dense tiling cell. Preserve first-use order
+/// for deterministic upload traces.
+fn referenced_image_ids(ops: &[PageOp], tiles: &[record::SyntheticTile]) -> Vec<u32> {
     let mut ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![ops];
+    for tile in tiles {
+        stack.push(tile.ops.as_slice());
+    }
     while let Some(ops) = stack.pop() {
         for op in ops {
             match op {
@@ -380,7 +384,9 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             clear,
             map,
             uniform,
-            recorder: PageRecorder::default().with_limits(&self.parse_limits),
+            recorder: PageRecorder::default()
+                .with_limits(&self.parse_limits)
+                .with_page_rect(info.page_rect),
         });
         Ok(())
     }
@@ -610,6 +616,22 @@ impl<'a> WgpuRenderer<'a> {
         };
         page.recorder.ensure_within_budget()?;
 
+        // Prepare offscreen dense tiling cells (append fullscreen reset quads
+        // before creating the shared vertex/index buffers, and batch each tile).
+        let mut synthetic_tiles = std::mem::take(&mut page.recorder.synthetic_tiles);
+        let mut tile_fs_ranges = Vec::with_capacity(synthetic_tiles.len());
+        for tile in &mut synthetic_tiles {
+            tile.ops = batch::batch_ops(std::mem::take(&mut tile.ops));
+            let tile_fs = if tile.uses_reset() || tile.has_blend_groups() {
+                page.recorder
+                    .append_fullscreen(tile.width as f32, tile.height as f32)
+            } else {
+                None
+            };
+            tile_fs_ranges.push(tile_fs);
+        }
+        page.recorder.ensure_within_budget()?;
+
         // Collapse consecutive same-state ops into single draw_indexed calls
         // (P3.7). Must happen before `rec` borrows `page.recorder` below (this
         // takes `page.recorder.ops` by value, leaving an empty Vec in its place
@@ -621,7 +643,7 @@ impl<'a> WgpuRenderer<'a> {
         // layered pages own only readback here and receive the remainder as their
         // dynamically enforced transparency-layer pool budget.
         let rec = &page.recorder;
-        let referenced_images = referenced_image_ids(&batched_ops);
+        let referenced_images = referenced_image_ids(&batched_ops, &synthetic_tiles);
         let mut uploadable_images = Vec::new();
         let mut image_texture_bytes = 0u64;
         if let Some(images) = self.image_cache {
@@ -645,6 +667,20 @@ impl<'a> WgpuRenderer<'a> {
                 uploadable_images.push(image_id);
             }
         }
+        let mut tile_texture_bytes = 0u64;
+        for tile in &synthetic_tiles {
+            if tile.width > ctx.max_texture_dim || tile.height > ctx.max_texture_dim {
+                return Err(WgpuRenderError::Unsupported(format!(
+                    "tiling pattern cell {}x{} exceeds adapter max texture dim {}",
+                    tile.width, tile.height, ctx.max_texture_dim
+                )));
+            }
+            tile_texture_bytes = tile_texture_bytes.saturating_add(blend::estimated_layer_bytes(
+                tile.width,
+                tile.height,
+                ctx.sample_count,
+            ));
+        }
         let glyph_texture_bytes = rec.glyph_atlas.gpu_texture_bytes();
         let target_bytes = if has_blend_groups {
             estimate_readback_bytes(page.width, page.height)
@@ -653,10 +689,11 @@ impl<'a> WgpuRenderer<'a> {
         };
         let fixed_gpu_bytes = target_bytes
             .saturating_add(image_texture_bytes)
+            .saturating_add(tile_texture_bytes)
             .saturating_add(glyph_texture_bytes);
         if fixed_gpu_bytes > self.max_gpu_texture_bytes {
             return Err(WgpuRenderError::Unsupported(format!(
-                "page GPU target/readback ({target_bytes} bytes), images ({image_texture_bytes} bytes), and glyph atlas ({glyph_texture_bytes} bytes) exceed max_gpu_texture_bytes={}",
+                "page GPU target/readback ({target_bytes} bytes), images ({image_texture_bytes} bytes), tiling cells ({tile_texture_bytes} bytes), and glyph atlas ({glyph_texture_bytes} bytes) exceed max_gpu_texture_bytes={}",
                 self.max_gpu_texture_bytes
             )));
         }
@@ -763,61 +800,221 @@ impl<'a> WgpuRenderer<'a> {
             }
         }
 
+        let timer = timing::GpuTimer::new(ctx, self.gpu_timing_enabled);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some(if has_blend_groups {
+                "zpdf-layered"
+            } else {
+                "zpdf-page"
+            }),
+        });
+        timer.write_begin(&mut encoder);
+
+        // Render dense tiling-pattern cells once into repeat-sampled textures
+        // before the main page pass. Ordered bottom-up so nested dense tiles
+        // are already present in `tile_bgs` when outer tiles sample them.
+        let mut tile_bgs: std::collections::HashMap<u32, wgpu::BindGroup> =
+            std::collections::HashMap::with_capacity(synthetic_tiles.len());
+        let mut tile_layers: Vec<blend::RenderLayer> = Vec::new();
+        let mut tile_pools: Vec<blend::LayerPool> = Vec::new();
+        let mut keep_bgs: Vec<wgpu::BindGroup> = Vec::new();
+        let mut keep_bufs: Vec<wgpu::Buffer> = Vec::new();
+        let mut remaining_layer_budget = layer_budget;
+        for (idx, tile) in synthetic_tiles.iter().enumerate() {
+            let tile_uniform = PageUniform {
+                w_px: tile.width as f32,
+                h_px: tile.height as f32,
+                scale: 1.0,
+                page_height: tile.height as f32,
+            };
+            let tile_ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("zpdf-tile-uniform"),
+                contents: bytemuck::bytes_of(&tile_uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let tile_page_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zpdf-tile-page-bg"),
+                layout: &ctx.pipelines.page_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: tile_ubuf.as_entire_binding(),
+                }],
+            });
+            let tile_res = ReplayRes {
+                pipelines: &ctx.pipelines,
+                bind_group: &tile_page_bg,
+                solid: buffers.as_ref().map(|(v, i)| (v, i)),
+                tex: tex_buffers.as_ref().map(|(v, i)| (v, i)),
+                tex_bgs: &tex_bgs,
+                tile_bgs: &tile_bgs,
+                glyph: glyph_buffers.as_ref().map(|(v, i)| (v, i)),
+                glyph_bg: glyph_bg.as_ref(),
+                fs_range: tile_fs_ranges[idx],
+            };
+            let sampler = if tile.nearest {
+                &ctx.pipelines.repeat_nearest_sampler
+            } else {
+                &ctx.pipelines.repeat_sampler
+            };
+            let tile_bg = if tile.has_blend_groups() {
+                let tile_layer_bytes =
+                    blend::estimated_layer_bytes(tile.width, tile.height, ctx.sample_count);
+                let mut pool = blend::LayerPool::new(
+                    tile.width,
+                    tile.height,
+                    ctx.sample_count,
+                    tile_layer_bytes.saturating_add(remaining_layer_budget),
+                );
+                let base = pool.acquire(device)?;
+                {
+                    let pass = begin_layer_pass(
+                        &mut encoder,
+                        pool.get(base),
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        wgpu::LoadOp::Clear(0),
+                    );
+                    drop(pass);
+                }
+                let final_layer = composite_into(
+                    ctx,
+                    &mut encoder,
+                    &mut pool,
+                    base,
+                    &tile.ops,
+                    &tile_res,
+                    &mut keep_bgs,
+                    &mut keep_bufs,
+                )?;
+                let extra_layers = pool.allocated().saturating_sub(1) as u64;
+                remaining_layer_budget = remaining_layer_budget
+                    .saturating_sub(extra_layers.saturating_mul(tile_layer_bytes));
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("zpdf-tile-bg"),
+                    layout: &ctx.pipelines.tex_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                pool.get(final_layer).sampleable_view(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                });
+                tile_pools.push(pool);
+                bg
+            } else {
+                let layer =
+                    blend::RenderLayer::new(device, tile.width, tile.height, ctx.sample_count);
+                {
+                    let mut pass = begin_layer_pass(
+                        &mut encoder,
+                        &layer,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        wgpu::LoadOp::Clear(0),
+                    );
+                    replay_ops(&mut pass, &tile.ops, &tile_res);
+                }
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("zpdf-tile-bg"),
+                    layout: &ctx.pipelines.tex_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(layer.sampleable_view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                });
+                tile_layers.push(layer);
+                bg
+            };
+            keep_bgs.push(tile_page_bg);
+            keep_bufs.push(tile_ubuf);
+            tile_bgs.insert(idx as u32, tile_bg);
+        }
+
         let res = ReplayRes {
             pipelines: &ctx.pipelines,
             bind_group: &bind_group,
             solid: buffers.as_ref().map(|(v, i)| (v, i)),
             tex: tex_buffers.as_ref().map(|(v, i)| (v, i)),
             tex_bgs: &tex_bgs,
+            tile_bgs: &tile_bgs,
             glyph: glyph_buffers.as_ref().map(|(v, i)| (v, i)),
             glyph_bg: glyph_bg.as_ref(),
             fs_range,
         };
 
-        let timer = timing::GpuTimer::new(ctx, self.gpu_timing_enabled);
-
-        // Pages with transparency groups need the multi-pass offscreen-layer path.
+        // Keep any page-level LayerPool alive until after `queue.submit`.
+        let mut _page_pool: Option<blend::LayerPool> = None;
         if has_blend_groups {
-            let (texture, gpu_ns) = render_layered(
+            let mut pool = blend::LayerPool::new(
+                target.width,
+                target.height,
+                target.sample_count,
+                remaining_layer_budget,
+            );
+            let base = pool.acquire(device)?;
+            {
+                let pass = begin_layer_pass(
+                    &mut encoder,
+                    pool.get(base),
+                    wgpu::LoadOp::Clear(page.clear),
+                    wgpu::LoadOp::Clear(0),
+                );
+                drop(pass);
+            }
+            let final_layer = composite_into(
                 ctx,
-                &target,
-                page.clear,
+                &mut encoder,
+                &mut pool,
+                base,
                 &batched_ops,
                 &res,
-                &timer,
-                layer_budget,
-                readback,
+                &mut keep_bgs,
+                &mut keep_bufs,
             )?;
-            self.last_gpu_time_ns = gpu_ns;
-            return Ok(texture);
-        }
-
-        // Single-pass path (no blend groups): one render pass into the page target.
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("zpdf-page"),
-        });
-        timer.write_begin(&mut encoder);
-        {
-            let color_att = target.color_attachment(page.clear);
-            let ds_att = target.stencil_attachment();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("zpdf-page-pass"),
-                color_attachments: &[Some(color_att)],
-                depth_stencil_attachment: Some(ds_att),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            replay_ops(&mut pass, &batched_ops, &res);
-        }
-        timer.write_end(&mut encoder);
-        timer.record_resolve(&mut encoder);
-        // The copy into the readback buffer is what the readback maps; skipping
-        // it is exactly what makes the submit-only path cheap.
-        if readback {
-            target.record_copy(&mut encoder);
+            timer.write_end(&mut encoder);
+            timer.record_resolve(&mut encoder);
+            if readback {
+                target.record_copy_from(&mut encoder, pool.get(final_layer).sampleable_texture());
+            }
+            _page_pool = Some(pool);
+        } else {
+            // Single-pass path (no blend groups): one render pass into the page target.
+            {
+                let color_att = target.color_attachment(page.clear);
+                let ds_att = target.stencil_attachment();
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("zpdf-page-pass"),
+                    color_attachments: &[Some(color_att)],
+                    depth_stencil_attachment: Some(ds_att),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                replay_ops(&mut pass, &batched_ops, &res);
+            }
+            timer.write_end(&mut encoder);
+            timer.record_resolve(&mut encoder);
+            // The copy into the readback buffer is what the readback maps; skipping
+            // it is exactly what makes the submit-only path cheap.
+            if readback {
+                target.record_copy(&mut encoder);
+            }
         }
         ctx.queue.submit(Some(encoder.finish()));
+        drop(tile_layers);
+        drop(tile_pools);
+        drop(keep_bgs);
+        drop(keep_bufs);
         let result = if readback {
             target.map_and_strip(device).map(Some)
         } else {
@@ -844,6 +1041,7 @@ struct ReplayRes<'a> {
     solid: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     tex: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     tex_bgs: &'a std::collections::HashMap<u32, wgpu::BindGroup>,
+    tile_bgs: &'a std::collections::HashMap<u32, wgpu::BindGroup>,
     /// Glyph-atlas quad buffers, present iff any glyph took the atlas path.
     glyph: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     /// The page's single atlas texture bind group (no per-op id, unlike `tex_bgs`).
@@ -866,6 +1064,31 @@ fn replay_ops(pass: &mut wgpu::RenderPass, ops: &[PageOp], res: &ReplayRes) {
             } => {
                 let (Some((tvb, tib)), Some(bg1)) = (res.tex, res.tex_bgs.get(image_id)) else {
                     continue; // image skipped (too large) or no textured buffers
+                };
+                if cur != Pipe::Textured {
+                    pass.set_pipeline(&res.pipelines.textured);
+                    cur = Pipe::Textured;
+                }
+                if bound != BufSet::Tex {
+                    pass.set_vertex_buffer(0, tvb.slice(..));
+                    pass.set_index_buffer(tib.slice(..), wgpu::IndexFormat::Uint32);
+                    bound = BufSet::Tex;
+                }
+                pass.set_bind_group(1, Some(bg1), &[]);
+                pass.set_stencil_reference(*clip_ref);
+                pass.draw_indexed(
+                    range.first_index..range.first_index + range.index_count,
+                    range.base_vertex,
+                    0..1,
+                );
+            }
+            PageOp::Tile {
+                range,
+                tile_id,
+                clip_ref,
+            } => {
+                let (Some((tvb, tib)), Some(bg1)) = (res.tex, res.tile_bgs.get(tile_id)) else {
+                    continue;
                 };
                 if cur != Pipe::Textured {
                     pass.set_pipeline(&res.pipelines.textured);
@@ -1117,14 +1340,15 @@ fn stroke_bounds(
     ))
 }
 
-/// Fallback per-tile replay for [`zpdf_display_list::TilingPattern`] on the
-/// wgpu backend (transforms cell commands into page space per visible tile,
-/// bounded to 4,096 tiles and nesting depth 8).
+/// Record a [`zpdf_display_list::TilingPattern`] on the wgpu backend:
+/// transforms cell commands into page space per visible tile up to 4,096 tiles,
+/// and falls back to repeating a single GPU-rasterized cell texture when the
+/// region exceeds `MAX_GPU_TILES` so dense patterns stay bounded and never drop.
 #[allow(clippy::too_many_arguments)]
 fn record_tiling_pattern(
     rec: &mut PageRecorder,
     tiling: &zpdf_display_list::TilingPattern,
-    bounds: zpdf_core::Rect,
+    mut bounds: zpdf_core::Rect,
     alpha: f32,
     fonts: Option<&zpdf_font::FontCache>,
     images: Option<&zpdf_image::ImageCache>,
@@ -1135,6 +1359,18 @@ fn record_tiling_pattern(
     const MAX_TILING_DEPTH: u8 = 8;
     if depth >= MAX_TILING_DEPTH || tiling.commands.commands.is_empty() || !rec.can_record() {
         return;
+    }
+    if let Some(page_rect) = rec.page_rect() {
+        let p = page_rect.normalize();
+        let pad = 1.0 / (map.scale as f64).max(1.0);
+        let x0 = bounds.x0.max(p.x0 - pad);
+        let y0 = bounds.y0.max(p.y0 - pad);
+        let x1 = bounds.x1.min(p.x1 + pad);
+        let y1 = bounds.y1.min(p.y1 + pad);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        bounds = zpdf_core::Rect::new(x0, y0, x1, y1);
     }
     let Some(from_page) = tiling.matrix.inverse() else {
         return;
@@ -1189,10 +1425,13 @@ fn record_tiling_pattern(
     let (j0, j1) = range(py0, py1, bbox.y0, bbox.y1, tiling.y_step);
     let nx = i1.saturating_sub(i0).saturating_add(1);
     let ny = j1.saturating_sub(j0).saturating_add(1);
-    if nx <= 0 || ny <= 0 || nx.saturating_mul(ny) > MAX_GPU_TILES {
-        if nx > 0 && ny > 0 {
-            tracing::warn!("wgpu tiling pattern: {nx}x{ny} tiles exceeds fallback cap; skipping");
-        }
+    if nx <= 0 || ny <= 0 {
+        return;
+    }
+    if nx.saturating_mul(ny) > MAX_GPU_TILES {
+        record_tiling_pattern_rasterized(
+            rec, tiling, bounds, from_page, alpha, fonts, images, map, depth,
+        );
         return;
     }
     let wrap_alpha = alpha.is_finite() && alpha < 1.0 && rec.can_push_blend();
@@ -1217,6 +1456,205 @@ fn record_tiling_pattern(
     }
     if wrap_alpha {
         rec.pop_blend();
+    }
+}
+
+/// Bounded O(1)-tile GPU fallback for dense tiling patterns (> `MAX_GPU_TILES`):
+/// records the single fundamental period (including any overlapping neighbor
+/// copies) once into a synthetic offscreen tile texture and paints `bounds`
+/// with a single repeat-sampled quad.
+#[allow(clippy::too_many_arguments)]
+fn record_tiling_pattern_rasterized(
+    rec: &mut PageRecorder,
+    tiling: &zpdf_display_list::TilingPattern,
+    bounds: zpdf_core::Rect,
+    from_page: zpdf_core::Matrix,
+    alpha: f32,
+    fonts: Option<&zpdf_font::FontCache>,
+    images: Option<&zpdf_image::ImageCache>,
+    map: &PageMap,
+    depth: u8,
+) {
+    const MAX_GPU_TILE_DIM: f64 = 2048.0;
+    const MAX_GPU_TILE_PIXELS: f64 = 4_194_304.0;
+
+    let opacity = unit(alpha);
+    if opacity <= 0.0 || !rec.can_record() {
+        return;
+    }
+    let bbox = tiling.bbox.normalize();
+    let (bx0, by0) = (bbox.x0, bbox.y0);
+    let (abs_x, abs_y) = (tiling.x_step.abs(), tiling.y_step.abs());
+    if bbox.width() <= 0.0 || bbox.height() <= 0.0 || abs_x <= 0.0 || abs_y <= 0.0 {
+        return;
+    }
+
+    let s = map.scale as f64;
+    let page_to_dev =
+        zpdf_core::Matrix::new(s, 0.0, 0.0, -s, -(map.x0 as f64) * s, (map.y1 as f64) * s);
+    let pat_to_dev = page_to_dev.concat(&tiling.matrix);
+    if ![
+        pat_to_dev.a,
+        pat_to_dev.b,
+        pat_to_dev.c,
+        pat_to_dev.d,
+        pat_to_dev.e,
+        pat_to_dev.f,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+    {
+        return;
+    }
+    let det = pat_to_dev.a * pat_to_dev.d - pat_to_dev.b * pat_to_dev.c;
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return;
+    }
+    let len_x = (pat_to_dev.a * abs_x).hypot(pat_to_dev.b * abs_x);
+    let len_y = (pat_to_dev.c * abs_y).hypot(pat_to_dev.d * abs_y);
+    if !len_x.is_finite() || !len_y.is_finite() || len_x <= 0.0 || len_y <= 0.0 {
+        return;
+    }
+
+    let mut tw_f = len_x.round().max(1.0);
+    let mut th_f = len_y.round().max(1.0);
+    let max_dim = tw_f.max(th_f);
+    if max_dim > MAX_GPU_TILE_DIM {
+        let k = MAX_GPU_TILE_DIM / max_dim;
+        tw_f = (tw_f * k).floor().max(1.0);
+        th_f = (th_f * k).floor().max(1.0);
+    }
+    if tw_f * th_f > MAX_GPU_TILE_PIXELS {
+        let k = (MAX_GPU_TILE_PIXELS / (tw_f * th_f)).sqrt();
+        tw_f = (tw_f * k).floor().max(1.0);
+        th_f = (th_f * k).floor().max(1.0);
+    }
+    let tile_w = tw_f as u32;
+    let tile_h = th_f as u32;
+
+    let tile_to_pat = zpdf_core::Matrix::new(
+        abs_x / tile_w as f64,
+        0.0,
+        0.0,
+        -abs_y / tile_h as f64,
+        bx0,
+        by0 + abs_y,
+    );
+    let m = pat_to_dev.concat(&tile_to_pat);
+    let exact_1to1 = (m.a - 1.0).abs() < 1e-4
+        && m.b.abs() < 1e-4
+        && m.c.abs() < 1e-4
+        && (m.d - 1.0).abs() < 1e-4
+        && (m.e - m.e.round()).abs() < 1e-4
+        && (m.f - m.f.round()).abs() < 1e-4;
+
+    let key =
+        record::SyntheticTileKey::new(tiling, tile_w, tile_h, exact_1to1, rec.blend_depth_total());
+    let tile_id = if let Some(id) = rec.cached_synthetic_tile(&key) {
+        id
+    } else {
+        let overlap = tiling.overlap_copy_ranges();
+        let sx = tile_w as f64 / abs_x;
+        let sy = tile_h as f64 / abs_y;
+        if !sx.is_finite() || !sy.is_finite() || sx <= 0.0 || sy <= 0.0 {
+            return;
+        }
+        let pat_to_tile = zpdf_core::Matrix::new(sx, 0.0, 0.0, sy, -bx0 * sx, -by0 * sy);
+        let tile_rect = zpdf_core::Rect::new(0.0, 0.0, tile_w as f64, tile_h as f64);
+        let tile_map = PageMap::new(tile_rect, 1.0);
+        let ops = rec.record_subops(|r| {
+            let saved_rect = r.replace_page_rect(Some(tile_rect));
+            'copies: for dj in overlap.dj.clone() {
+                for di in overlap.di.clone() {
+                    if !r.can_record() {
+                        break 'copies;
+                    }
+                    let copy_ctm = pat_to_tile.concat(&zpdf_core::Matrix::translate(
+                        di as f64 * tiling.x_step,
+                        dj as f64 * tiling.y_step,
+                    ));
+                    let stroke_scale = (copy_ctm.a * copy_ctm.d - copy_ctm.b * copy_ctm.c)
+                        .abs()
+                        .sqrt() as f32;
+                    let transformed =
+                        transform_display_list(&tiling.commands, &copy_ctm, stroke_scale);
+                    record_display_list_at_depth(
+                        r,
+                        &transformed,
+                        fonts,
+                        images,
+                        &tile_map,
+                        depth + 1,
+                    );
+                    r.close_open_blends();
+                    r.pop_all_clips();
+                }
+            }
+            r.replace_page_rect(saved_rect);
+        });
+        if ops.is_empty() || !rec.can_record() {
+            return;
+        }
+        let Some(id) = rec.insert_synthetic_tile(
+            key,
+            record::SyntheticTile {
+                width: tile_w,
+                height: tile_h,
+                nearest: exact_1to1,
+                ops,
+                _keep_commands: std::sync::Arc::clone(&tiling.commands),
+            },
+        ) else {
+            return;
+        };
+        id
+    };
+
+    // Map `bounds`'s four corners into repeating [0, 1]^2 tile UVs, shifting by
+    // an integer cell offset in f64 before casting to f32 so distant fills keep
+    // exact sub-tile phase precision.
+    let corners = [
+        zpdf_core::Point::new(bounds.x0, bounds.y1),
+        zpdf_core::Point::new(bounds.x1, bounds.y1),
+        zpdf_core::Point::new(bounds.x1, bounds.y0),
+        zpdf_core::Point::new(bounds.x0, bounds.y0),
+    ];
+    let mut raw_uvs = [(0.0f64, 0.0f64); 4];
+    let (mut u_min, mut v_min) = (f64::INFINITY, f64::INFINITY);
+    for (idx, c) in corners.iter().enumerate() {
+        let p = c.transform(&from_page);
+        let u = (p.x - bx0) / abs_x;
+        let v = (by0 + abs_y - p.y) / abs_y;
+        if !u.is_finite() || !v.is_finite() {
+            return;
+        }
+        u_min = u_min.min(u);
+        v_min = v_min.min(v);
+        raw_uvs[idx] = (u, v);
+    }
+    let u_shift = u_min.floor();
+    let v_shift = v_min.floor();
+    let color = [1.0, 1.0, 1.0, opacity];
+    let mut quad = [transform::TexturedVertex {
+        pos: [0.0, 0.0],
+        uv: [0.0, 0.0],
+        color,
+    }; 4];
+    for (idx, c) in corners.iter().enumerate() {
+        let pt = map.pt(*c);
+        let u = (raw_uvs[idx].0 - u_shift) as f32;
+        let v = (raw_uvs[idx].1 - v_shift) as f32;
+        if !u.is_finite() || !v.is_finite() {
+            return;
+        }
+        quad[idx] = transform::TexturedVertex {
+            pos: [pt.x, pt.y],
+            uv: [u, v],
+            color,
+        };
+    }
+    if image::is_safe_quad(&quad) {
+        rec.add_tile(quad, tile_id);
     }
 }
 
@@ -1723,81 +2161,6 @@ fn composite_into(
     Ok(*active.first().unwrap_or(&base))
 }
 
-/// Multi-pass render for pages with transparency groups: a stack of offscreen
-/// layers, each composited onto its parent on PopBlendGroup. Layers come from a
-/// recycling [`blend::LayerPool`] so a page with hundreds of groups reuses a
-/// small working set instead of allocating (and never freeing) one full-page
-/// layer per group.
-// `readback` is a parameter rather than renderer state on purpose: it describes
-// this one consumption of the page, and a sticky flag would let a page render
-// silently change shape between calls.
-#[allow(clippy::too_many_arguments)]
-fn render_layered(
-    ctx: &GpuContext,
-    target: &PageTarget,
-    page_clear: wgpu::Color,
-    ops: &[PageOp],
-    res: &ReplayRes,
-    timer: &timing::GpuTimer,
-    layer_budget: u64,
-    readback: bool,
-) -> Result<(Option<GpuTexture>, Option<u64>), WgpuRenderError> {
-    let device = &ctx.device;
-    let (w, h, sc) = (target.width, target.height, target.sample_count);
-
-    let mut pool = blend::LayerPool::new(w, h, sc, layer_budget);
-    let base = pool.acquire(device)?;
-    // Composite bind groups + mode buffers kept alive until submit.
-    let mut keep_bgs: Vec<wgpu::BindGroup> = Vec::new();
-    let mut keep_bufs: Vec<wgpu::Buffer> = Vec::new();
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("zpdf-layered"),
-    });
-    timer.write_begin(&mut encoder);
-
-    // Initialize the base layer (page background, no clips).
-    {
-        let pass = begin_layer_pass(
-            &mut encoder,
-            pool.get(base),
-            wgpu::LoadOp::Clear(page_clear),
-            wgpu::LoadOp::Clear(0),
-        );
-        drop(pass);
-    }
-
-    let final_layer = composite_into(
-        ctx,
-        &mut encoder,
-        &mut pool,
-        base,
-        ops,
-        res,
-        &mut keep_bgs,
-        &mut keep_bufs,
-    )?;
-    timer.write_end(&mut encoder);
-    timer.record_resolve(&mut encoder);
-    if readback {
-        target.record_copy_from(&mut encoder, pool.get(final_layer).sampleable_texture());
-    }
-    ctx.queue.submit(Some(encoder.finish()));
-    let result = if readback {
-        target.map_and_strip(device).map(Some)
-    } else {
-        // See `finish_page`: an un-synchronized loop must still drain completed
-        // submissions or it OOMs the device.
-        let _ = ctx.device.poll(wgpu::PollType::Poll);
-        Ok(None)
-    };
-    let gpu_ns = timer.resolve_ns(device);
-    if let Some(msg) = ctx.take_error() {
-        return Err(WgpuRenderError::Wgpu(format!("device error: {msg}")));
-    }
-    result.map(|tex| (tex, gpu_ns))
-}
-
 /// Uniform for the mask-apply pass. Mirrors `MaskU` in `mask_apply.wgsl`: the
 /// coverage kind, the device-pixel sampling offset, the /BC backdrop luminosity
 /// (used where the offset reads outside the built mask), and the /TR transfer LUT
@@ -2234,6 +2597,92 @@ mod resource_tests {
         assert!(
             !rec.ops.is_empty(),
             "63x63 strictly overlapping tiles must not be rejected by MAX_GPU_TILES"
+        );
+        assert!(
+            rec.synthetic_tiles.is_empty(),
+            "tiles within MAX_GPU_TILES should stay on the vector replay path"
+        );
+    }
+
+    #[test]
+    fn tiling_pattern_above_cap_records_repeating_synthetic_tile() {
+        let mut cell = zpdf_display_list::DisplayList::new(Rect::new(0.0, 0.0, 2.0, 2.0));
+        let mut left = zpdf_display_list::Path::new();
+        left.rect(Rect::new(0.0, 0.0, 1.0, 2.0));
+        cell.push(RenderCommand::FillPath {
+            path: left,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut right = zpdf_display_list::Path::new();
+        right.rect(Rect::new(1.0, 0.0, 2.0, 2.0));
+        cell.push(RenderCommand::FillPath {
+            path: right,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 2.0, 2.0),
+            x_step: 2.0,
+            y_step: 2.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        };
+        // 65×65 = 4,225 visible tiles (> MAX_GPU_TILES = 4,096).
+        let mut rec = PageRecorder::default();
+        let map = PageMap::new(Rect::new(0.0, 0.0, 130.0, 130.0), 2.0);
+        record_tiling_pattern(
+            &mut rec,
+            &tiling,
+            Rect::new(0.0, 0.0, 130.0, 130.0),
+            1.0,
+            None,
+            None,
+            &map,
+            0,
+        );
+        assert_eq!(
+            rec.synthetic_tiles.len(),
+            1,
+            "65x65 dense pattern must record one rasterized cell texture"
+        );
+        assert_eq!(
+            (rec.synthetic_tiles[0].width, rec.synthetic_tiles[0].height),
+            (4, 4)
+        );
+        assert!(
+            rec.ops
+                .iter()
+                .any(|op| matches!(op, PageOp::Tile { tile_id: 0, .. })),
+            "dense pattern must emit a repeating PageOp::Tile draw instead of returning blank"
+        );
+        // A second fill with the same dense pattern must reuse the cached synthetic tile.
+        record_tiling_pattern(
+            &mut rec,
+            &tiling,
+            Rect::new(0.0, 0.0, 130.0, 130.0),
+            0.5,
+            None,
+            None,
+            &map,
+            0,
+        );
+        assert_eq!(
+            rec.synthetic_tiles.len(),
+            1,
+            "repeated dense fills should reuse the cached synthetic tile"
+        );
+        assert_eq!(
+            rec.ops
+                .iter()
+                .filter(|op| matches!(op, PageOp::Tile { tile_id: 0, .. }))
+                .count(),
+            2
         );
     }
 

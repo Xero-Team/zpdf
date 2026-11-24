@@ -18,6 +18,10 @@ pub struct Pipelines {
     /// Shared bilinear / ClampToEdge sampler (matches the CPU backend's
     /// `FilterQuality::Bilinear` image sampling).
     pub sampler: wgpu::Sampler,
+    /// Shared bilinear / Repeat sampler for rasterized dense tiling patterns.
+    pub repeat_sampler: wgpu::Sampler,
+    /// Shared nearest / Repeat sampler for 1:1 pixel-aligned dense tiling patterns.
+    pub repeat_nearest_sampler: wgpu::Sampler,
     /// Solid fill / stroke / Type3 pipeline.
     pub solid_fill: wgpu::RenderPipeline,
     /// Clip-path stamp (increment stencil within the existing intersection).
@@ -135,6 +139,26 @@ impl Pipelines {
             // `FilterQuality::Bilinear` image sampling (pdfium-quality scaling).
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("zpdf-tile-repeat-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let repeat_nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("zpdf-tile-repeat-nearest-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
@@ -421,6 +445,8 @@ impl Pipelines {
             page_bgl,
             tex_bgl,
             sampler,
+            repeat_sampler,
+            repeat_nearest_sampler,
             solid_fill,
             clip_write,
             clip_reset,

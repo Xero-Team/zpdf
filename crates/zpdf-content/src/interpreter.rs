@@ -187,7 +187,14 @@ pub struct ContentInterpreter<'a> {
     rule_sink: Option<&'a mut Vec<RuleLine>>,
     /// The CTM at page-content start (identity or the baked page rotation).
     /// Pattern space is anchored to this, not to the CTM at fill time.
+    /// Base CTM of the stream currently being interpreted (page default user
+    /// space, or identity inside a tiling cell's pattern space).
     base_ctm: Matrix,
+    /// Cumulative transform from the current display list's coordinate space to
+    /// page space (`Matrix::identity()` at page level, `to_page` inside a tiling
+    /// pattern cell). Used to size shading rasters from their transformed
+    /// page-space footprint while keeping their placement in cell coordinates.
+    shading_space_to_page: Matrix,
     /// Inside an uncolored (PaintType 2) tiling-pattern cell: color operators
     /// are ignored so the cell paints with the pattern's `scn` color.
     suppress_color_ops: bool,
@@ -534,6 +541,9 @@ struct TilingCellKey {
     pat_id: ObjectId,
     uncolored_color: Option<[u32; 4]>,
     image_downscale: u32,
+    /// Page-space axis scales of the cell's transform, so enlarged and shrunk
+    /// instances of the same pattern never alias each other's shading rasters.
+    shading_scale: [u32; 2],
     resource_scopes: Vec<ResourceScopeId>,
 }
 
@@ -985,6 +995,7 @@ impl<'a> ContentInterpreter<'a> {
             extracted_text_bytes: 0,
             rule_sink: None,
             base_ctm: Matrix::identity(),
+            shading_space_to_page: Matrix::identity(),
             suppress_color_ops: false,
             oc_config: None,
             annotations: None,
@@ -3588,16 +3599,28 @@ impl<'a> ContentInterpreter<'a> {
         self.emit_shading_image(&def, region);
     }
 
-    /// Rasterize `def` over the page-space `region` and emit it as an image.
+    /// Rasterize `def` over `region` (in the current display list's coordinate
+    /// space) and emit it as an image, sizing the raster from the transformed
+    /// page-space footprint so magnified tiling-pattern cells keep full gradient
+    /// detail while placing the image in cell coordinates.
     fn emit_shading_image(&mut self, def: &crate::shading::ShadingDef, region: Rect) {
         if region.width() <= 0.0 || region.height() <= 0.0 {
             return;
         }
+        let m = self.shading_space_to_page;
+        let page_w = (m.a * region.width()).hypot(m.b * region.width());
+        let page_h = (m.c * region.height()).hypot(m.d * region.height());
+        let (eff_w, eff_h) =
+            if page_w.is_finite() && page_h.is_finite() && page_w > 0.0 && page_h > 0.0 {
+                (page_w, page_h)
+            } else {
+                (region.width(), region.height())
+            };
         // Resolution: smooth gradients upscale cleanly; cap the long side.
-        let long = region.width().max(region.height());
+        let long = eff_w.max(eff_h);
         let scale = (768.0 / long).min(2.0);
-        let w = ((region.width() * scale).ceil() as u32).clamp(1, 2048);
-        let h = ((region.height() * scale).ceil() as u32).clamp(1, 2048);
+        let w = ((eff_w * scale).ceil() as u32).clamp(1, 2048);
+        let h = ((eff_h * scale).ceil() as u32).clamp(1, 2048);
         // Gradient/mesh evaluation is CPU work here, and the result reaches a
         // render backend as an ordinary image — so this is the only place a
         // shading's cost can be attributed. (Both backends paint only
@@ -5926,6 +5949,12 @@ impl<'a> ContentInterpreter<'a> {
             0.0
         };
 
+        let cell_to_page = self.shading_space_to_page.concat(&to_page);
+        let shading_scale = [
+            (cell_to_page.a.hypot(cell_to_page.b) as f32).to_bits(),
+            (cell_to_page.c.hypot(cell_to_page.d) as f32).to_bits(),
+        ];
+
         let uncolored = def.paint_type == 2;
         let cache_key = TilingCellKey {
             pat_id: def.pat_id,
@@ -5939,6 +5968,7 @@ impl<'a> ContentInterpreter<'a> {
                 .map(f32::to_bits)
             }),
             image_downscale: cell_downscale_scale.to_bits(),
+            shading_scale,
             resource_scopes: self.form_resource_scopes.clone(),
         };
         if let Some(cached) = self.tiling_cell_cache.get(&cache_key) {
@@ -6014,6 +6044,8 @@ impl<'a> ContentInterpreter<'a> {
         let saved_compatibility = std::mem::replace(&mut self.compatibility_depth, 0);
         let saved_oc_hidden = self.oc_hidden_from.take();
         let saved_base_ctm = self.base_ctm;
+        let saved_shading_space_to_page =
+            std::mem::replace(&mut self.shading_space_to_page, cell_to_page);
         // Soft masks built inside the cell live in pattern-cell space (`def.bbox`),
         // separate from the outer page's soft-mask cache.
         let saved_soft_mask_cache = std::mem::take(&mut self.soft_mask_cache);
@@ -6136,6 +6168,7 @@ impl<'a> ContentInterpreter<'a> {
         self.compatibility_depth = saved_compatibility;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
+        self.shading_space_to_page = saved_shading_space_to_page;
         self.soft_mask_cache = saved_soft_mask_cache;
         self.image_downscale_scale = saved_image_downscale_scale;
         self.pop_form_fonts();

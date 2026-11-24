@@ -129,3 +129,156 @@ fn rich_image_budget_exhaustion_does_not_drop_text() {
     assert!(converted.pages[0].images.is_empty());
     assert!(converted.pages[0].diagnostics.resource_limit_reached);
 }
+
+fn assemble(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        out.extend_from_slice(object);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn rich_conversion_extracts_images_from_tiling_patterns() {
+    // 20×20 pattern cell painting a 1×1 green image scaled to 10×10 at (2, 3),
+    // with pattern /Matrix translating by (10, 20), tiled across a 40×20 rect
+    // (2 cells horizontally: i=0 and i=1).
+    let cell = stream(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Matrix [1 0 0 1 10 20] \
+         /Resources << /XObject << /Im1 6 0 R >> >>",
+        b"q 10 0 0 10 2 3 cm /Im1 Do Q",
+    );
+    let img = stream(
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &[0, 200, 50],
+    );
+    let content = stream("", b"/Pattern cs /P0 scn 10 20 40 20 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+          /Resources << /Pattern << /P0 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        img,                                           // 6
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let text_only = convert_pdf(&doc, &[0], ConversionOptions::default()).expect("text mode");
+    assert!(
+        text_only.pages[0].images.is_empty(),
+        "text-only mode must not decode tiling cell images"
+    );
+
+    let rich = convert_pdf(
+        &doc,
+        &[0],
+        ConversionOptions {
+            mode: ConversionMode::Rich,
+            use_structure: false,
+        },
+    )
+    .expect("rich mode");
+    let page = &rich.pages[0];
+    assert!(
+        rich.is_complete(),
+        "2-cell pattern should complete cleanly: {:?}",
+        page.diagnostics
+    );
+    assert_eq!(
+        page.images.len(),
+        1,
+        "pattern image XObject must be collected"
+    );
+    assert_eq!(page.images[0].image.data, [0, 200, 50, 255]);
+    assert_eq!(
+        page.images[0].placements.len(),
+        2,
+        "two-cell pattern must produce two transformed placements"
+    );
+    let mut xs: Vec<f64> = page.images[0]
+        .placements
+        .iter()
+        .map(|p| {
+            assert!((p.transform.a - 10.0).abs() < 1e-6);
+            assert!((p.transform.d - 10.0).abs() < 1e-6);
+            assert!((p.transform.f - 23.0).abs() < 1e-6);
+            p.transform.e
+        })
+        .collect();
+    xs.sort_by(|a, b| a.total_cmp(b));
+    assert!((xs[0] - 12.0).abs() < 1e-6, "tile 0 x={}", xs[0]);
+    assert!((xs[1] - 32.0).abs() < 1e-6, "tile 1 x={}", xs[1]);
+}
+
+#[test]
+fn rich_conversion_bounds_dense_tiling_image_placements() {
+    // 100×100 = 10,000 cells painting an image XObject: rich conversion must
+    // collect the image while bounding placement expansion and signaling truncation.
+    let cell = stream(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 2 2] /XStep 2 /YStep 2 \
+         /Resources << /XObject << /Im1 6 0 R >> >>",
+        b"q 2 0 0 2 0 0 cm /Im1 Do Q",
+    );
+    let img = stream(
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &[10, 20, 240],
+    );
+    let content = stream("", b"/Pattern cs /P0 scn 0 0 200 200 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+          /Resources << /Pattern << /P0 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        content,
+        cell,
+        img,
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let rich = convert_pdf(
+        &doc,
+        &[0],
+        ConversionOptions {
+            mode: ConversionMode::Rich,
+            use_structure: false,
+        },
+    )
+    .expect("rich mode");
+    let page = &rich.pages[0];
+    assert_eq!(page.images.len(), 1);
+    assert_eq!(page.images[0].image.data, [10, 20, 240, 255]);
+    assert!(
+        !page.images[0].placements.is_empty() && page.images[0].placements.len() <= 4096,
+        "placements must stay bounded, got {}",
+        page.images[0].placements.len()
+    );
+    assert!(
+        page.diagnostics.resource_limit_reached,
+        "truncating dense tiling placements must set resource_limit_reached"
+    );
+}
