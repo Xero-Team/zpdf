@@ -1070,3 +1070,207 @@ fn gpu_translucent_overlapping_multiply_tiling_applies_outer_opacity_once() {
         "translucent overlapping Multiply tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
     );
 }
+
+/// Regression: an overlapping cell twice as wide as its horizontal step
+/// (`/BBox [0 0 8 4] /XStep 4 /YStep 4`, opaque 50%-gray `/BM /Multiply`) covers
+/// every interior pixel twice (`255 * 0.5 * 0.5 ≈ 64` on white) and must agree
+/// below (10×10 = 100 vector tiles) and above (65×65 = 4,225 dense synthetic
+/// tiles) the 4,096 tile cap on both GPU and CPU.
+#[test]
+fn gpu_overlapping_multiply_cell_agrees_above_and_below_4096_tile_cap() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 8 4] /XStep 4 /YStep 4 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        b"/GM gs 0.5 0.5 0.5 rg 0 0 8 4 re f",
+    );
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 40 40 re f\n60 0 260 260 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU overlapping Multiply cap parity test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 259 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    let gpu_below = px(&gpu.data, 22, 22);
+    let gpu_above = px(&gpu.data, 190, 130);
+    assert!(
+        gpu_below.iter().all(|&c| (58..=70).contains(&c)),
+        "GPU below-cap overlapping 50%-gray Multiply must be ~64 on white, got {gpu_below:?}"
+    );
+    assert!(
+        gpu_above.iter().all(|&c| (58..=70).contains(&c)),
+        "GPU above-cap overlapping 50%-gray Multiply must be ~64 on white (not ~128), got {gpu_above:?}"
+    );
+    for ch in 0..3 {
+        assert!(
+            (gpu_below[ch] as i32 - gpu_above[ch] as i32).abs() <= 2,
+            "GPU interior pixel must agree below ({gpu_below:?}) and above ({gpu_above:?}) cap"
+        );
+    }
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  overlapping_multiply_above_below_cap: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "overlapping Multiply above/below cap GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}
+
+/// Regression: a dense (> 4,096 tiles) outer tiling pattern whose cell fills
+/// with an inner `Multiply` pattern must composite cleanly against distinct
+/// page backgrounds on both GPU and CPU.
+#[test]
+fn gpu_dense_nested_multiply_tiling_preserves_backdrop() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let p_inner = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 2 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 1 2 re f\n0 1 1 rg 1 0 1 2 re f",
+    );
+    let p_outer = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4 \
+         /Resources << /Pattern << /PI 5 0 R >> >>",
+        b"/Pattern cs /PI scn 0 0 4 4 re f",
+    );
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 130 260 re f\n\
+          1 1 0 rg 130 0 130 260 re f\n\
+          /Pattern cs /PO scn 0 0 260 260 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 260 260] /Contents 4 0 R \
+          /Resources << /Pattern << /PO 6 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        p_inner,                                       // 5
+        p_outer,                                       // 6
+        gs_mul,                                        // 7
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU dense nested Multiply test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+
+    assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+    let px = |data: &[u8], x: f64, y: f64| -> [u8; 3] {
+        let ix = (x * SCALE as f64) as u32;
+        let iy = ((260.0 - y) * SCALE as f64) as u32;
+        let off = ((iy * gpu.width + ix) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    let y_white = px(&gpu.data, 140.5, 130.0);
+    assert!(
+        y_white[0] > 220 && y_white[1] > 220 && y_white[2] < 30,
+        "GPU dense nested white Multiply over yellow must stay yellow, got {y_white:?}"
+    );
+    let y_cyan = px(&gpu.data, 141.5, 130.0);
+    assert!(
+        y_cyan[0] < 30 && y_cyan[1] > 220 && y_cyan[2] < 30,
+        "GPU dense nested cyan Multiply over yellow must turn green, got {y_cyan:?}"
+    );
+    let b_cyan = px(&gpu.data, 21.5, 130.0);
+    assert!(
+        b_cyan[0] < 30 && b_cyan[1] < 30 && b_cyan[2] > 220,
+        "GPU dense nested cyan Multiply over blue must stay blue, got {b_cyan:?}"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  dense_nested_multiply_65x65: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "dense nested Multiply tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}

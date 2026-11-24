@@ -250,6 +250,7 @@ pub fn convert_pdf(
 const MAX_TILING_IMAGE_DEPTH: u8 = 8;
 const MAX_TILING_IMAGE_PLACEMENTS: usize = 4096;
 const MAX_TILING_IMAGE_VISITS: usize = 4096;
+const MAX_TILING_IMAGE_SCAN_COMMANDS: usize = 65_536;
 
 struct ImageCollector<'a> {
     cache: &'a mut ImageCache,
@@ -257,6 +258,12 @@ struct ImageCollector<'a> {
     positions: HashMap<u32, usize>,
     remaining_tiling_placements: usize,
     remaining_tiling_visits: usize,
+    remaining_image_scan_cmds: usize,
+    image_scan_exhausted: bool,
+    /// Memoized `dl_contains_images` results keyed by `(Arc::as_ptr, depth)`
+    /// so shared image-free child cells in a nested DAG are scanned at most
+    /// once per remaining depth.
+    tiling_has_images: HashMap<(usize, u8), bool>,
     truncated: bool,
 }
 
@@ -382,15 +389,33 @@ fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
     (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1, y1))
 }
 
-fn dl_contains_images(dl: &DisplayList, depth: u8) -> bool {
+fn dl_contains_images(
+    dl: &std::sync::Arc<DisplayList>,
+    depth: u8,
+    collector: &mut ImageCollector<'_>,
+) -> bool {
     if depth > MAX_TILING_IMAGE_DEPTH {
         // Conservatively treat depth-capped subtrees as image-bearing so the
         // caller signals truncation rather than silently skipping them.
         return true;
     }
+    let key = (std::sync::Arc::as_ptr(dl) as *const () as usize, depth);
+    if let Some(&cached) = collector.tiling_has_images.get(&key) {
+        return cached;
+    }
+    let mut found = false;
     for cmd in &dl.commands {
+        if collector.remaining_image_scan_cmds == 0 {
+            collector.image_scan_exhausted = true;
+            collector.truncated = true;
+            return false;
+        }
+        collector.remaining_image_scan_cmds -= 1;
         match cmd {
-            RenderCommand::DrawImage(_) => return true,
+            RenderCommand::DrawImage(_) => {
+                found = true;
+                break;
+            }
             RenderCommand::FillPath {
                 paint: Paint::Tiling(t),
                 ..
@@ -399,21 +424,30 @@ fn dl_contains_images(dl: &DisplayList, depth: u8) -> bool {
                 paint: Paint::Tiling(t),
                 ..
             } => {
-                if dl_contains_images(&t.commands, depth + 1) {
-                    return true;
+                if dl_contains_images(&t.commands, depth + 1, collector) {
+                    found = true;
+                    break;
+                }
+                if collector.image_scan_exhausted {
+                    return false;
                 }
             }
             RenderCommand::DrawGlyphRun(run) => {
                 if let Paint::Tiling(t) = &run.paint {
-                    if dl_contains_images(&t.commands, depth + 1) {
-                        return true;
+                    if dl_contains_images(&t.commands, depth + 1, collector) {
+                        found = true;
+                        break;
+                    }
+                    if collector.image_scan_exhausted {
+                        return false;
                     }
                 }
             }
             _ => {}
         }
     }
-    false
+    collector.tiling_has_images.insert(key, found);
+    found
 }
 
 fn collect_tiling_images(
@@ -425,7 +459,7 @@ fn collect_tiling_images(
     depth: u8,
     collector: &mut ImageCollector<'_>,
 ) {
-    if !dl_contains_images(&tiling.commands, depth + 1) {
+    if !dl_contains_images(&tiling.commands, depth + 1, collector) {
         return;
     }
     if depth >= MAX_TILING_IMAGE_DEPTH {
@@ -667,6 +701,9 @@ fn take_display_list_images(
         positions: HashMap::new(),
         remaining_tiling_placements: MAX_TILING_IMAGE_PLACEMENTS,
         remaining_tiling_visits: MAX_TILING_IMAGE_VISITS,
+        remaining_image_scan_cmds: MAX_TILING_IMAGE_SCAN_COMMANDS,
+        image_scan_exhausted: false,
+        tiling_has_images: HashMap::new(),
         truncated: false,
     };
     let page_rect = display_list.page_rect.normalize();
@@ -683,4 +720,174 @@ fn take_display_list_images(
         diagnostics.resource_limit_reached = true;
     }
     collector.images
+}
+
+#[cfg(test)]
+mod tiling_image_scan_tests {
+    use super::*;
+    use std::sync::Arc;
+    use zpdf_display_list::{Color, FillRule};
+
+    #[test]
+    fn image_free_nested_tiling_dag_memoizes_without_exponential_rescan() {
+        // Build a 7-level diamond DAG where every level references the same
+        // image-free child Arc<DisplayList> 16 times (16^7 = 268M naive paths).
+        let mut leaf_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        leaf_dl.push(RenderCommand::FillPath {
+            path: sq.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut child_arc = Arc::new(leaf_dl);
+        for _ in 0..7 {
+            let child_tiling = Arc::new(TilingPattern {
+                commands: Arc::clone(&child_arc),
+                bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+                x_step: 10.0,
+                y_step: 10.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            });
+            let mut parent_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+            for _ in 0..16 {
+                parent_dl.push(RenderCommand::FillPath {
+                    path: sq.clone(),
+                    rule: FillRule::NonZero,
+                    paint: Paint::Tiling(Arc::clone(&child_tiling)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+            child_arc = Arc::new(parent_dl);
+        }
+
+        let root_tiling = Arc::new(TilingPattern {
+            commands: child_arc,
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut page_dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut fill = Path::new();
+        fill.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+        page_dl.push(RenderCommand::FillPath {
+            path: fill,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(root_tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let mut cache = ImageCache::new();
+        let mut diagnostics = zpdf_core::ProcessingDiagnostics::default();
+        let images = take_display_list_images(&page_dl, &mut cache, &mut diagnostics);
+        assert!(images.is_empty());
+        assert!(
+            !diagnostics.resource_limit_reached,
+            "memoized image-free DAG should scan each shared list once without hitting limits"
+        );
+    }
+
+    #[test]
+    fn image_presence_scan_budget_reports_truncation_when_exhausted() {
+        let mut cell_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        for _ in 0..100 {
+            cell_dl.push(RenderCommand::FillPath {
+                path: sq.clone(),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+        }
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell_dl),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut cache = ImageCache::new();
+        let mut collector = ImageCollector {
+            cache: &mut cache,
+            images: Vec::new(),
+            positions: HashMap::new(),
+            remaining_tiling_placements: MAX_TILING_IMAGE_PLACEMENTS,
+            remaining_tiling_visits: MAX_TILING_IMAGE_VISITS,
+            remaining_image_scan_cmds: 10,
+            image_scan_exhausted: false,
+            tiling_has_images: HashMap::new(),
+            truncated: false,
+        };
+        assert!(!dl_contains_images(&tiling.commands, 1, &mut collector));
+        assert!(
+            collector.truncated,
+            "exhausting scan budget must flag truncation"
+        );
+    }
+
+    #[test]
+    fn image_presence_scan_flags_truncation_after_exact_child_budget_boundary() {
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        let mut child_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        child_dl.push(RenderCommand::FillPath {
+            path: sq.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let child = Arc::new(TilingPattern {
+            commands: Arc::new(child_dl),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut parent_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        parent_dl.push(RenderCommand::FillPath {
+            path: sq.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(child),
+            alpha: 1.0,
+            overprint: None,
+        });
+        parent_dl.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let parent_arc = Arc::new(parent_dl);
+        let mut cache = ImageCache::new();
+        let mut collector = ImageCollector {
+            cache: &mut cache,
+            images: Vec::new(),
+            positions: HashMap::new(),
+            remaining_tiling_placements: MAX_TILING_IMAGE_PLACEMENTS,
+            remaining_tiling_visits: MAX_TILING_IMAGE_VISITS,
+            // Exactly enough to visit parent[0] and child[0], leaving 0 for parent[1].
+            remaining_image_scan_cmds: 2,
+            image_scan_exhausted: false,
+            tiling_has_images: HashMap::new(),
+            truncated: false,
+        };
+        assert!(!dl_contains_images(&parent_arc, 1, &mut collector));
+        assert!(
+            collector.truncated,
+            "trailing sibling command after exact child budget consumption must flag truncation"
+        );
+    }
 }

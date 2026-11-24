@@ -1313,3 +1313,201 @@ fn tiling_cell_overlapping_multiply_applies_outer_opacity_once() {
         "CPU direct-replay overlapping Multiply over blue at 50% should be ~[0, 0, 128], got {dir_blue:?}"
     );
 }
+
+/// Regression: during CPU direct per-tile replay of an overlapping
+/// backdrop-dependent pattern, translated tiles with a spatially varying soft
+/// mask must NOT alias freed `Arc<DisplayList>` addresses in `soft_mask_planes`
+/// and drop or mis-position later tiles' masked marks.
+#[test]
+fn direct_replay_translated_tiles_with_spatially_varying_soft_mask() {
+    // Spatially varying luminosity mask: white (visible) on left half [0..10],
+    // black (masked out) on right half [10..20].
+    let mask_group = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 24 20] \
+         /Group << /Type /Group /S /Transparency /CS /DeviceGray >>",
+        b"1 g 0 0 10 20 re f",
+    );
+    let gs_mask_mul =
+        b"<< /Type /ExtGState /BM /Multiply /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >>"
+            .to_vec();
+    // Overlapping cell (`/BBox` 24 > `/XStep` 20) + `/BM /Multiply` forces CPU direct replay.
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 24 20] /XStep 20 /YStep 20 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 0 1 1 rg 0 0 20 20 re f",
+    );
+    // Yellow background across 200×200 (10×10 = 100 translated tiles).
+    let content = stream_obj(
+        "",
+        b"1 1 0 rg 0 0 200 200 re f\n/Pattern cs /P0 scn 0 0 200 200 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        mask_group,                                    // 6
+        gs_mask_mul,                                   // 7
+    ]);
+    let page = render(pdf);
+
+    // Every translated tile must reveal cyan*yellow = green in its left half
+    // [0..10] and stay yellow in its masked-out right half [10..20].
+    for &(tx, ty) in &[(0, 0), (1, 0), (3, 2), (7, 5), (9, 9)] {
+        let bx = tx as f64 * 20.0;
+        let by = ty as f64 * 20.0;
+        assert_rgbish(
+            px(&page, bx + 5.0, by + 10.0),
+            [0, 255, 0],
+            &format!("tile ({tx},{ty}) unmasked left half should be cyan*yellow=green"),
+        );
+        assert_rgbish(
+            px(&page, bx + 15.0, by + 10.0),
+            [255, 255, 0],
+            &format!("tile ({tx},{ty}) masked right half should stay yellow"),
+        );
+    }
+}
+
+/// Regression: an overlapping backdrop-dependent cell twice as wide as its
+/// horizontal step (`/BBox [0 0 8 4] /XStep 4 /YStep 4`, opaque 50%-gray
+/// `/BM /Multiply`) covers every interior point twice (`255 * 0.5 * 0.5 ≈ 64`
+/// on white) and must produce the same ~64 interior value both below the 4,096
+/// tile cap (direct replay) and above it (dense per-copy segment compositing).
+#[test]
+fn overlapping_multiply_cell_agrees_above_and_below_4096_tile_cap() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 8 4] /XStep 4 /YStep 4 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        b"/GM gs 0.5 0.5 0.5 rg 0 0 8 4 re f",
+    );
+    // Left fill [0..40]×[0..40] = 10×10 = 100 tiles (below 4,096 cap).
+    // Right fill [60..320]×[0..260] = 65×65 = 4,225 tiles (above 4,096 cap).
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 40 40 re f\n60 0 260 260 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+
+    let below = px_on(&page, 260.0, 1.0, 22.5, 22.5);
+    let above = px_on(&page, 260.0, 1.0, 190.5, 130.5);
+    assert!(
+        below.iter().all(|&c| (58..=70).contains(&c)),
+        "below-cap overlapping 50%-gray Multiply must be ~64 on white, got {below:?}"
+    );
+    assert!(
+        above.iter().all(|&c| (58..=70).contains(&c)),
+        "above-cap overlapping 50%-gray Multiply must be ~64 on white (not ~128), got {above:?}"
+    );
+    for ch in 0..3 {
+        assert!(
+            (below[ch] as i32 - above[ch] as i32).abs() <= 2,
+            "interior pixel must agree below ({below:?}) and above ({above:?}) the 4,096 cap"
+        );
+    }
+}
+
+/// Regression: a dense (> 4,096 tiles) outer tiling pattern whose cell fills or
+/// strokes with an inner `Multiply` pattern must remain visible and composite
+/// against the live page backdrop on both the fill and stroke paths.
+#[test]
+fn dense_nested_multiply_tiling_pattern_above_4096_tiles_preserves_backdrop() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    // Inner pattern (2×2): white Multiply on left half [0..1], cyan Multiply on right half [1..2].
+    let p_inner = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 2 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 9 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 1 2 re f\n0 1 1 rg 1 0 1 2 re f",
+    );
+    // Outer fill pattern (4×4 -> 65×65 = 4,225 tiles over 260×260) fills with PInner.
+    let p_outer_fill = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4 \
+         /Resources << /Pattern << /PI 5 0 R >> >>",
+        b"/Pattern cs /PI scn 0 0 4 4 re f",
+    );
+    // Inner magenta Multiply pattern (1×1) used by a dense stroke pattern (> 4,096 tiles).
+    let p_inner_mag = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 1 1] /XStep 1 /YStep 1 \
+         /Resources << /ExtGState << /GM 9 0 R >> >>",
+        b"/GM gs 1 0 1 rg 0 0 1 1 re f",
+    );
+    // Outer stroke pattern (1×1 -> 260×20 = 5,200 tiles on a 20pt stroke) fills with PInnerMag.
+    let p_outer_stroke = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 1 1] /XStep 1 /YStep 1 \
+         /Resources << /Pattern << /PM 7 0 R >> >>",
+        b"/Pattern cs /PM scn 0 0 1 1 re f",
+    );
+    // Blue left [0..130], yellow right [130..260]; dense nested fill across whole
+    // page, then dense nested stroke along y=200 (20pt tall).
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 130 260 re f\n\
+          1 1 0 rg 130 0 130 260 re f\n\
+          /Pattern cs /POF scn 0 0 260 260 re f\n\
+          /Pattern CS /POS SCN 20 w 0 200 m 260 200 l S",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 260 260] /Contents 4 0 R \
+          /Resources << /Pattern << /POF 6 0 R /POS 8 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        p_inner,                                       // 5
+        p_outer_fill,                                  // 6
+        p_inner_mag,                                   // 7
+        p_outer_stroke,                                // 8
+        gs_mul,                                        // 9
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 2.0);
+
+    // Dense nested fill over yellow right half (y=100):
+    // - cell-x=0.5 (white Multiply) -> stays yellow [255, 255, 0]
+    // - cell-x=1.5 (cyan Multiply) -> becomes green [0, 255, 0] (NOT dropped/blank!)
+    assert_rgbish(
+        px_on(&page, 260.0, 2.0, 140.5, 100.0),
+        [255, 255, 0],
+        "dense nested white Multiply fill over yellow stays yellow",
+    );
+    assert_rgbish(
+        px_on(&page, 260.0, 2.0, 141.5, 100.0),
+        [0, 255, 0],
+        "dense nested cyan Multiply fill over yellow turns green",
+    );
+    // Dense nested fill over blue left half: stays blue.
+    assert_rgbish(
+        px_on(&page, 260.0, 2.0, 21.5, 100.0),
+        [0, 0, 255],
+        "dense nested cyan Multiply fill over blue stays blue",
+    );
+    // Dense nested stroke (5,200 tiles) along y=200:
+    // - over yellow (x=140.5, previously yellow after white Multiply): magenta*yellow = red!
+    // - over blue (x=20.5): magenta*blue = blue!
+    assert_rgbish(
+        px_on(&page, 260.0, 2.0, 140.5, 200.0),
+        [255, 0, 0],
+        "dense nested magenta Multiply stroke over yellow turns red",
+    );
+    assert_rgbish(
+        px_on(&page, 260.0, 2.0, 20.5, 200.0),
+        [0, 0, 255],
+        "dense nested magenta Multiply stroke over blue stays blue",
+    );
+}

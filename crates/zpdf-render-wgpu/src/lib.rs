@@ -1507,7 +1507,7 @@ fn record_tiling_pattern(
     // backdrop-independent cells can render into a clean transparent group.
     let wrap_alpha = opacity < 1.0 && rec.can_push_blend();
     if wrap_alpha {
-        if tiling.is_backdrop_dependent() {
+        if rec.tiling_is_backdrop_dependent(tiling) {
             rec.push_non_isolated_opacity(opacity);
         } else {
             rec.push_blend(zpdf_display_list::BlendMode::Normal, opacity, None);
@@ -1696,11 +1696,13 @@ fn record_tiling_pattern_rasterized(
 
     let get_or_record_tile = |rec: &mut PageRecorder,
                               commands: &zpdf_display_list::DisplayList,
-                              segment_index: usize|
+                              segment_index: usize,
+                              overlap_shift: Option<(i64, i64)>|
      -> Option<u32> {
         let key = record::SyntheticTileKey::new(
             tiling,
             segment_index,
+            overlap_shift,
             tile_w,
             tile_h,
             exact_1to1,
@@ -1711,8 +1713,12 @@ fn record_tiling_pattern_rasterized(
         }
         let ops = rec.record_subops(|r| {
             let saved_rect = r.replace_page_rect(Some(tile_rect));
-            'copies: for dj in overlap.dj.clone() {
-                for di in overlap.di.clone() {
+            let (di_range, dj_range) = match overlap_shift {
+                Some((di, dj)) => (di..=di, dj..=dj),
+                None => (overlap.di.clone(), overlap.dj.clone()),
+            };
+            'copies: for dj in dj_range {
+                for di in di_range.clone() {
                     if !r.can_record() {
                         break 'copies;
                     }
@@ -1750,23 +1756,43 @@ fn record_tiling_pattern_rasterized(
         )
     };
 
-    if tiling.is_backdrop_dependent() {
+    if rec.tiling_is_backdrop_dependent(tiling) {
         if let Some(segments) = tiling.blend_segments() {
-            // Preserve the live backdrop across all segments while evaluating
-            // at opacity 1.0, then apply the object's constant opacity ONCE
-            // (ISO 32000-1 §11.6.7).
+            // Preserve the live backdrop across all segments and overlapping
+            // neighbor copies while evaluating at opacity 1.0, then apply the
+            // object's constant opacity ONCE (ISO 32000-1 §11.6.7).
+            const MAX_DENSE_BLEND_PASSES: usize = 64;
+            let overlap_nx = overlap
+                .di
+                .end()
+                .saturating_sub(*overlap.di.start())
+                .saturating_add(1)
+                .max(0) as usize;
+            let overlap_ny = overlap
+                .dj
+                .end()
+                .saturating_sub(*overlap.dj.start())
+                .saturating_add(1)
+                .max(0) as usize;
+            let overlap_count = overlap_nx.saturating_mul(overlap_ny);
+            let separate_copies = overlap_count > 1
+                && overlap_count.saturating_mul(segments.len()) <= MAX_DENSE_BLEND_PASSES;
+
             let wrap_alpha = opacity < 1.0 && rec.can_push_blend();
             if wrap_alpha {
                 rec.push_non_isolated_opacity(opacity);
             }
             let seg_quad = if wrap_alpha { quad_opaque } else { quad_alpha };
             let seg_alpha = if wrap_alpha { 1.0 } else { opacity };
-            for (seg_idx, seg) in segments.iter().enumerate() {
-                if !rec.can_record() {
-                    break;
-                }
-                let Some(tile_id) = get_or_record_tile(rec, &seg.commands, seg_idx + 1) else {
-                    continue;
+
+            let emit_segment = |rec: &mut PageRecorder,
+                                seg_idx: usize,
+                                seg: &zpdf_display_list::TilingBlendSegment,
+                                overlap_shift: Option<(i64, i64)>| {
+                let Some(tile_id) =
+                    get_or_record_tile(rec, &seg.commands, seg_idx + 1, overlap_shift)
+                else {
+                    return;
                 };
                 if seg.blend_mode == zpdf_display_list::BlendMode::Normal {
                     rec.add_tile(seg_quad, tile_id);
@@ -1777,6 +1803,26 @@ fn record_tiling_pattern_rasterized(
                 } else {
                     rec.add_tile(seg_quad, tile_id);
                 }
+            };
+
+            if separate_copies {
+                'copies: for dj in overlap.dj.clone() {
+                    for di in overlap.di.clone() {
+                        for (seg_idx, seg) in segments.iter().enumerate() {
+                            if !rec.can_record() {
+                                break 'copies;
+                            }
+                            emit_segment(rec, seg_idx, seg, Some((di, dj)));
+                        }
+                    }
+                }
+            } else {
+                for (seg_idx, seg) in segments.iter().enumerate() {
+                    if !rec.can_record() {
+                        break;
+                    }
+                    emit_segment(rec, seg_idx, seg, None);
+                }
             }
             if wrap_alpha {
                 rec.pop_blend();
@@ -1785,7 +1831,7 @@ fn record_tiling_pattern_rasterized(
         }
     }
 
-    if let Some(tile_id) = get_or_record_tile(rec, &tiling.commands, 0) {
+    if let Some(tile_id) = get_or_record_tile(rec, &tiling.commands, 0, None) {
         rec.add_tile(quad_alpha, tile_id);
     }
 }

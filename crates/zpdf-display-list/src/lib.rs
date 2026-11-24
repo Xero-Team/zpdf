@@ -451,18 +451,37 @@ impl TilingPattern {
     /// nested backdrop-dependent [`TilingPattern`]). Such cells cannot be
     /// pre-baked onto a single transparent tile and composited with `Normal`
     /// source-over (ISO 32000-1 §11.6.7).
+    ///
+    /// Memoizes nested cell checks by `(Arc::as_ptr, depth)` so shared child
+    /// cells in a DAG are classified at most once per depth.
     pub fn is_backdrop_dependent(&self) -> bool {
-        dl_is_backdrop_dependent(&self.commands, 0)
+        let mut memo = std::collections::HashMap::new();
+        dl_is_backdrop_dependent_memo(&self.commands, 0, &mut memo)
     }
 
     /// Split a backdrop-dependent cell into sequential top-level blend-mode
     /// slices when every mark can be rasterized into a tile pixmap and
-    /// composited onto the destination with its own [`BlendMode`]. Returns
+    /// composited onto the destination with its own [`BlendMode`]. Recursively
+    /// lifts non-overlapping nested backdrop-dependent [`TilingPattern`] paints
+    /// so dense nested `Multiply` (etc.) patterns stay representable. Returns
     /// `None` when the cell uses active overprint, non-passthrough nested
-    /// backdrop-dependent groups, nested backdrop-dependent tiling patterns,
-    /// or exceeds the segment cap.
+    /// backdrop-dependent groups, overlapping nested backdrop-dependent tiling
+    /// patterns, or exceeds the segment cap.
     pub fn blend_segments(&self) -> Option<Vec<TilingBlendSegment>> {
+        let mut memo = std::collections::HashMap::new();
+        self.blend_segments_at(0, &mut memo)
+    }
+
+    fn blend_segments_at(
+        &self,
+        depth: u8,
+        memo: &mut std::collections::HashMap<(usize, u8), bool>,
+    ) -> Option<Vec<TilingBlendSegment>> {
         const MAX_SEGMENTS: usize = 64;
+        const MAX_NESTING_DEPTH: u8 = 8;
+        if depth > MAX_NESTING_DEPTH {
+            return None;
+        }
         let cmds = &self.commands.commands;
         let page_rect = self.commands.page_rect;
         let mut segments: Vec<TilingBlendSegment> = Vec::new();
@@ -492,6 +511,38 @@ impl TilingPattern {
             Some(())
         };
 
+        let emit_lifted_cmd = |blend_mode: BlendMode,
+                               cmd: RenderCommand,
+                               cur_normal: &mut Vec<RenderCommand>,
+                               clip_stack: &[RenderCommand],
+                               segments: &mut Vec<TilingBlendSegment>|
+         -> Option<()> {
+            if blend_mode == BlendMode::Normal {
+                if cur_normal.is_empty() {
+                    cur_normal.extend(clip_stack.iter().cloned());
+                }
+                cur_normal.push(cmd);
+                return Some(());
+            }
+            flush_normal(cur_normal, clip_stack, segments)?;
+            if segments.len() >= MAX_SEGMENTS {
+                return None;
+            }
+            let mut seg_cmds = Vec::with_capacity(clip_stack.len() * 2 + 1);
+            seg_cmds.extend(clip_stack.iter().cloned());
+            seg_cmds.push(cmd);
+            for _ in 0..clip_stack.len() {
+                seg_cmds.push(RenderCommand::PopClip);
+            }
+            let mut dl = DisplayList::new(page_rect);
+            dl.commands = seg_cmds;
+            segments.push(TilingBlendSegment {
+                blend_mode,
+                commands: std::sync::Arc::new(dl),
+            });
+            Some(())
+        };
+
         let mut idx = 0usize;
         while idx < cmds.len() {
             if passthrough_pops.last().copied() == Some(idx) {
@@ -515,17 +566,95 @@ impl TilingPattern {
                     idx += 1;
                 }
                 RenderCommand::FillPath {
-                    paint, overprint, ..
-                }
-                | RenderCommand::StrokePath {
-                    paint, overprint, ..
+                    path,
+                    rule,
+                    paint,
+                    alpha,
+                    overprint,
                 } => {
                     if overprint.is_some_and(|op| op.active != 0) {
                         return None;
                     }
                     if let Paint::Tiling(inner) = paint {
-                        if inner.is_backdrop_dependent() {
-                            return None;
+                        if dl_is_backdrop_dependent_memo(&inner.commands, depth + 1, memo) {
+                            let inner_bbox = inner.bbox.normalize();
+                            if inner_bbox.width() > inner.x_step.abs() + 1e-9
+                                || inner_bbox.height() > inner.y_step.abs() + 1e-9
+                            {
+                                return None;
+                            }
+                            let inner_segs = inner.blend_segments_at(depth + 1, memo)?;
+                            if inner_segs.len() > 1 && *alpha < 1.0 {
+                                return None;
+                            }
+                            for seg in inner_segs {
+                                let mut lifted = (**inner).clone();
+                                lifted.commands = seg.commands;
+                                emit_lifted_cmd(
+                                    seg.blend_mode,
+                                    RenderCommand::FillPath {
+                                        path: path.clone(),
+                                        rule: *rule,
+                                        paint: Paint::Tiling(std::sync::Arc::new(lifted)),
+                                        alpha: *alpha,
+                                        overprint: *overprint,
+                                    },
+                                    &mut cur_normal,
+                                    &clip_stack,
+                                    &mut segments,
+                                )?;
+                            }
+                            idx += 1;
+                            continue;
+                        }
+                    }
+                    if cur_normal.is_empty() {
+                        cur_normal.extend(clip_stack.iter().cloned());
+                    }
+                    cur_normal.push(cmds[idx].clone());
+                    idx += 1;
+                }
+                RenderCommand::StrokePath {
+                    path,
+                    style,
+                    paint,
+                    alpha,
+                    overprint,
+                } => {
+                    if overprint.is_some_and(|op| op.active != 0) {
+                        return None;
+                    }
+                    if let Paint::Tiling(inner) = paint {
+                        if dl_is_backdrop_dependent_memo(&inner.commands, depth + 1, memo) {
+                            let inner_bbox = inner.bbox.normalize();
+                            if inner_bbox.width() > inner.x_step.abs() + 1e-9
+                                || inner_bbox.height() > inner.y_step.abs() + 1e-9
+                            {
+                                return None;
+                            }
+                            let inner_segs = inner.blend_segments_at(depth + 1, memo)?;
+                            if inner_segs.len() > 1 && *alpha < 1.0 {
+                                return None;
+                            }
+                            for seg in inner_segs {
+                                let mut lifted = (**inner).clone();
+                                lifted.commands = seg.commands;
+                                emit_lifted_cmd(
+                                    seg.blend_mode,
+                                    RenderCommand::StrokePath {
+                                        path: path.clone(),
+                                        style: style.clone(),
+                                        paint: Paint::Tiling(std::sync::Arc::new(lifted)),
+                                        alpha: *alpha,
+                                        overprint: *overprint,
+                                    },
+                                    &mut cur_normal,
+                                    &clip_stack,
+                                    &mut segments,
+                                )?;
+                            }
+                            idx += 1;
+                            continue;
                         }
                     }
                     if cur_normal.is_empty() {
@@ -539,8 +668,32 @@ impl TilingPattern {
                         return None;
                     }
                     if let Paint::Tiling(inner) = &run.paint {
-                        if inner.is_backdrop_dependent() {
-                            return None;
+                        if dl_is_backdrop_dependent_memo(&inner.commands, depth + 1, memo) {
+                            let inner_bbox = inner.bbox.normalize();
+                            if inner_bbox.width() > inner.x_step.abs() + 1e-9
+                                || inner_bbox.height() > inner.y_step.abs() + 1e-9
+                            {
+                                return None;
+                            }
+                            let inner_segs = inner.blend_segments_at(depth + 1, memo)?;
+                            if inner_segs.len() > 1 && run.alpha < 1.0 {
+                                return None;
+                            }
+                            for seg in inner_segs {
+                                let mut lifted = (**inner).clone();
+                                lifted.commands = seg.commands;
+                                let mut lifted_run = run.clone();
+                                lifted_run.paint = Paint::Tiling(std::sync::Arc::new(lifted));
+                                emit_lifted_cmd(
+                                    seg.blend_mode,
+                                    RenderCommand::DrawGlyphRun(lifted_run),
+                                    &mut cur_normal,
+                                    &clip_stack,
+                                    &mut segments,
+                                )?;
+                            }
+                            idx += 1;
+                            continue;
                         }
                     }
                     if cur_normal.is_empty() {
@@ -566,7 +719,7 @@ impl TilingPattern {
                 } => {
                     let end = find_matching_pop_blend(cmds, idx)?;
                     let inner = &cmds[idx + 1..end];
-                    let inner_backdrop = slice_is_backdrop_dependent(inner, 0);
+                    let inner_backdrop = slice_is_backdrop_dependent_memo(inner, depth, memo);
                     if *blend_mode == BlendMode::Normal {
                         if *isolated || !inner_backdrop {
                             if cur_normal.is_empty() {
@@ -646,11 +799,28 @@ fn find_matching_pop_blend(cmds: &[RenderCommand], push_idx: usize) -> Option<us
     None
 }
 
-fn dl_is_backdrop_dependent(dl: &DisplayList, depth: u8) -> bool {
-    slice_is_backdrop_dependent(&dl.commands, depth)
+fn dl_is_backdrop_dependent_memo(
+    dl: &std::sync::Arc<DisplayList>,
+    depth: u8,
+    memo: &mut std::collections::HashMap<(usize, u8), bool>,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let key = (std::sync::Arc::as_ptr(dl) as *const () as usize, depth);
+    if let Some(&cached) = memo.get(&key) {
+        return cached;
+    }
+    let result = slice_is_backdrop_dependent_memo(&dl.commands, depth, memo);
+    memo.insert(key, result);
+    result
 }
 
-fn slice_is_backdrop_dependent(cmds: &[RenderCommand], depth: u8) -> bool {
+fn slice_is_backdrop_dependent_memo(
+    cmds: &[RenderCommand],
+    depth: u8,
+    memo: &mut std::collections::HashMap<(usize, u8), bool>,
+) -> bool {
     if depth > 8 {
         return false;
     }
@@ -680,7 +850,7 @@ fn slice_is_backdrop_dependent(cmds: &[RenderCommand], depth: u8) -> bool {
                         return true;
                     }
                     if let Paint::Tiling(inner) = paint {
-                        if dl_is_backdrop_dependent(&inner.commands, depth + 1) {
+                        if dl_is_backdrop_dependent_memo(&inner.commands, depth + 1, memo) {
                             return true;
                         }
                     }
@@ -690,7 +860,7 @@ fn slice_is_backdrop_dependent(cmds: &[RenderCommand], depth: u8) -> bool {
                         return true;
                     }
                     if let Paint::Tiling(inner) = &run.paint {
-                        if dl_is_backdrop_dependent(&inner.commands, depth + 1) {
+                        if dl_is_backdrop_dependent_memo(&inner.commands, depth + 1, memo) {
                             return true;
                         }
                     }
@@ -1096,5 +1266,101 @@ mod tiling_backdrop_tests {
             assert_eq!(pushes, 1);
             assert_eq!(pops, 1);
         }
+    }
+
+    #[test]
+    fn is_backdrop_dependent_memoizes_shared_dag_without_exponential_blowup() {
+        // 8-level diamond DAG where each level paints 16 references to the same
+        // child Arc<DisplayList> (16^8 = 4.3 billion naive paths), all Normal.
+        let mut child_arc = Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        Arc::make_mut(&mut child_arc).push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        for _ in 0..8 {
+            let child = Arc::new(TilingPattern {
+                commands: Arc::clone(&child_arc),
+                bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+                x_step: 10.0,
+                y_step: 10.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            });
+            let mut parent = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+            for _ in 0..16 {
+                parent.push(RenderCommand::FillPath {
+                    path: rect_path(0.0, 0.0, 10.0, 10.0),
+                    rule: FillRule::NonZero,
+                    paint: Paint::Tiling(Arc::clone(&child)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+            child_arc = Arc::new(parent);
+        }
+        let root = TilingPattern {
+            commands: child_arc,
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        };
+        assert!(!root.is_backdrop_dependent());
+    }
+
+    #[test]
+    fn blend_segments_lifts_nested_multiply_tiling_pattern() {
+        let inner = Arc::new(tiling_with(vec![
+            RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            },
+            RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 1.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            },
+            RenderCommand::PopBlendGroup,
+        ]));
+        let outer = tiling_with(vec![
+            RenderCommand::PushClip {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+            },
+            RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(inner),
+                alpha: 1.0,
+                overprint: None,
+            },
+            RenderCommand::PopClip,
+        ]);
+        assert!(outer.is_backdrop_dependent());
+        let segs = outer
+            .blend_segments()
+            .expect("nested non-overlapping Multiply tiling must lift cleanly");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].blend_mode, BlendMode::Multiply);
+        // The lifted inner tiling inside the segment must itself be backdrop-independent.
+        assert!(!TilingPattern {
+            commands: Arc::clone(&segs[0].commands),
+            bbox: outer.bbox,
+            x_step: outer.x_step,
+            y_step: outer.y_step,
+            matrix: outer.matrix,
+            tiling_type: outer.tiling_type,
+        }
+        .is_backdrop_dependent());
     }
 }

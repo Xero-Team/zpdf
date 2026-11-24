@@ -139,6 +139,7 @@ fn arena_fits_u32(current: usize, additional: usize) -> bool {
 pub struct SyntheticTileKey {
     commands: usize,
     segment_index: usize,
+    overlap_shift: Option<(i64, i64)>,
     bbox: [u64; 4],
     steps: [u64; 2],
     width: u32,
@@ -151,6 +152,7 @@ impl SyntheticTileKey {
     pub fn new(
         tiling: &zpdf_display_list::TilingPattern,
         segment_index: usize,
+        overlap_shift: Option<(i64, i64)>,
         width: u32,
         height: u32,
         nearest: bool,
@@ -159,6 +161,7 @@ impl SyntheticTileKey {
         Self {
             commands: std::sync::Arc::as_ptr(&tiling.commands) as *const () as usize,
             segment_index,
+            overlap_shift,
             bbox: [
                 tiling.bbox.x0.to_bits(),
                 tiling.bbox.y0.to_bits(),
@@ -219,6 +222,10 @@ pub struct PageRecorder {
     pub synthetic_tiles: Vec<SyntheticTile>,
     synthetic_tile_cache: std::collections::HashMap<SyntheticTileKey, u32>,
     synthetic_tile_bytes: u64,
+    /// Per-page memo of `TilingPattern::is_backdrop_dependent()`, retaining
+    /// each cell `Arc<DisplayList>` so pointer keys never alias freed memory.
+    tiling_backdrop_cache:
+        std::collections::HashMap<usize, (std::sync::Arc<zpdf_display_list::DisplayList>, bool)>,
     page_rect: Option<zpdf_core::Rect>,
     clip_stack: Vec<ClipEntry>,
     clip_depth: u32,
@@ -270,6 +277,25 @@ impl PageRecorder {
 
     pub fn cached_synthetic_tile(&self, key: &SyntheticTileKey) -> Option<u32> {
         self.synthetic_tile_cache.get(key).copied()
+    }
+
+    /// Cached per-page check of `tiling.is_backdrop_dependent()`, keyed by
+    /// `Arc::as_ptr(&tiling.commands)` while keeping the `Arc` alive.
+    pub fn tiling_is_backdrop_dependent(
+        &mut self,
+        tiling: &zpdf_display_list::TilingPattern,
+    ) -> bool {
+        let ptr = std::sync::Arc::as_ptr(&tiling.commands) as *const () as usize;
+        if let Some(&(_, dep)) = self.tiling_backdrop_cache.get(&ptr) {
+            return dep;
+        }
+        let dep = tiling.is_backdrop_dependent();
+        if self.tiling_backdrop_cache.len() >= 256 {
+            self.tiling_backdrop_cache.clear();
+        }
+        self.tiling_backdrop_cache
+            .insert(ptr, (std::sync::Arc::clone(&tiling.commands), dep));
+        dep
     }
 
     pub fn insert_synthetic_tile(
