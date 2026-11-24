@@ -3246,12 +3246,8 @@ impl<'a> SvgWriter<'a> {
                 return true;
             }
         }
-        if self.non_isolated_filter_depth == 0
+        self.non_isolated_filter_depth == 0
             && self.emit_chunked_tiling_ops(ops, shape_body, affected, disjoint_rect)
-        {
-            return true;
-        }
-        false
     }
 
     #[allow(clippy::too_many_arguments)]
