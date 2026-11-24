@@ -697,8 +697,6 @@ impl BackdropIndex {
     }
 
     fn build(commands: &[RenderCommand], page_rect: Rect, font_cache: &FontCache) -> Self {
-        use zpdf_display_list::SoftMaskKind;
-
         let mut index = Self {
             origin_x: page_rect.x0,
             origin_y: page_rect.y0,
@@ -789,35 +787,22 @@ impl BackdropIndex {
                                 }
                                 CommandBounds::Unknown => fallback,
                             };
-                        let masked = match mask {
-                            Some(m) if m.kind == SoftMaskKind::Alpha && m.transfer.is_none() => {
-                                match compute_commands_bounds(
-                                    &m.commands.commands,
-                                    m.offset,
-                                    font_cache,
-                                ) {
-                                    CommandBounds::Empty => {
+                        let masked =
+                            match soft_mask_visibility(mask.as_ref(), page_rect, font_cache) {
+                                SoftMaskVisibility::Empty => {
+                                    idx = end_idx + 1;
+                                    continue;
+                                }
+                                SoftMaskVisibility::Bounded(padded) => {
+                                    let Some(both) = intersect_rect(draw_rect, padded) else {
                                         idx = end_idx + 1;
                                         continue;
-                                    }
-                                    CommandBounds::Known(mr) => {
-                                        let padded = Rect::new(
-                                            mr.x0 - 1.0,
-                                            mr.y0 - 1.0,
-                                            mr.x1 + 1.0,
-                                            mr.y1 + 1.0,
-                                        );
-                                        let Some(both) = intersect_rect(draw_rect, padded) else {
-                                            idx = end_idx + 1;
-                                            continue;
-                                        };
-                                        both
-                                    }
-                                    CommandBounds::Unknown => draw_rect,
+                                    };
+                                    both
                                 }
-                            }
-                            _ => draw_rect,
-                        };
+                                SoftMaskVisibility::Unbounded
+                                | SoftMaskVisibility::MissingOutlines => draw_rect,
+                            };
                         let Some(clipped) = intersect_rect(masked, active_clip) else {
                             idx = end_idx + 1;
                             continue;
@@ -991,7 +976,7 @@ impl<'a> SlideConverter<'a> {
                 || command_has_backdrop_dependent_native_overprint(c, self.font_cache)
         });
         let isolated_inner_blends =
-            compute_isolated_inner_non_normal_blends(commands, self.font_cache);
+            compute_isolated_inner_non_normal_blends(commands, self.page_rect, self.font_cache);
         let later_non_normal_blends = NonNormalBlendIndex::build(
             commands,
             self.page_rect,
@@ -1087,7 +1072,8 @@ impl<'a> SlideConverter<'a> {
                     || isolated_with_inner_blend;
                 if needs_group_flatten {
                     if let Some(end_idx) = Self::find_matching_pop_blend(commands, cmd_idx) {
-                        let mask_vis = soft_mask_visibility(mask.as_ref(), self.font_cache);
+                        let mask_vis =
+                            soft_mask_visibility(mask.as_ref(), self.page_rect, self.font_cache);
                         if group_alpha <= 0.0 || matches!(mask_vis, SoftMaskVisibility::Empty) {
                             // Zero-opacity transparency group or empty `/S /Alpha`
                             // soft mask (with no transfer function) hides everything
@@ -1102,17 +1088,41 @@ impl<'a> SlideConverter<'a> {
                             cmd_idx = end_idx + 1;
                             continue;
                         }
+                        let group_slice = &commands[cmd_idx..=end_idx];
+                        if matches!(mask_vis, SoftMaskVisibility::MissingOutlines) {
+                            if group_has_visible_paint(
+                                group_slice,
+                                &self.clip_stack,
+                                self.page_rect,
+                                self.font_cache,
+                            ) {
+                                return Err(zpdf_core::Error::StreamDecode(
+                                    "PPTX soft mask contains text without font outlines and cannot be rendered faithfully".into(),
+                                ));
+                            }
+                            for cmd in group_slice {
+                                self.track_clip(cmd);
+                            }
+                            while exp_idx < expanded.len() && expanded[exp_idx].cmd_start <= end_idx
+                            {
+                                exp_idx += 1;
+                            }
+                            cmd_idx = end_idx + 1;
+                            continue;
+                        }
                         // Soft masks, group opacity, knockout compositing, non-Normal
                         // blend modes, and isolated groups with inner non-Normal blends
                         // apply to the entire group even when it contains editable text.
-                        let group_slice = &commands[cmd_idx..=end_idx];
                         let is_opaque_isolated_normal = *isolated
                             && !*knockout
                             && !is_non_normal_blend
                             && !is_translucent_group
                             && mask.is_none();
                         let surviving_native_texts = self.plan_flattened_group_native_texts(
+                            display_list,
+                            cmd_idx,
                             group_slice,
+                            *bounds,
                             is_opaque_isolated_normal,
                             mask_vis,
                         )?;
@@ -1122,20 +1132,37 @@ impl<'a> SlideConverter<'a> {
                         let group_clip_len = self.clip_stack.len();
                         self.flatten_commands_group(group_slice, mask.as_ref(), *bounds, backdrop)?;
                         if !surviving_native_texts.is_empty() {
-                            self.isolated_scope_stack.push(IsolatedScope {
-                                body_start_idx: cmd_idx + 1,
-                                pop_idx: end_idx,
-                                clip_len_before_push: group_clip_len,
-                                bounds: *bounds,
-                                backdrop: None,
-                                backdrop_index: None,
-                            });
+                            let mut active_scope_key: Option<(usize, usize)> = None;
                             let mut emit_err = None;
-                            for rel_idx in surviving_native_texts {
-                                if let RenderCommand::DrawGlyphRun(run) = &group_slice[rel_idx] {
+                            for planned in surviving_native_texts {
+                                let key = (planned.scope_body_start, planned.scope_pop_idx);
+                                if active_scope_key != Some(key) {
+                                    if active_scope_key.is_some() {
+                                        self.isolated_scope_stack.pop();
+                                        self.clip_stack.truncate(group_clip_len);
+                                        self.shared_clip_stack = None;
+                                    }
+                                    for &clip_abs in &planned.scope_extra_clips {
+                                        self.clip_stack.push(&commands[clip_abs]);
+                                    }
+                                    self.shared_clip_stack = None;
+                                    let clip_len_before = self.clip_stack.len();
+                                    self.isolated_scope_stack.push(IsolatedScope {
+                                        body_start_idx: planned.scope_body_start,
+                                        pop_idx: planned.scope_pop_idx,
+                                        clip_len_before_push: clip_len_before,
+                                        bounds: planned.scope_bounds,
+                                        backdrop: None,
+                                        backdrop_index: None,
+                                    });
+                                    active_scope_key = Some(key);
+                                }
+                                if let RenderCommand::DrawGlyphRun(run) =
+                                    &group_slice[planned.rel_idx]
+                                {
                                     if let Err(err) = self.emit_native_only_glyph_run(
                                         commands,
-                                        cmd_idx + rel_idx,
+                                        cmd_idx + planned.rel_idx,
                                         run,
                                     ) {
                                         emit_err = Some(err);
@@ -1143,7 +1170,11 @@ impl<'a> SlideConverter<'a> {
                                     }
                                 }
                             }
-                            self.isolated_scope_stack.pop();
+                            if active_scope_key.is_some() {
+                                self.isolated_scope_stack.pop();
+                                self.clip_stack.truncate(group_clip_len);
+                                self.shared_clip_stack = None;
+                            }
                             if let Some(err) = emit_err {
                                 return Err(err);
                             }
@@ -1185,7 +1216,10 @@ impl<'a> SlideConverter<'a> {
                     {
                         let group_slice = &commands[cmd_idx..g_end];
                         self.plan_flattened_group_native_texts(
+                            display_list,
+                            cmd_idx,
                             group_slice,
+                            self.page_rect,
                             false,
                             SoftMaskVisibility::Unbounded,
                         )?;
@@ -1212,7 +1246,10 @@ impl<'a> SlideConverter<'a> {
                 if let Some(end_idx) = Self::find_matching_pop_clip(commands, cmd_idx) {
                     let group_slice = &commands[cmd_idx..=end_idx];
                     self.plan_flattened_group_native_texts(
+                        display_list,
+                        cmd_idx,
                         group_slice,
+                        self.page_rect,
                         false,
                         SoftMaskVisibility::Unbounded,
                     )?;
@@ -1325,16 +1362,12 @@ impl<'a> SlideConverter<'a> {
                 "PPTX overprinting native-only text has non-finite bounds and cannot resolve backdrop color".into(),
             ));
         };
-        let mut target_rect = match intersect_rect(bounds, self.page_rect) {
-            Some(r) => r,
-            None => {
-                // Off-page text: resolve against the empty scope backdrop.
-                return resolve_overprint_on_premul_rgba(empty_bg_rgba, &op, effective_alpha);
-            }
+        let Some(target_rect) = intersect_rect(bounds, self.page_rect)
+            .and_then(|r| tighten_rect_to_clips(r, &self.clip_stack))
+        else {
+            // Fully clipped or off-page (caller skips emitting invisible runs).
+            return Ok(((0, 0, 0), 0.0));
         };
-        if let Some(tightened) = tighten_rect_to_clips(target_rect, &self.clip_stack) {
-            target_rect = tightened;
-        }
 
         let (uniform_rgb, uniform_alpha) = if cmd_idx <= backdrop_start_idx {
             resolve_overprint_on_premul_rgba(empty_bg_rgba, &op, effective_alpha)?
@@ -1479,7 +1512,11 @@ impl<'a> SlideConverter<'a> {
                         .into_iter()
                         .filter_map(|id| {
                             let item = &index.items[id];
-                            (item.start < rel_limit).then_some((
+                            (item.start < rel_limit
+                                && item
+                                    .bounds
+                                    .is_none_or(|b| intersect_rect(b, target_rect).is_some()))
+                            .then_some((
                                 backdrop_start_idx + item.start,
                                 (backdrop_start_idx + item.end).min(cmd_idx - 1),
                             ))
@@ -1494,8 +1531,11 @@ impl<'a> SlideConverter<'a> {
                         .into_iter()
                         .filter_map(|id| {
                             let item = &index.items[id];
-                            (item.start < cmd_idx)
-                                .then_some((item.start, item.end.min(cmd_idx - 1)))
+                            (item.start < cmd_idx
+                                && item
+                                    .bounds
+                                    .is_none_or(|b| intersect_rect(b, target_rect).is_some()))
+                            .then_some((item.start, item.end.min(cmd_idx - 1)))
                         })
                         .collect()
                 };
@@ -1619,20 +1659,31 @@ impl<'a> SlideConverter<'a> {
         self.native_only_texts
             .visit_overlapping(Some(target_rect), &mut self.stats, |_, rec| {
                 if overlap_err.is_none() && rec.cmd_idx >= backdrop_start_idx {
-                    if rec.resolved_alpha < 1.0 - 1e-3 {
-                        overlap_err = Some(zpdf_core::Error::StreamDecode(
-                            "PPTX overprinting native-only text overlaps earlier translucent native-only text".into(),
-                        ));
+                    let rec_a = (rec.resolved_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let rec_px = if rec_a == 255 {
+                        [rec.resolved_rgb.0, rec.resolved_rgb.1, rec.resolved_rgb.2, 255]
+                    } else if rec_a == 0 {
+                        [0, 0, 0, 0]
                     } else {
-                        let over_text = resolve_overprint_color_on_rgb(
-                            rec.resolved_rgb,
-                            &op,
-                            effective_alpha,
-                        );
-                        if over_text != uniform_rgb || uniform_alpha_u8 != 255 {
-                            overlap_err = Some(zpdf_core::Error::StreamDecode(
-                                "PPTX overprinting native-only text overlaps earlier native-only text with a different resolved color".into(),
-                            ));
+                        let a_f = rec_a as f64 / 255.0;
+                        [
+                            (rec.resolved_rgb.0 as f64 * a_f).round() as u8,
+                            (rec.resolved_rgb.1 as f64 * a_f).round() as u8,
+                            (rec.resolved_rgb.2 as f64 * a_f).round() as u8,
+                            rec_a,
+                        ]
+                    };
+                    match resolve_overprint_on_premul_rgba(rec_px, &op, effective_alpha) {
+                        Ok((over_rgb, over_alpha)) => {
+                            let over_a_u8 = (over_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+                            if over_rgb != uniform_rgb || over_a_u8 != uniform_alpha_u8 {
+                                overlap_err = Some(zpdf_core::Error::StreamDecode(
+                                    "PPTX overprinting native-only text overlaps earlier native-only text with a different resolved color".into(),
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            overlap_err = Some(err);
                         }
                     }
                 }
@@ -1652,6 +1703,11 @@ impl<'a> SlideConverter<'a> {
         glyph_run: &zpdf_display_list::GlyphRun,
     ) -> Result<()> {
         let bounds = native_text_ink_bounds(glyph_run);
+        if glyph_run.overprint.is_some_and(|op| op.active != 0)
+            && !is_rect_visible_under_clips(bounds, &self.clip_stack, self.page_rect)
+        {
+            return Ok(());
+        }
         let (paint_override, resolved_rgb, resolved_alpha, is_opaque_black, is_opaque_white) =
             if let Some(op) = glyph_run.overprint.filter(|op| op.active != 0) {
                 let (rgb, alpha) =
@@ -1761,29 +1817,110 @@ impl<'a> SlideConverter<'a> {
         self.removed_element_slots.clear();
     }
 
-    /// Inspect a group that is about to be rasterized via `CpuRenderer` for any
-    /// visible metrics-only (`!has_font_data()`) `DrawGlyphRun` commands that
-    /// `CpuRenderer` would silently skip.
-    ///
-    /// For an opaque isolated Normal group flattened solely because of inner
-    /// overprint/blend operations, returns the relative indices of unclipped
-    /// metrics-only glyph runs whose color is preserved by all subsequent
-    /// overlapping commands inside the group so they can be emitted as native
-    /// `TextBox` elements immediately after the flattened image. Returns `Err`
-    /// whenever flattening would drop or corrupt outline-less text.
-    fn plan_flattened_group_native_texts(
+    fn check_flattened_slice_missing_outlines(
         &self,
         group_cmds: &[RenderCommand],
+        initial_clips: &[&RenderCommand],
+        visible_region: Rect,
+    ) -> Result<()> {
+        let mut clips: Vec<&RenderCommand> = initial_clips.to_vec();
+        let mut idx = 0usize;
+        while idx < group_cmds.len() {
+            let cmd = &group_cmds[idx];
+            match cmd {
+                RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                    clips.push(cmd);
+                    idx += 1;
+                }
+                RenderCommand::PopClip => {
+                    clips.pop();
+                    idx += 1;
+                }
+                RenderCommand::PushBlendGroup { alpha, mask, .. } => {
+                    let sub_vis =
+                        soft_mask_visibility(mask.as_ref(), self.page_rect, self.font_cache);
+                    if !alpha.is_finite()
+                        || *alpha <= 0.0
+                        || matches!(sub_vis, SoftMaskVisibility::Empty)
+                    {
+                        if let Some(sub_end) = Self::find_matching_pop_blend(group_cmds, idx) {
+                            idx = sub_end + 1;
+                        } else {
+                            break;
+                        }
+                    } else if matches!(sub_vis, SoftMaskVisibility::MissingOutlines) {
+                        let sub_end = Self::find_matching_pop_blend(group_cmds, idx)
+                            .unwrap_or(group_cmds.len() - 1);
+                        if group_has_visible_paint(
+                            &group_cmds[idx..=sub_end],
+                            &clips,
+                            visible_region,
+                            self.font_cache,
+                        ) {
+                            return Err(zpdf_core::Error::StreamDecode(
+                                "PPTX soft mask contains text without font outlines and cannot be rendered faithfully".into(),
+                            ));
+                        }
+                        idx = sub_end + 1;
+                    } else {
+                        idx += 1;
+                    }
+                }
+                RenderCommand::DrawGlyphRun(run)
+                    if is_visible_native_only_glyph_run(cmd, self.font_cache)
+                        && is_rect_visible_under_clips(
+                            native_text_ink_bounds(run),
+                            &clips,
+                            visible_region,
+                        ) =>
+                {
+                    return Err(zpdf_core::Error::StreamDecode(
+                        "PPTX flattened group contains native-only text without font outlines and cannot be rendered faithfully".into(),
+                    ));
+                }
+                _ => {
+                    idx += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inspect a group that is about to be rasterized via `CpuRenderer` for any
+    /// visible metrics-only (`!has_font_data()`) `DrawGlyphRun` commands (or
+    /// nested soft masks lacking font outlines) that `CpuRenderer` would
+    /// silently skip.
+    ///
+    /// For an opaque isolated Normal group flattened solely because of inner
+    /// overprint/blend operations, returns the surviving ordinary metrics-only
+    /// glyph runs together with their innermost enclosing isolated Normal scope
+    /// so they can be emitted as native `TextBox` elements immediately after the
+    /// flattened image. Nested Type 3 / pattern artwork runs and unfaithful
+    /// overlaps return `Err`.
+    fn plan_flattened_group_native_texts(
+        &self,
+        display_list: &DisplayList,
+        group_start_idx: usize,
+        group_cmds: &[RenderCommand],
+        outer_bounds: Rect,
         is_opaque_isolated_normal: bool,
         outer_mask_vis: SoftMaskVisibility,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<Vec<PlannedNativeText>> {
         if matches!(outer_mask_vis, SoftMaskVisibility::Empty) {
             return Ok(Vec::new());
         }
-        let has_native_only = group_cmds
-            .iter()
-            .any(|c| is_visible_native_only_glyph_run(c, self.font_cache));
-        if !has_native_only {
+        let has_native_or_missing_mask = group_cmds.iter().any(|c| {
+            is_visible_native_only_glyph_run(c, self.font_cache)
+                || matches!(
+                    c,
+                    RenderCommand::PushBlendGroup { mask: Some(m), .. }
+                        if matches!(
+                            soft_mask_visibility(Some(m), self.page_rect, self.font_cache),
+                            SoftMaskVisibility::MissingOutlines
+                        )
+                )
+        });
+        if !has_native_or_missing_mask {
             return Ok(Vec::new());
         }
 
@@ -1793,66 +1930,34 @@ impl<'a> SlideConverter<'a> {
                 Some(r) => r,
                 None => return Ok(Vec::new()),
             },
-            SoftMaskVisibility::Unbounded => self.page_rect,
+            SoftMaskVisibility::Unbounded | SoftMaskVisibility::MissingOutlines => self.page_rect,
         };
 
         if !is_opaque_isolated_normal {
-            let mut clips: Vec<&RenderCommand> = self.clip_stack.clone();
-            let mut idx = 0usize;
-            while idx < group_cmds.len() {
-                let cmd = &group_cmds[idx];
-                match cmd {
-                    RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
-                        clips.push(cmd);
-                        idx += 1;
-                    }
-                    RenderCommand::PopClip => {
-                        clips.pop();
-                        idx += 1;
-                    }
-                    RenderCommand::PushBlendGroup { alpha, mask, .. }
-                        if !alpha.is_finite()
-                            || *alpha <= 0.0
-                            || matches!(
-                                soft_mask_visibility(mask.as_ref(), self.font_cache),
-                                SoftMaskVisibility::Empty
-                            ) =>
-                    {
-                        if let Some(sub_end) = Self::find_matching_pop_blend(group_cmds, idx) {
-                            idx = sub_end + 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    RenderCommand::DrawGlyphRun(run)
-                        if is_visible_native_only_glyph_run(cmd, self.font_cache)
-                            && is_rect_visible_under_clips(
-                                native_text_ink_bounds(run),
-                                &clips,
-                                visible_region,
-                            ) =>
-                    {
-                        return Err(zpdf_core::Error::StreamDecode(
-                            "PPTX flattened group contains native-only text without font outlines and cannot be rendered faithfully".into(),
-                        ));
-                    }
-                    _ => {
-                        idx += 1;
-                    }
-                }
-            }
+            self.check_flattened_slice_missing_outlines(
+                group_cmds,
+                &self.clip_stack,
+                visible_region,
+            )?;
             return Ok(Vec::new());
         }
 
         // Opaque isolated Normal group: walk its body (skipping outer Push/Pop).
         struct InnerNativeText {
-            rel_idx: usize,
+            planned: PlannedNativeText,
             bounds: Option<Rect>,
             is_opaque_black: bool,
             is_opaque_white: bool,
         }
 
+        // Track active clips pushed inside `group_cmds` (by absolute command index)
+        // alongside the full clip stack so child isolated scopes carry their exact
+        // outer-group clip prefix when emitted.
         let mut clips: Vec<&RenderCommand> = self.clip_stack.clone();
+        let mut extra_clip_indices: Vec<usize> = Vec::new();
+        let outer_pop_abs = group_start_idx + group_cmds.len().saturating_sub(1);
+        let mut scope_stack: Vec<(usize, usize, Rect, Vec<usize>)> =
+            vec![(group_start_idx + 1, outer_pop_abs, outer_bounds, Vec::new())];
         let mut inner_texts: Vec<InnerNativeText> = Vec::new();
         let end_body = group_cmds.len().saturating_sub(1);
         let mut rel = 1usize;
@@ -1861,10 +1966,12 @@ impl<'a> SlideConverter<'a> {
             match cmd {
                 RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
                     clips.push(cmd);
+                    extra_clip_indices.push(group_start_idx + rel);
                     rel += 1;
                 }
                 RenderCommand::PopClip => {
                     clips.pop();
+                    extra_clip_indices.pop();
                     rel += 1;
                 }
                 RenderCommand::PushBlendGroup {
@@ -1896,8 +2003,23 @@ impl<'a> SlideConverter<'a> {
                         ));
                     };
                     let sub_slice = &group_cmds[rel..=sub_end];
-                    let sub_mask_vis = soft_mask_visibility(mask.as_ref(), self.font_cache);
+                    let sub_mask_vis =
+                        soft_mask_visibility(mask.as_ref(), self.page_rect, self.font_cache);
                     if group_alpha <= 0.0 || matches!(sub_mask_vis, SoftMaskVisibility::Empty) {
+                        rel = sub_end + 1;
+                        continue;
+                    }
+                    if matches!(sub_mask_vis, SoftMaskVisibility::MissingOutlines) {
+                        if group_has_visible_paint(
+                            sub_slice,
+                            &clips,
+                            visible_region,
+                            self.font_cache,
+                        ) {
+                            return Err(zpdf_core::Error::StreamDecode(
+                                "PPTX soft mask contains text without font outlines and cannot be rendered faithfully".into(),
+                            ));
+                        }
                         rel = sub_end + 1;
                         continue;
                     }
@@ -1918,16 +2040,27 @@ impl<'a> SlideConverter<'a> {
                                 ) || command_has_renderable_overprint(c, self.font_cache)
                             });
                     if sub_is_transparent_normal {
+                        if *isolated {
+                            scope_stack.push((
+                                group_start_idx + rel + 1,
+                                group_start_idx + sub_end,
+                                *bounds,
+                                extra_clip_indices.clone(),
+                            ));
+                        }
                         rel += 1;
                         continue;
                     }
-                    if sub_slice
-                        .iter()
-                        .any(|c| is_visible_native_only_glyph_run(c, self.font_cache))
-                    {
-                        return Err(zpdf_core::Error::StreamDecode(
-                            "PPTX nested flattened group contains native-only text without font outlines and cannot be rendered faithfully".into(),
-                        ));
+                    let sub_visible_region = match sub_mask_vis {
+                        SoftMaskVisibility::Bounded(mr) => intersect_rect(mr, visible_region),
+                        _ => Some(visible_region),
+                    };
+                    if let Some(sub_vis_rect) = sub_visible_region {
+                        self.check_flattened_slice_missing_outlines(
+                            sub_slice,
+                            &clips,
+                            sub_vis_rect,
+                        )?;
                     }
                     if !inner_texts.is_empty() {
                         let sub_bounds =
@@ -1960,6 +2093,14 @@ impl<'a> SlideConverter<'a> {
                     rel = sub_end + 1;
                 }
                 RenderCommand::PopBlendGroup => {
+                    let abs_idx = group_start_idx + rel;
+                    if scope_stack.len() > 1
+                        && scope_stack
+                            .last()
+                            .is_some_and(|&(_, pop_abs, _, _)| pop_abs == abs_idx)
+                    {
+                        scope_stack.pop();
+                    }
                     rel += 1;
                 }
                 RenderCommand::DrawGlyphRun(run)
@@ -1970,17 +2111,36 @@ impl<'a> SlideConverter<'a> {
                         rel += 1;
                         continue;
                     }
+                    let abs_idx = group_start_idx + rel;
+                    if display_list.is_in_type3_glyph_range(abs_idx)
+                        || display_list.is_in_pattern_range(abs_idx)
+                    {
+                        return Err(zpdf_core::Error::StreamDecode(
+                            "PPTX glyph artwork contains nested text without font outlines and cannot be rasterized".into(),
+                        ));
+                    }
                     if clip_stack_constrains_rect_for(&clips, bounds) {
                         return Err(zpdf_core::Error::StreamDecode(
                             "PPTX isolated group clips native-only text without font outlines and cannot be rendered faithfully".into(),
                         ));
                     }
+                    let (scope_body_start, scope_pop_idx, scope_bounds, scope_extra_clips) =
+                        scope_stack
+                            .last()
+                            .expect("outer scope always present")
+                            .clone();
                     // Surviving native-only runs are emitted after the Form PNG
                     // in their exact original source order, so overlapping runs
                     // with different colors preserve relative Z-order naturally
                     // whenever no raster paint crosses between them.
                     inner_texts.push(InnerNativeText {
-                        rel_idx: rel,
+                        planned: PlannedNativeText {
+                            rel_idx: rel,
+                            scope_body_start,
+                            scope_pop_idx,
+                            scope_bounds,
+                            scope_extra_clips,
+                        },
                         bounds,
                         is_opaque_black: glyph_run_is_opaque_black(run),
                         is_opaque_white: glyph_run_is_opaque_white(run),
@@ -2041,7 +2201,7 @@ impl<'a> SlideConverter<'a> {
             }
         }
 
-        Ok(inner_texts.into_iter().map(|t| t.rel_idx).collect())
+        Ok(inner_texts.into_iter().map(|t| t.planned).collect())
     }
 
     fn clip_stack_constrains_commands(&self, cmds: &[RenderCommand]) -> bool {
@@ -2549,7 +2709,6 @@ impl<'a> SlideConverter<'a> {
         group_bounds: Rect,
         backdrop_range: Option<(&[RenderCommand], usize, usize)>,
     ) -> Result<()> {
-        use zpdf_display_list::SoftMaskKind;
         use zpdf_render::{PageRenderInfo, RenderBackend};
 
         let fallback_bounds =
@@ -2559,22 +2718,20 @@ impl<'a> SlideConverter<'a> {
             CommandBounds::Known(r) => Rect::new(r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0),
             CommandBounds::Unknown => fallback_bounds,
         };
-        let mut raw_bounds = match mask {
-            Some(mask) if mask.kind == SoftMaskKind::Alpha && mask.transfer.is_none() => {
-                match compute_commands_bounds(&mask.commands.commands, mask.offset, self.font_cache)
-                {
-                    CommandBounds::Empty => return Ok(()),
-                    CommandBounds::Known(m) => {
-                        let padded = Rect::new(m.x0 - 1.0, m.y0 - 1.0, m.x1 + 1.0, m.y1 + 1.0);
-                        let Some(both) = intersect_rect(draw_rect, padded) else {
-                            return Ok(());
-                        };
-                        both
-                    }
-                    CommandBounds::Unknown => draw_rect,
-                }
+        let mut raw_bounds = match soft_mask_visibility(mask, self.page_rect, self.font_cache) {
+            SoftMaskVisibility::Empty => return Ok(()),
+            SoftMaskVisibility::MissingOutlines => {
+                return Err(zpdf_core::Error::StreamDecode(
+                    "PPTX soft mask contains text without font outlines and cannot be rendered faithfully".into(),
+                ));
             }
-            _ => draw_rect,
+            SoftMaskVisibility::Bounded(padded) => {
+                let Some(both) = intersect_rect(draw_rect, padded) else {
+                    return Ok(());
+                };
+                both
+            }
+            SoftMaskVisibility::Unbounded => draw_rect,
         };
         // Tighten to every active caller clip and any leading clip inside the
         // group so disjoint clipped artwork exits immediately and partial clips
@@ -3938,6 +4095,7 @@ fn type3_glyph_range_starting_at(display_list: &DisplayList, cmd_idx: usize) -> 
 /// the group, while outline-less metrics-only fonts remain native text.
 fn compute_isolated_inner_non_normal_blends(
     commands: &[RenderCommand],
+    page_rect: Rect,
     font_cache: &FontCache,
 ) -> Vec<bool> {
     let mut flags = vec![false; commands.len()];
@@ -3974,7 +4132,7 @@ fn compute_isolated_inner_non_normal_blends(
                 if zero_alpha_depth > 0
                     || group_alpha <= 0.0
                     || matches!(
-                        soft_mask_visibility(mask.as_ref(), font_cache),
+                        soft_mask_visibility(mask.as_ref(), page_rect, font_cache),
                         SoftMaskVisibility::Empty
                     )
                 {
@@ -4102,8 +4260,6 @@ impl NonNormalBlendIndex {
         font_cache: &FontCache,
         enabled: bool,
     ) -> Self {
-        use zpdf_display_list::SoftMaskKind;
-
         let mut index = Self::empty(page_rect);
         if !enabled {
             return index;
@@ -4160,30 +4316,19 @@ impl NonNormalBlendIndex {
                                             )),
                                             CommandBounds::Unknown => Some(fallback),
                                         };
-                                        let effective = draw_rect.and_then(|dr| match mask {
-                                            Some(m)
-                                                if m.kind == SoftMaskKind::Alpha
-                                                    && m.transfer.is_none() =>
-                                            {
-                                                match compute_commands_bounds(
-                                                    &m.commands.commands,
-                                                    m.offset,
-                                                    font_cache,
-                                                ) {
-                                                    CommandBounds::Empty => None,
-                                                    CommandBounds::Known(mr) => {
-                                                        let padded = Rect::new(
-                                                            mr.x0 - 1.0,
-                                                            mr.y0 - 1.0,
-                                                            mr.x1 + 1.0,
-                                                            mr.y1 + 1.0,
-                                                        );
-                                                        intersect_rect(dr, padded)
-                                                    }
-                                                    CommandBounds::Unknown => Some(dr),
+                                        let effective = draw_rect.and_then(|dr| {
+                                            match soft_mask_visibility(
+                                                mask.as_ref(),
+                                                page_rect,
+                                                font_cache,
+                                            ) {
+                                                SoftMaskVisibility::Empty => None,
+                                                SoftMaskVisibility::Bounded(padded) => {
+                                                    intersect_rect(dr, padded)
                                                 }
+                                                SoftMaskVisibility::Unbounded
+                                                | SoftMaskVisibility::MissingOutlines => Some(dr),
                                             }
-                                            _ => Some(dr),
                                         });
                                         let mut effective_opt =
                                             effective.and_then(|r| intersect_rect(r, clip_rect));
@@ -4414,23 +4559,205 @@ fn command_has_renderable_overprint(cmd: &RenderCommand, font_cache: &FontCache)
     }
 }
 
+struct PlannedNativeText {
+    rel_idx: usize,
+    scope_body_start: usize,
+    scope_pop_idx: usize,
+    scope_bounds: Rect,
+    scope_extra_clips: Vec<usize>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SoftMaskVisibility {
-    /// Proven zero coverage everywhere (empty `/S /Alpha` mask with no transfer function).
+    /// Proven zero coverage everywhere (empty `/S /Alpha` mask with no transfer
+    /// function and no outline-less mask text).
     Empty,
     /// Non-zero coverage is confined within `Rect`.
     Bounded(Rect),
     /// Coverage may extend anywhere (luminosity mask, transfer function, or unknown bounds).
     Unbounded,
+    /// Mask contains visible outline-less (`!has_font_data()`) text that
+    /// `CpuRenderer` would skip, so the mask cannot be rasterized faithfully.
+    MissingOutlines,
+}
+
+fn shift_rect(r: Rect, dx: f64, dy: f64) -> Option<Rect> {
+    if !(dx.is_finite() && dy.is_finite()) {
+        return None;
+    }
+    Some(Rect::new(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy))
+}
+
+fn commands_have_visible_native_only_text(
+    commands: &[RenderCommand],
+    offset: (f32, f32),
+    visible_region: Rect,
+    font_cache: &FontCache,
+    depth: u8,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let dx = offset.0 as f64;
+    let dy = offset.1 as f64;
+    let mut clips: Vec<&RenderCommand> = Vec::new();
+    let mut idx = 0usize;
+    while idx < commands.len() {
+        let cmd = &commands[idx];
+        match cmd {
+            RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                clips.push(cmd);
+                idx += 1;
+            }
+            RenderCommand::PopClip => {
+                clips.pop();
+                idx += 1;
+            }
+            RenderCommand::PushBlendGroup { alpha, mask, .. } => {
+                if !alpha.is_finite() || *alpha <= 0.0 {
+                    if let Some(sub_end) = SlideConverter::find_matching_pop_blend(commands, idx) {
+                        idx = sub_end + 1;
+                        continue;
+                    }
+                    break;
+                }
+                if let Some(m) = mask {
+                    let child_off = (offset.0 + m.offset.0, offset.1 + m.offset.1);
+                    if commands_have_visible_native_only_text(
+                        &m.commands.commands,
+                        child_off,
+                        visible_region,
+                        font_cache,
+                        depth + 1,
+                    ) {
+                        return true;
+                    }
+                    if m.kind == zpdf_display_list::SoftMaskKind::Alpha
+                        && m.transfer.is_none()
+                        && matches!(
+                            compute_commands_bounds(&m.commands.commands, child_off, font_cache),
+                            CommandBounds::Empty
+                        )
+                    {
+                        if let Some(sub_end) =
+                            SlideConverter::find_matching_pop_blend(commands, idx)
+                        {
+                            idx = sub_end + 1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                idx += 1;
+            }
+            RenderCommand::DrawGlyphRun(run)
+                if is_visible_native_only_glyph_run(cmd, font_cache) =>
+            {
+                let visible = match native_text_ink_bounds(run) {
+                    Some(r) => tighten_rect_to_clips(r, &clips)
+                        .and_then(|clipped| shift_rect(clipped, dx, dy))
+                        .is_some_and(|b| intersect_rect(b, visible_region).is_some()),
+                    None => !matches!(active_clip_rect_for(&clips), ActiveClip::Rect(None)),
+                };
+                if visible {
+                    return true;
+                }
+                idx += 1;
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+    false
+}
+
+fn group_has_visible_paint(
+    group_cmds: &[RenderCommand],
+    outer_clips: &[&RenderCommand],
+    visible_region: Rect,
+    font_cache: &FontCache,
+) -> bool {
+    let mut clips: Vec<&RenderCommand> = outer_clips.to_vec();
+    let mut idx = 0usize;
+    while idx < group_cmds.len() {
+        let cmd = &group_cmds[idx];
+        match cmd {
+            RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                clips.push(cmd);
+                idx += 1;
+            }
+            RenderCommand::PopClip => {
+                clips.pop();
+                idx += 1;
+            }
+            RenderCommand::PushBlendGroup { alpha, mask, .. } if idx > 0 => {
+                if !alpha.is_finite()
+                    || *alpha <= 0.0
+                    || matches!(
+                        soft_mask_visibility(mask.as_ref(), visible_region, font_cache),
+                        SoftMaskVisibility::Empty
+                    )
+                {
+                    if let Some(sub_end) = SlideConverter::find_matching_pop_blend(group_cmds, idx)
+                    {
+                        idx = sub_end + 1;
+                        continue;
+                    }
+                    break;
+                }
+                idx += 1;
+            }
+            RenderCommand::DrawGlyphRun(run)
+                if is_visible_native_only_glyph_run(cmd, font_cache) =>
+            {
+                if is_rect_visible_under_clips(native_text_ink_bounds(run), &clips, visible_region)
+                {
+                    return true;
+                }
+                idx += 1;
+            }
+            other if is_visible_paint_command(other, font_cache) => {
+                match compute_commands_bounds(std::slice::from_ref(other), (0.0, 0.0), font_cache) {
+                    CommandBounds::Empty => {}
+                    CommandBounds::Known(r) => {
+                        if is_rect_visible_under_clips(Some(r), &clips, visible_region) {
+                            return true;
+                        }
+                    }
+                    CommandBounds::Unknown => {
+                        if !matches!(active_clip_rect_for(&clips), ActiveClip::Rect(None)) {
+                            return true;
+                        }
+                    }
+                }
+                idx += 1;
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+    false
 }
 
 fn soft_mask_visibility(
     mask: Option<&zpdf_display_list::SoftMask>,
+    page_rect: Rect,
     font_cache: &FontCache,
 ) -> SoftMaskVisibility {
     let Some(mask) = mask else {
         return SoftMaskVisibility::Unbounded;
     };
+    if commands_have_visible_native_only_text(
+        &mask.commands.commands,
+        mask.offset,
+        page_rect,
+        font_cache,
+        0,
+    ) {
+        return SoftMaskVisibility::MissingOutlines;
+    }
     if mask.kind != zpdf_display_list::SoftMaskKind::Alpha || mask.transfer.is_some() {
         return SoftMaskVisibility::Unbounded;
     }
@@ -4500,7 +4827,11 @@ fn track_blend_non_passthrough(cmd: &RenderCommand, stack: &mut Vec<bool>) {
 /// pixel, matching `CpuRenderer::overprint_merge` (`out_a = ba + a * (1 - ba)`):
 /// - `px[3] == 0`: transparent isolated-Form backdrop (white paper inks, `out_a = alpha`)
 /// - `px[3] == 255`: opaque backdrop (resolved color over `px[0..3]`, `out_a = 1.0`)
-/// - `0 < px[3] < 255`: partially translucent Form backdrop (cannot be represented faithfully)
+/// - `0 < px[3] < 255`: unpremultiply the translucent Form backdrop and solve
+///   for the exact SourceOver `TextBox` color `C_tb` with opacity `alpha` that
+///   matches `out_a * C_out + (1 - out_a) * P` over every outer page color `P`.
+///   Opaque overprints (`alpha == 1`) always yield `(C_out, 1.0)`; translucent
+///   overprints succeed iff `C_tb` lies in `[0, 1]^3`, otherwise return `Err`.
 fn resolve_overprint_on_premul_rgba(
     px: [u8; 4],
     op: &zpdf_display_list::Overprint,
@@ -4520,9 +4851,54 @@ fn resolve_overprint_on_premul_rgba(
             resolve_overprint_color_on_rgb((px[0], px[1], px[2]), op, eff_a),
             1.0,
         )),
-        _ => Err(zpdf_core::Error::StreamDecode(
-            "PPTX overprinting native-only text without font outlines spans a translucent backdrop and cannot be rendered faithfully".into(),
-        )),
+        a_u8 => {
+            let a = eff_a as f64;
+            if a <= 0.0 {
+                return Ok(((0, 0, 0), 0.0));
+            }
+            let ba = a_u8 as f64 / 255.0;
+            let bg = [
+                (px[0] as f64 / a_u8 as f64).clamp(0.0, 1.0),
+                (px[1] as f64 / a_u8 as f64).clamp(0.0, 1.0),
+                (px[2] as f64 / a_u8 as f64).clamp(0.0, 1.0),
+            ];
+            let (bc, bm, by, bk) = zpdf_core::rgb_to_cmyk_naive(bg[0], bg[1], bg[2]);
+            let bd = [bc, bm, by, bk];
+            let mut res = [0.0f64; 4];
+            for i in 0..4 {
+                let tgt = if op.paints(i) {
+                    if op.cmyk[i].is_finite() {
+                        op.cmyk[i].clamp(0.0, 1.0) as f64
+                    } else {
+                        0.0
+                    }
+                } else {
+                    bd[i]
+                };
+                res[i] = bd[i] + a * (tgt - bd[i]);
+            }
+            let (rr, rg, rb) = zpdf_core::cmyk_to_rgb_naive(res[0], res[1], res[2], res[3]);
+            let enc = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+            if eff_a >= 1.0 - 1e-4 {
+                // Opaque overprint replaces the translucent Form pixel with an
+                // opaque pixel (`out_a = 1.0`), directly representable as an
+                // opaque `TextBox` on top of the translucent Form shape.
+                return Ok(((enc(rr), enc(rg), enc(rb)), 1.0));
+            }
+            let out_a = ba + a * (1.0 - ba);
+            let out_rgb = [rr, rg, rb];
+            let mut tb_rgb = [0u8; 3];
+            for k in 0..3 {
+                let c_tb = (out_a * out_rgb[k] - (1.0 - a) * ba * bg[k]) / a;
+                if !(-1e-3..=1.0 + 1e-3).contains(&c_tb) {
+                    return Err(zpdf_core::Error::StreamDecode(
+                        "PPTX overprinting native-only text without font outlines spans a translucent backdrop that cannot be represented faithfully".into(),
+                    ));
+                }
+                tb_rgb[k] = enc(c_tb);
+            }
+            Ok(((tb_rgb[0], tb_rgb[1], tb_rgb[2]), eff_a))
+        }
     }
 }
 
@@ -15910,5 +16286,628 @@ mod export_tests {
             "large sheet BackdropIndex replay must visit only the cyan rect (<= 200), got {}",
             stats_big.backdrop_command_visits
         );
+    }
+
+    #[test]
+    fn unmapped_type3_nested_outline_less_helvetica_in_flattened_form_matches_page_behavior() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        let run_form = |form_ops: &[u8]| {
+            // Opaque isolated Normal Form painting an overprinted path (forcing the Form
+            // to flatten) followed by an unmapped Type 3 icon drawing outline-less Helvetica.
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+                  /Resources << /XObject << /Fm1 5 0 R >> >> >>"
+                    .to_vec(), // 3
+                stream("", b"/Fm1 Do"),                        // 4
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 240 120] \
+                     /Group << /Type /Group /S /Transparency /I true /K false >> \
+                     /Resources << /Font << /FT3 6 0 R >> /ExtGState << /GSop 11 0 R >> >>",
+                    form_ops,
+                ), // 5
+                b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                  /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 7 0 R /Encoding 8 0 R \
+                  /FirstChar 65 /LastChar 65 /Widths [1000] \
+                  /Resources << /Font << /FH 10 0 R >> >> >>"
+                    .to_vec(), // 6
+                b"<< /icon 9 0 R >>".to_vec(),                 // 7
+                b"<< /Type /Encoding /Differences [65 /icon] >>".to_vec(), // 8
+                stream("", b"1000 0 d0 BT /FH 800 Tf 0 0 Td (A) Tj ET"), // 9
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 10
+                b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 11
+            ]);
+            let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .expect("open pdf")
+                .with_font_provider(provider);
+            let page = doc.page(0).expect("page 0");
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+            let mut images = ImageCache::new();
+            let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                .with_document(doc.file(), &page.resources)
+                .with_fonts(&mut fonts)
+                .with_images(&mut images)
+                .interpret_with_stats(&content_bytes);
+            display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+        };
+
+        // 1. Visible icon inside flattened isolated Form must report missing outlines
+        //    rather than leaking its internal Helvetica "A" as an editable slide TextBox.
+        let visible = run_form(
+            b"0 1 1 rg 10 10 40 40 re f \
+              q /GSop gs 0 0 1 0 k 10 10 40 40 re f Q \
+              BT /FT3 60 Tf 80 20 Td (A) Tj ET",
+        );
+        assert!(
+            visible.is_err(),
+            "visible unmapped Type 3 icon inside flattened Form must error rather than leak a TextBox"
+        );
+
+        // 2. Disjointly clipped icon inside the same flattened Form skips cleanly and
+        //    emits only the flattened Form image (no TextBox).
+        let clipped = run_form(
+            b"0 1 1 rg 10 10 40 40 re f \
+              q /GSop gs 0 0 1 0 k 10 10 40 40 re f Q \
+              q 180 20 40 40 re W n BT /FT3 60 Tf 80 20 Td (A) Tj ET Q",
+        )
+        .expect("clipped unmapped Type 3 icon inside flattened Form must skip cleanly");
+        assert!(
+            clipped
+                .elements
+                .iter()
+                .all(|e| !matches!(e.base(), SlideElement::TextBox { .. })),
+            "clipped Type 3 icon must not emit any TextBox: {:?}",
+            clipped.elements
+        );
+        assert_eq!(clipped.elements.len(), 1);
+    }
+
+    #[test]
+    fn disjointly_clipped_overprint_native_text_skips_before_backdrop_sample() {
+        let page_rect = Rect::new(0.0, 0.0, 240.0, 120.0);
+        let mut fonts = FontCache::new();
+        let fid = fonts.insert(
+            "FH".into(),
+            zpdf_font::LoadedFont::new_placeholder("Helvetica".into()),
+        );
+        let make_clipped_dl = |cyan_width: f64| -> DisplayList {
+            let mut dl = DisplayList::new(page_rect);
+            let mut bg = zpdf_display_list::Path::new();
+            bg.rect(Rect::new(0.0, 0.0, cyan_width, 120.0));
+            dl.push(RenderCommand::FillPath {
+                path: bg,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::rgb(
+                    0.0, 1.0, 1.0,
+                )),
+                alpha: 1.0,
+                overprint: None,
+            });
+            // Rectangular caller clip at x in [180..220], completely disjoint from label at [20..80].
+            let mut clip_path = zpdf_display_list::Path::new();
+            clip_path.rect(Rect::new(180.0, 10.0, 220.0, 110.0));
+            dl.push(RenderCommand::PushClip {
+                path: clip_path,
+                rule: zpdf_display_list::FillRule::NonZero,
+            });
+            dl.push(RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+                font_id: fid,
+                font_size: 24.0,
+                glyphs: vec![
+                    zpdf_display_list::PositionedGlyph {
+                        glyph_id: 0,
+                        code_len: 1,
+                        code: b'H' as u32,
+                        x: 0.0,
+                        y: 0.0,
+                        advance: 30.0,
+                    },
+                    zpdf_display_list::PositionedGlyph {
+                        glyph_id: 0,
+                        code_len: 1,
+                        code: b'i' as u32,
+                        x: 30.0,
+                        y: 0.0,
+                        advance: 30.0,
+                    },
+                ],
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::gray(0.5)),
+                alpha: 1.0,
+                overprint: Some(zpdf_display_list::Overprint {
+                    cmyk: [0.0, 0.0, 0.0, 0.5],
+                    active: zpdf_display_list::Overprint::K,
+                }),
+                transform: zpdf_core::Matrix::translate(20.0, 40.0),
+                h_scale: 1.0,
+            }));
+            dl.push(RenderCommand::PopClip);
+            dl
+        };
+
+        // 1. Clipped label straddles cyan [0..50] and white [50..240]: must NOT error on
+        //    non-uniform backdrop and must emit only the cyan rectangle.
+        let slide_split = display_list_to_slide(
+            &make_clipped_dl(50.0),
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("disjointly clipped overprint text over split backdrop must skip cleanly");
+        assert_eq!(slide_split.elements.len(), 1);
+        assert!(
+            slide_split
+                .elements
+                .iter()
+                .all(|e| !matches!(e.base(), SlideElement::TextBox { .. })),
+            "clipped overprint text must not emit a TextBox: {:?}",
+            slide_split.elements
+        );
+
+        // 2. Clipped label over a uniform cyan background [0..240]: must ALSO emit no TextBox.
+        let slide_uniform = display_list_to_slide(
+            &make_clipped_dl(240.0),
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("disjointly clipped overprint text over uniform backdrop must skip cleanly");
+        assert_eq!(slide_uniform.elements.len(), 1);
+        assert!(
+            slide_uniform
+                .elements
+                .iter()
+                .all(|e| !matches!(e.base(), SlideElement::TextBox { .. })),
+            "clipped overprint text must not emit a hidden TextBox: {:?}",
+            slide_uniform.elements
+        );
+    }
+
+    #[test]
+    fn alpha_soft_mask_with_outline_less_text_errors_when_group_visible_and_skips_when_empty() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        let run_case = |mask_ops: &[u8], masked_ops: &[u8]| {
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+                  /Resources << /ExtGState << /GSsm 5 0 R >> >> >>"
+                    .to_vec(), // 3
+                stream("", masked_ops),                        // 4
+                b"<< /Type /ExtGState /SMask << /Type /Mask /S /Alpha /G 6 0 R >> >>".to_vec(), // 5
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 240 120] \
+                     /Group << /Type /Group /S /Transparency /CS /DeviceRGB /I true >> \
+                     /Resources << /Font << /FH 7 0 R >> >>",
+                    mask_ops,
+                ), // 6
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 7
+            ]);
+            let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .expect("open pdf")
+                .with_font_provider(provider);
+            let page = doc.page(0).expect("page 0");
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+            let mut images = ImageCache::new();
+            let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                .with_document(doc.file(), &page.resources)
+                .with_fonts(&mut fonts)
+                .with_images(&mut images)
+                .interpret_with_stats(&content_bytes);
+            display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+        };
+
+        // 1. `/S /Alpha` mask paints outline-less Helvetica "A" over a visible red fill:
+        //    must NOT treat the mask as Empty and silently drop the red fill.
+        let masked_red = run_case(
+            b"0 g BT /FH 60 Tf 20 20 Td (A) Tj ET",
+            b"q /GSsm gs 1 0 0 rg 0 0 240 120 re f Q",
+        );
+        assert!(
+            masked_red.is_err(),
+            "alpha soft mask with outline-less glyph over visible fill must report missing outlines"
+        );
+
+        // 2. Same mask over an empty masked group has no paint to affect: skips cleanly.
+        let masked_empty = run_case(b"0 g BT /FH 60 Tf 20 20 Td (A) Tj ET", b"q /GSsm gs Q")
+            .expect("missing-outline mask over empty group should skip cleanly");
+        assert!(masked_empty.elements.is_empty());
+
+        // 3. Mask whose outline-less Helvetica "A" is clipped out inside the mask IS empty
+        //    and legitimately hides the red fill.
+        let clipped_mask = run_case(
+            b"q 180 20 40 40 re W n 0 g BT /FH 60 Tf 20 20 Td (A) Tj ET Q",
+            b"q /GSsm gs 1 0 0 rg 0 0 240 120 re f Q",
+        )
+        .expect("alpha mask with clipped-out outline-less glyph is genuinely empty");
+        assert!(clipped_mask.elements.is_empty());
+    }
+
+    #[test]
+    fn promoted_overprint_text_inside_nested_isolated_form_resolves_in_child_scope() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        let run_nested = |child_ops: &[u8]| {
+            // Outer opaque isolated Normal Form paints a cyan rect + yellow-only overprinted
+            // path (forcing outer Form to flatten) and invokes an isolated Normal child Form.
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+                  /Resources << /XObject << /FmOuter 5 0 R >> >> >>"
+                    .to_vec(), // 3
+                stream("", b"/FmOuter Do"),                    // 4
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 240 120] \
+                     /Group << /Type /Group /S /Transparency /I true /K false >> \
+                     /Resources << /XObject << /FmChild 6 0 R >> /ExtGState << /GSop 8 0 R >> >>",
+                    b"0 1 1 rg 0 0 240 120 re f \
+                      q /GSop gs 0 0 1 0 k 10 10 40 40 re f Q \
+                      /FmChild Do",
+                ), // 5
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 240 120] \
+                     /Group << /Type /Group /S /Transparency /I true /K false >> \
+                     /Resources << /Font << /FH 7 0 R >> /ExtGState << /GSop 8 0 R >> >>",
+                    child_ops,
+                ), // 6
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 7
+                b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 8
+            ]);
+            let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .expect("open pdf")
+                .with_font_provider(provider);
+            let page = doc.page(0).expect("page 0");
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+            let mut images = ImageCache::new();
+            let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                .with_document(doc.file(), &page.resources)
+                .with_fonts(&mut fonts)
+                .with_images(&mut images)
+                .interpret_with_stats(&content_bytes);
+            display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+        };
+
+        // 1. Child isolated Form contains ONLY a gray 0.5g K-only overprinting outline-less
+        //    Helvetica label: must succeed (no "unclosed non-passthrough group" error) and
+        //    resolve against child Form's transparent backdrop => gray (128, 128, 128).
+        let slide_transparent_child =
+            run_nested(b"q /GSop gs 0.5 g BT /FH 24 Tf 80 40 Td (Child) Tj ET Q")
+                .expect("promoted overprint text inside child isolated Form must resolve cleanly");
+        assert_eq!(slide_transparent_child.elements.len(), 2);
+        assert!(matches!(
+            slide_transparent_child.elements[0].base(),
+            SlideElement::Image { .. }
+        ));
+        assert!(matches!(
+            slide_transparent_child.elements[1].base(),
+            SlideElement::TextBox {
+                text,
+                color_rgb: (128, 128, 128),
+                ..
+            } if text == "Child"
+        ));
+
+        // 2. Child isolated Form paints its own cyan rect before the same label: must
+        //    resolve against child Form's cyan backdrop => dark cyan (0, 128, 128).
+        let slide_cyan_child = run_nested(
+            b"0 1 1 rg 70 20 150 80 re f \
+              q /GSop gs 0.5 g BT /FH 24 Tf 80 40 Td (Child) Tj ET Q",
+        )
+        .expect("promoted overprint text over child Form's own cyan rect must resolve cleanly");
+        assert_eq!(slide_cyan_child.elements.len(), 2);
+        assert!(matches!(
+            slide_cyan_child.elements[1].base(),
+            SlideElement::TextBox {
+                text,
+                color_rgb: (0, 128, 128),
+                ..
+            } if text == "Child"
+        ));
+    }
+
+    #[test]
+    fn uniform_translucent_form_backdrop_allows_representable_overprint_text() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Isolated Normal Form: 50%-opaque yellow rect + opaque Y-only overprinting
+        // outline-less Helvetica label of the same yellow entirely inside it.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+              /Resources << /XObject << /Fm1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"/Fm1 Do"),                        // 4
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 240 120] \
+                 /Group << /Type /Group /S /Transparency /I true /K false >> \
+                 /Resources << /Font << /FH 6 0 R >> \
+                 /ExtGState << /GShalf 7 0 R /GSop 8 0 R >> >>",
+                b"q /GShalf gs 1 1 0 rg 10 10 220 100 re f Q \
+                  q /GSop gs 0 0 1 0 k BT /FH 24 Tf 30 40 Td (Yellow) Tj ET Q",
+            ), // 5
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 6
+            b"<< /Type /ExtGState /ca 0.5 >>".to_vec(),    // 7
+            b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 8
+        ]);
+        let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+        let doc = zpdf_document::PdfDocument::open(pdf)
+            .expect("open pdf")
+            .with_font_provider(provider);
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("opaque Y-only overprint over uniform 50%-opaque yellow must succeed");
+        assert_eq!(slide.elements.len(), 2);
+        assert!(matches!(
+            slide.elements[1],
+            SlideElement::TextBox {
+                ref text,
+                color_rgb: (255, 255, 0),
+                ..
+            } if text == "Yellow"
+        ));
+
+        // Unrepresentable translucent overprint over a 90%-opaque 50% gray backdrop
+        // (simultaneous C+K overprint at alpha=0.5 requires negative SourceOver red channel)
+        // must still be rejected.
+        let unrep_op = zpdf_display_list::Overprint {
+            cmyk: [1.0, 0.0, 0.0, 1.0],
+            active: zpdf_display_list::Overprint::C | zpdf_display_list::Overprint::K,
+        };
+        let ba = 230u8; // ~0.902
+        let premul_gray = [115, 115, 115, ba];
+        assert!(
+            resolve_overprint_on_premul_rgba(premul_gray, &unrep_op, 0.5).is_err(),
+            "out-of-gamut translucent overprint on translucent backdrop must still error"
+        );
+    }
+
+    #[test]
+    fn backdrop_index_filters_distant_global_rules_by_bounds_before_replay() {
+        let mut fonts = FontCache::new();
+        let fid = fonts.insert(
+            "FH".into(),
+            zpdf_font::LoadedFont::new_placeholder("Helvetica".into()),
+        );
+        let op_half_gray = Some(zpdf_display_list::Overprint {
+            cmyk: [0.0, 0.0, 0.0, 0.5],
+            active: zpdf_display_list::Overprint::K,
+        });
+
+        let sheet = Rect::new(0.0, 0.0, 10_000.0, 4_000.0);
+        let build_sheet = |in_isolated_form: bool| -> DisplayList {
+            let mut dl = DisplayList::new(sheet);
+            if in_isolated_form {
+                dl.push(RenderCommand::PushBlendGroup {
+                    blend_mode: zpdf_display_list::BlendMode::Normal,
+                    isolated: true,
+                    knockout: false,
+                    bounds: sheet,
+                    alpha: 1.0,
+                    mask: None,
+                });
+            }
+            // 1 uniform cyan background across the entire sheet.
+            let mut bg = zpdf_display_list::Path::new();
+            bg.rect(sheet);
+            dl.push(RenderCommand::FillPath {
+                path: bg,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::rgb(
+                    0.0, 1.0, 1.0,
+                )),
+                alpha: 1.0,
+                overprint: None,
+            });
+            // 100 long horizontal rules confined to the top of the sheet (y in [3800..3990]):
+            // each spans >16 512pt grid cells, so BackdropIndex places them in `global_items`.
+            for i in 0..100 {
+                let y = 3800.0 + i as f64 * 1.5;
+                let mut rule = zpdf_display_list::Path::new();
+                rule.rect(Rect::new(10.0, y, 9_990.0, y + 0.5));
+                dl.push(RenderCommand::FillPath {
+                    path: rule,
+                    rule: zpdf_display_list::FillRule::NonZero,
+                    paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::rgb(
+                        1.0, 0.0, 0.0,
+                    )),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+            // 100 disjoint 0.5g overprinting Helvetica labels along the bottom (y = 40).
+            for i in 0..100 {
+                dl.push(RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+                    font_id: fid,
+                    font_size: 10.0,
+                    glyphs: vec![zpdf_display_list::PositionedGlyph {
+                        glyph_id: 0,
+                        code_len: 1,
+                        code: b'L' as u32,
+                        x: 0.0,
+                        y: 0.0,
+                        advance: 10.0,
+                    }],
+                    paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::gray(0.5)),
+                    alpha: 1.0,
+                    overprint: op_half_gray,
+                    transform: zpdf_core::Matrix::translate(50.0 + i as f64 * 80.0, 40.0),
+                    h_scale: 1.0,
+                }));
+            }
+            if in_isolated_form {
+                dl.push(RenderCommand::PopBlendGroup);
+            }
+            dl
+        };
+
+        for in_isolated_form in [false, true] {
+            let dl = build_sheet(in_isolated_form);
+            let (slide, stats) = display_list_to_slide_internal(
+                &dl,
+                0,
+                &fonts,
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+                Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+                None,
+            )
+            .expect("large sheet with distant global rules and bottom labels");
+            assert_eq!(slide.elements.len(), 201);
+            for elem in &slide.elements[101..] {
+                assert!(matches!(
+                    elem.base(),
+                    SlideElement::TextBox {
+                        color_rgb: (0, 128, 128),
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(
+                stats.backdrop_command_visits, 100,
+                "in_isolated_form={in_isolated_form}: distant global rules must be filtered by bounds before replay (expected 100 cyan visits, got {})",
+                stats.backdrop_command_visits
+            );
+        }
     }
 }
