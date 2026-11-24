@@ -932,19 +932,7 @@ impl<'a> CpuRenderer<'a> {
         tiny_skia::StrokeDash::new(array, dash.phase * scale)
     }
 
-    /// Expand a display-list path stroke (including caps, joins, miter limit,
-    /// and dashes) into a filled outline in the path's own user coordinate
-    /// space.
-    ///
-    /// Used by exporters that need to apply a non-uniform transform to a
-    /// stroked path or stroked clip without distorting directional stroke
-    /// widths or dash lengths.
-    #[doc(hidden)]
-    pub fn stroke_path_to_outline(
-        path: &Path,
-        style: &StrokeStyle,
-        resolution_scale: f32,
-    ) -> Option<Path> {
+    fn path_to_skia_user_space(path: &Path) -> Option<tiny_skia::Path> {
         let mut pb = tiny_skia::PathBuilder::new();
         for elem in path {
             match elem {
@@ -961,25 +949,14 @@ impl<'a> CpuRenderer<'a> {
                 PathElement::Close => pb.close(),
             }
         }
-        let skia_path = pb.finish()?;
-        let res = resolution_scale.max(0.25);
-        let min_width = if style.width <= 0.0 { 1.0 / res } else { 0.0 };
-        let skia_stroke = Self::skia_stroke(style, 1.0, min_width);
-        // `tiny_skia::Path::stroke` does not apply `stroke.dash`; dash first
-        // identically to `Pixmap::stroke_path`.
-        let dashed_path;
-        let path_to_stroke = if let Some(ref dash) = skia_stroke.dash {
-            dashed_path = skia_path.dash(dash, res)?;
-            &dashed_path
-        } else {
-            &skia_path
-        };
-        let outlined = path_to_stroke.stroke(&skia_stroke, res)?;
+        pb.finish()
+    }
 
+    fn skia_path_to_display_list(skia_path: &tiny_skia::Path) -> Path {
         let mut out = Path::new();
         let mut cur = zpdf_core::Point::new(0.0, 0.0);
         let mut subpath_start = cur;
-        for seg in outlined.segments() {
+        for seg in skia_path.segments() {
             match seg {
                 tiny_skia::PathSegment::MoveTo(p) => {
                     let pt = zpdf_core::Point::new(p.x as f64, p.y as f64);
@@ -1021,6 +998,55 @@ impl<'a> CpuRenderer<'a> {
                 }
             }
         }
+        out
+    }
+
+    /// Apply `style`'s dash pattern to `path` in its own user coordinate space.
+    ///
+    /// Returns a clone of `path` unchanged when `style` has no active dash
+    /// pattern, or an empty [`Path`] if dashing yields no visible segments.
+    #[doc(hidden)]
+    pub fn dash_path(path: &Path, style: &StrokeStyle, resolution_scale: f32) -> Path {
+        let Some(dash) = Self::stroke_dash(style, 1.0) else {
+            return path.clone();
+        };
+        let Some(skia_path) = Self::path_to_skia_user_space(path) else {
+            return Path::new();
+        };
+        let res = resolution_scale.max(0.25);
+        let Some(dashed) = skia_path.dash(&dash, res) else {
+            return Path::new();
+        };
+        Self::skia_path_to_display_list(&dashed)
+    }
+
+    /// Expand a display-list path stroke (including caps, joins, miter limit,
+    /// and dashes) into a filled outline in the path's own user coordinate
+    /// space.
+    ///
+    /// `min_width` specifies the minimum user-space stroke width independently
+    /// of `resolution_scale` (which only controls curve flattening).
+    #[doc(hidden)]
+    pub fn stroke_path_to_outline(
+        path: &Path,
+        style: &StrokeStyle,
+        min_width: f32,
+        resolution_scale: f32,
+    ) -> Option<Path> {
+        let skia_path = Self::path_to_skia_user_space(path)?;
+        let res = resolution_scale.max(0.25);
+        let skia_stroke = Self::skia_stroke(style, 1.0, min_width.max(0.0));
+        // `tiny_skia::Path::stroke` does not apply `stroke.dash`; dash first
+        // identically to `Pixmap::stroke_path`.
+        let dashed_path;
+        let path_to_stroke = if let Some(ref dash) = skia_stroke.dash {
+            dashed_path = skia_path.dash(dash, res)?;
+            &dashed_path
+        } else {
+            &skia_path
+        };
+        let outlined = path_to_stroke.stroke(&skia_stroke, res)?;
+        let out = Self::skia_path_to_display_list(&outlined);
         (!out.is_empty()).then_some(out)
     }
 

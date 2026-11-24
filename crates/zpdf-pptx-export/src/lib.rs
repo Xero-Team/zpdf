@@ -205,12 +205,20 @@ impl<'a> SlideConverter<'a> {
             while exp_idx < expanded.len() && expanded[exp_idx].cmd_start <= cmd_idx {
                 let entry = &expanded[exp_idx];
                 exp_idx += 1;
-                if !display_list.is_in_pattern_range(entry.cmd_start)
-                    && self.convert_glyph_run(&entry.run, true)?
-                {
-                    let end = entry.cmd_end.min(commands.len());
-                    if end > cmd_idx {
-                        skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
+                if !display_list.is_in_pattern_range(entry.cmd_start) {
+                    let effective_alpha = effective_paint_alpha(&entry.run.paint, entry.run.alpha);
+                    if effective_alpha <= 0.0 {
+                        let end = entry.cmd_end.min(commands.len());
+                        if end > cmd_idx {
+                            skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
+                        }
+                    } else if effective_alpha >= 1.0 - 1e-3
+                        && self.convert_glyph_run(&entry.run, true)?
+                    {
+                        let end = entry.cmd_end.min(commands.len());
+                        if end > cmd_idx {
+                            skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
+                        }
                     }
                 }
             }
@@ -232,23 +240,55 @@ impl<'a> SlideConverter<'a> {
                 ..
             } = &commands[cmd_idx]
             {
-                let needs_group_flatten = mask.is_some()
-                    || *blend_mode != zpdf_display_list::BlendMode::Normal
-                    || !alpha.is_finite()
-                    || (*alpha - 1.0).abs() > 1e-3;
+                let group_alpha = if alpha.is_finite() {
+                    alpha.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let is_non_normal_blend = *blend_mode != zpdf_display_list::BlendMode::Normal;
+                let is_translucent_group = group_alpha < 1.0 - 1e-3;
+                let needs_group_flatten =
+                    mask.is_some() || is_non_normal_blend || is_translucent_group;
                 if needs_group_flatten {
                     if let Some(end_idx) = Self::find_matching_pop_blend(commands, cmd_idx) {
-                        if !self.range_has_editable_text(
-                            display_list,
-                            expanded,
-                            exp_idx,
-                            cmd_idx,
-                            end_idx,
-                        )? {
+                        if group_alpha <= 0.0 {
+                            // Zero-opacity transparency group hides everything inside,
+                            // including editable text and sibling shapes.
+                            for cmd in &commands[cmd_idx..=end_idx] {
+                                self.track_clip(cmd);
+                            }
+                            while exp_idx < expanded.len() && expanded[exp_idx].cmd_start <= end_idx
+                            {
+                                exp_idx += 1;
+                            }
+                            cmd_idx = end_idx + 1;
+                            continue;
+                        }
+                        // Enclosing group opacity (< 1) and non-Normal blend modes
+                        // apply to the entire group even when it contains editable text.
+                        let must_apply_group = is_translucent_group || is_non_normal_blend;
+                        if must_apply_group
+                            || !self.range_has_editable_text(
+                                display_list,
+                                expanded,
+                                exp_idx,
+                                cmd_idx,
+                                end_idx,
+                            )?
+                        {
+                            let uses_backdrop = commands[cmd_idx..=end_idx].iter().any(|c| {
+                                matches!(
+                                    c,
+                                    RenderCommand::PushBlendGroup { blend_mode, .. }
+                                        if *blend_mode != zpdf_display_list::BlendMode::Normal
+                                )
+                            });
+                            let backdrop = uses_backdrop.then_some(&commands[..cmd_idx]);
                             self.flatten_commands_group(
                                 &commands[cmd_idx..=end_idx],
                                 mask.as_ref(),
                                 *bounds,
+                                backdrop,
                             )?;
                             for cmd in &commands[cmd_idx..=end_idx] {
                                 self.track_clip(cmd);
@@ -276,10 +316,19 @@ impl<'a> SlideConverter<'a> {
                         cmd_idx,
                         end_idx,
                     )? {
+                        let uses_backdrop = commands[cmd_idx..=end_idx].iter().any(|c| {
+                            matches!(
+                                c,
+                                RenderCommand::PushBlendGroup { blend_mode, .. }
+                                    if *blend_mode != zpdf_display_list::BlendMode::Normal
+                            )
+                        });
+                        let backdrop = uses_backdrop.then_some(&commands[..cmd_idx]);
                         self.flatten_commands_group(
                             &commands[cmd_idx..=end_idx],
                             None,
                             self.page_rect,
+                            backdrop,
                         )?;
                         for cmd in &commands[cmd_idx..=end_idx] {
                             self.track_clip(cmd);
@@ -293,10 +342,9 @@ impl<'a> SlideConverter<'a> {
                 }
             }
             self.track_clip(&commands[cmd_idx]);
-            self.convert_command(
-                &commands[cmd_idx],
-                display_list.is_in_type3_glyph_range(cmd_idx),
-            )?;
+            let in_artwork_range = display_list.is_in_type3_glyph_range(cmd_idx)
+                || display_list.is_in_pattern_range(cmd_idx);
+            self.convert_command(&commands[cmd_idx], in_artwork_range)?;
             cmd_idx += 1;
         }
         Ok(())
@@ -396,14 +444,20 @@ impl<'a> SlideConverter<'a> {
         None
     }
 
-    /// Rasterize a drawing group (soft-masked, clipped Type 3 artwork, or
-    /// translucent paint) onto a transparent bitmap so masks, clips, and
-    /// command opacity survive PowerPoint export.
+    /// Rasterize a drawing group (soft-masked, clipped Type 3 artwork,
+    /// non-Normal blend group, or translucent Type 3 paint) onto a transparent
+    /// bitmap so masks, clips, blend modes, and opacity survive PowerPoint export.
+    ///
+    /// When `backdrop_cmds` is `Some(prefix)` (for non-Normal blend modes such
+    /// as `Multiply`), resolves the blend against the page's real backdrop
+    /// (`Color::white()` + `prefix`) and masks the output strictly to pixels
+    /// touched by `group_cmds`.
     fn flatten_commands_group(
         &mut self,
         group_cmds: &[RenderCommand],
         mask: Option<&zpdf_display_list::SoftMask>,
         group_bounds: Rect,
+        backdrop_cmds: Option<&[RenderCommand]>,
     ) -> Result<()> {
         use zpdf_display_list::SoftMaskKind;
         use zpdf_render::{PageRenderInfo, RenderBackend};
@@ -518,9 +572,8 @@ impl<'a> SlideConverter<'a> {
         } else {
             render_rect.height() / crop_h
         };
-        let stroke_res = (scale as f64 * sx.max(sy)).max(0.25) as f32;
 
-        let mut rebaser = SoftMaskRebaser::new(crop_rect.x0, crop_rect.y1, sx, sy, stroke_res);
+        let mut rebaser = SoftMaskRebaser::new(crop_rect.x0, crop_rect.y1, sx, sy, scale);
         let rebased_cmds = rebaser.prepare_commands(group_cmds);
         let rebased_clips =
             (!rebaser.is_unit_scale()).then(|| rebaser.prepare_commands(&self.clip_stack));
@@ -558,8 +611,53 @@ impl<'a> SlideConverter<'a> {
         if rendered.data.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
             return Ok(());
         }
-        // `CpuRenderer` produces premultiplied RGBA8; PNG expects straight RGBA8.
-        unpremultiply_rgba(&mut rendered.data);
+
+        if let Some(prefix_cmds) = backdrop_cmds {
+            // Pass 2: resolve the non-Normal blend against the real page backdrop
+            // (`Color::white()` + all preceding page commands), then keep only
+            // pixels touched by the blend group (`rendered.alpha > 0`).
+            let rebased_prefix = rebaser.prepare_commands(prefix_cmds);
+            renderer
+                .begin_page(&PageRenderInfo {
+                    page_rect: render_rect,
+                    scale,
+                    background: zpdf_display_list::Color::white(),
+                })
+                .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX blend render: {e}")))?;
+            for cmd in &rebased_prefix {
+                renderer.execute(cmd).map_err(|e| {
+                    zpdf_core::Error::StreamDecode(format!("PPTX blend render: {e}"))
+                })?;
+            }
+            for cmd in &rebased_cmds {
+                renderer.execute(cmd).map_err(|e| {
+                    zpdf_core::Error::StreamDecode(format!("PPTX blend render: {e}"))
+                })?;
+            }
+            let blended = renderer
+                .end_page()
+                .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX blend render: {e}")))?;
+            if blended.width == rendered.width && blended.height == rendered.height {
+                for (dst, src) in rendered
+                    .data
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(blended.data.as_chunks::<4>().0.iter())
+                {
+                    if dst[3] == 0 {
+                        *dst = [0, 0, 0, 0];
+                    } else {
+                        *dst = [src[0], src[1], src[2], 255];
+                    }
+                }
+            } else {
+                unpremultiply_rgba(&mut rendered.data);
+            }
+        } else {
+            // `CpuRenderer` produces premultiplied RGBA8; PNG expects straight RGBA8.
+            unpremultiply_rgba(&mut rendered.data);
+        }
         let png_data = rgba_to_png(rendered.width, rendered.height, &rendered.data)?;
 
         self.image_counter += 1;
@@ -577,15 +675,20 @@ impl<'a> SlideConverter<'a> {
         Ok(())
     }
 
-    fn convert_command(&mut self, cmd: &RenderCommand, in_type3_glyph: bool) -> Result<()> {
+    fn convert_command(&mut self, cmd: &RenderCommand, in_artwork_range: bool) -> Result<()> {
         match cmd {
             RenderCommand::DrawGlyphRun(glyph_run) => {
                 let effective_alpha = effective_paint_alpha(&glyph_run.paint, glyph_run.alpha);
                 if effective_alpha <= 0.0 {
                     return Ok(());
                 }
-                if in_type3_glyph && effective_alpha < 1.0 - 1e-3 {
-                    self.flatten_commands_group(std::slice::from_ref(cmd), None, self.page_rect)?;
+                if in_artwork_range {
+                    self.flatten_commands_group(
+                        std::slice::from_ref(cmd),
+                        None,
+                        self.page_rect,
+                        None,
+                    )?;
                 } else {
                     self.convert_glyph_run(glyph_run, false)?;
                 }
@@ -597,8 +700,13 @@ impl<'a> SlideConverter<'a> {
                 if effective_alpha <= 0.0 {
                     return Ok(());
                 }
-                if effective_alpha < 1.0 - 1e-3 {
-                    self.flatten_commands_group(std::slice::from_ref(cmd), None, self.page_rect)?;
+                if in_artwork_range && effective_alpha < 1.0 - 1e-3 {
+                    self.flatten_commands_group(
+                        std::slice::from_ref(cmd),
+                        None,
+                        self.page_rect,
+                        None,
+                    )?;
                 } else {
                     self.convert_fill_path(path, paint)?;
                 }
@@ -614,8 +722,13 @@ impl<'a> SlideConverter<'a> {
                 if effective_alpha <= 0.0 {
                     return Ok(());
                 }
-                if effective_alpha < 1.0 - 1e-3 {
-                    self.flatten_commands_group(std::slice::from_ref(cmd), None, self.page_rect)?;
+                if in_artwork_range && effective_alpha < 1.0 - 1e-3 {
+                    self.flatten_commands_group(
+                        std::slice::from_ref(cmd),
+                        None,
+                        self.page_rect,
+                        None,
+                    )?;
                 } else {
                     self.convert_stroke_path(path, style, paint)?;
                 }
@@ -654,6 +767,10 @@ impl<'a> SlideConverter<'a> {
             .ok_or_else(|| zpdf_core::Error::StreamDecode("Font not found".into()))?;
 
         if glyph_run.glyphs.is_empty() {
+            return Ok(None);
+        }
+        let effective_alpha = effective_paint_alpha(&glyph_run.paint, glyph_run.alpha);
+        if effective_alpha <= 0.0 || (require_verified_all && effective_alpha < 1.0 - 1e-3) {
             return Ok(None);
         }
 
@@ -1228,7 +1345,9 @@ struct SoftMaskRebaser {
     origin_y: f64,
     scale_x: f64,
     scale_y: f64,
-    stroke_resolution_scale: f32,
+    /// Actual `CpuRenderer` page raster scale, used to preserve exact
+    /// one-device-pixel hairlines independently of the curve-flattening clamp.
+    render_scale: f32,
     /// Memoized offset-presence check keyed by input `Arc<DisplayList>` address.
     offset_cache: std::collections::HashMap<usize, bool>,
     /// Memoized transformed display lists keyed by `(input Arc address, dx bits, dy bits)`.
@@ -1236,19 +1355,13 @@ struct SoftMaskRebaser {
 }
 
 impl SoftMaskRebaser {
-    fn new(
-        origin_x: f64,
-        origin_y: f64,
-        scale_x: f64,
-        scale_y: f64,
-        stroke_resolution_scale: f32,
-    ) -> Self {
+    fn new(origin_x: f64, origin_y: f64, scale_x: f64, scale_y: f64, render_scale: f32) -> Self {
         Self {
             origin_x,
             origin_y,
             scale_x,
             scale_y,
-            stroke_resolution_scale,
+            render_scale,
             offset_cache: std::collections::HashMap::new(),
             translated_cache: std::collections::HashMap::new(),
         }
@@ -1260,6 +1373,24 @@ impl SoftMaskRebaser {
 
     fn is_uniform_scale(&self) -> bool {
         (self.scale_x - self.scale_y).abs() <= 1e-9
+    }
+
+    fn curve_resolution_scale(&self) -> f32 {
+        (self.render_scale as f64 * self.scale_x.max(self.scale_y)).max(0.25) as f32
+    }
+
+    fn is_device_hairline(&self, style: &zpdf_display_list::StrokeStyle) -> bool {
+        let device_max_scale = self.render_scale as f64 * self.scale_x.max(self.scale_y);
+        style.width <= 0.0 || (style.width as f64 * device_max_scale) <= 1.0
+    }
+
+    fn min_hairline_user_width(&self) -> f32 {
+        let device_min_scale = self.render_scale as f64 * self.scale_x.min(self.scale_y);
+        if device_min_scale > 0.0 {
+            (1.0 / device_min_scale) as f32
+        } else {
+            0.0
+        }
     }
 
     fn canonical_bits(v: f64) -> u64 {
@@ -1440,6 +1571,45 @@ impl SoftMaskRebaser {
                         alpha: *alpha,
                         overprint: *overprint,
                     }
+                } else if self.is_device_hairline(style) {
+                    // Hairlines must remain 1 full device pixel in every
+                    // direction after anisotropic fitting: dash in user space
+                    // so directional dash lengths stay exact, map the centerline
+                    // to render space, and outline at `1 / render_scale` render
+                    // units (exact 1 device pixel, independent of the curve
+                    // flattening clamp and avoiding tiny-skia's <=2px hairline
+                    // clip-inset early return).
+                    let curve_res = self.curve_resolution_scale();
+                    let dashed = if style.dash.is_some() {
+                        Some(zpdf_render_cpu::CpuRenderer::dash_path(
+                            path, style, curve_res,
+                        ))
+                    } else {
+                        None
+                    };
+                    let mapped_centerline = self.map_path(dashed.as_ref().unwrap_or(path), dx, dy);
+                    let mut hairline_style = style.clone();
+                    hairline_style.width = 0.0;
+                    hairline_style.dash = None;
+                    let hairline_render_width = if self.render_scale > 0.0 {
+                        1.0 / self.render_scale
+                    } else {
+                        0.0
+                    };
+                    let outlined = zpdf_render_cpu::CpuRenderer::stroke_path_to_outline(
+                        &mapped_centerline,
+                        &hairline_style,
+                        hairline_render_width,
+                        curve_res,
+                    )
+                    .unwrap_or_default();
+                    RenderCommand::FillPath {
+                        path: outlined,
+                        rule: zpdf_display_list::FillRule::NonZero,
+                        paint: paint.clone(),
+                        alpha: *alpha,
+                        overprint: *overprint,
+                    }
                 } else {
                     // Under an anisotropic fit (e.g. X=1, Y=4/3), expand the
                     // stroke and dashes into a filled outline in user space
@@ -1448,7 +1618,8 @@ impl SoftMaskRebaser {
                     let outlined = zpdf_render_cpu::CpuRenderer::stroke_path_to_outline(
                         path,
                         style,
-                        self.stroke_resolution_scale,
+                        self.min_hairline_user_width(),
+                        self.curve_resolution_scale(),
                     )
                     .map(|outline| self.map_path(&outline, dx, dy))
                     .unwrap_or_default();
@@ -1486,11 +1657,41 @@ impl SoftMaskRebaser {
                         path: self.map_path(path, dx, dy),
                         style: self.map_uniform_stroke_style(style),
                     }
+                } else if self.is_device_hairline(style) {
+                    let curve_res = self.curve_resolution_scale();
+                    let dashed = if style.dash.is_some() {
+                        Some(zpdf_render_cpu::CpuRenderer::dash_path(
+                            path, style, curve_res,
+                        ))
+                    } else {
+                        None
+                    };
+                    let mapped_centerline = self.map_path(dashed.as_ref().unwrap_or(path), dx, dy);
+                    let mut hairline_style = style.clone();
+                    hairline_style.width = 0.0;
+                    hairline_style.dash = None;
+                    let hairline_render_width = if self.render_scale > 0.0 {
+                        1.0 / self.render_scale
+                    } else {
+                        0.0
+                    };
+                    let outlined = zpdf_render_cpu::CpuRenderer::stroke_path_to_outline(
+                        &mapped_centerline,
+                        &hairline_style,
+                        hairline_render_width,
+                        curve_res,
+                    )
+                    .unwrap_or_default();
+                    RenderCommand::PushClip {
+                        path: outlined,
+                        rule: zpdf_display_list::FillRule::NonZero,
+                    }
                 } else {
                     let outlined = zpdf_render_cpu::CpuRenderer::stroke_path_to_outline(
                         path,
                         style,
-                        self.stroke_resolution_scale,
+                        self.min_hairline_user_width(),
+                        self.curve_resolution_scale(),
                     )
                     .map(|outline| self.map_path(&outline, dx, dy))
                     .unwrap_or_default();
@@ -5256,6 +5457,684 @@ mod export_tests {
                 (" B", pt_to_emu(90.0), pt_to_emu(80.0)),
             ],
             "blank U+0020 space must remain editable with its advance while painted U+0020 stays artwork"
+        );
+    }
+
+    #[test]
+    fn type3_page_opacity_before_text_show_preserved_in_pptx() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Page sets /ca 0 before (A), /ca 0.5 before (B), and /ca 1 before (C).
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> \
+              /ExtGState << /GS0 11 0 R /GS50 12 0 R /GS100 13 0 R >> >> >>"
+                .to_vec(), // 3
+            stream(
+                "",
+                b"1 0 0 rg /GS0 gs BT /F1 40 Tf 10 30 Td (A) Tj ET \
+                  /GS50 gs BT /F1 40 Tf 70 30 Td (B) Tj ET \
+                  /GS100 gs BT /F1 40 Tf 130 30 Td (C) Tj ET",
+            ), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 67 /Widths [1000 1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /A 8 0 R /B 9 0 R /C 10 0 R >>".to_vec(), // 6
+            b"<< /Type /Encoding /Differences [65 /A /B /C] >>".to_vec(), // 7
+            stream("", b"1000 0 0 0 1000 1000 d1 0 0 800 800 re f"), // 8
+            stream("", b"1000 0 0 0 1000 1000 d1 0 0 800 800 re f"), // 9
+            stream("", b"1000 0 0 0 1000 1000 d1 0 0 800 800 re f"), // 10
+            b"<< /Type /ExtGState /ca 0 >>".to_vec(),      // 11
+            b"<< /Type /ExtGState /ca 0.5 >>".to_vec(),    // 12
+            b"<< /Type /ExtGState /ca 1 >>".to_vec(),      // 13
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let mut spans = Vec::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .with_text_sink(&mut spans);
+        let (display_list, _) = interpreter.interpret_with_stats(&content_bytes);
+
+        let extracted: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(extracted, "ABC");
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "/ca 0 letter (A) must be omitted, leaving translucent (B) image and opaque (C) text: {:?}",
+            slide.elements
+        );
+        let SlideElement::Image { image_data, .. } = &slide.elements[0] else {
+            panic!(
+                "/ca 0.5 letter (B) must export as translucent Image, got {:?}",
+                slide.elements[0]
+            );
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let center = rgba.get_pixel(w / 2, h / 2).0;
+        assert!(
+            center[0] > 240 && center[1] < 15 && center[2] < 15 && (120..=136).contains(&center[3]),
+            "translucent /ca 0.5 letter (B) must preserve ~50% red alpha, got {center:?}"
+        );
+        match &slide.elements[1] {
+            SlideElement::TextBox { text, .. } => assert_eq!(text, "C"),
+            other => panic!("opaque /ca 1 letter (C) must remain editable TextBox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_and_translucent_transparency_forms_apply_group_opacity_to_editable_text_and_shapes() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Form XObject with `/Group /S /Transparency` draws a mapped Type 3 letter (A)
+        // AND a sibling red rectangle.
+        let form = stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 160 100] \
+             /Group << /Type /Group /S /Transparency /CS /DeviceRGB /I true >> \
+             /Resources << /Font << /F1 5 0 R >> >>",
+            b"0 0 0 rg BT /F1 40 Tf 10 30 Td (A) Tj ET 1 0 0 rg 80 30 40 40 re f",
+        );
+
+        let build_pdf = |gs_dict: &[u8]| {
+            assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 160 100] /Contents 4 0 R \
+                  /Resources << /XObject << /Fm 9 0 R >> /ExtGState << /GS 10 0 R >> >> >>"
+                    .to_vec(), // 3
+                stream("", b"/GS gs /Fm Do"),                  // 4
+                b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                  /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+                  /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+                    .to_vec(), // 5
+                b"<< /A 8 0 R >>".to_vec(),                    // 6
+                b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+                stream("", b"1000 0 d0 0 0 800 800 re f"),     // 8
+                form.clone(),                                  // 9
+                gs_dict.to_vec(),                              // 10
+            ])
+        };
+
+        // Zero-alpha Form: must produce NO visible slide elements.
+        let zero_pdf = build_pdf(b"<< /Type /ExtGState /ca 0 >>");
+        let doc = zpdf_document::PdfDocument::open(zero_pdf).expect("open zero pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+        let zero_slide =
+            display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+                .expect("zero slide");
+        assert!(
+            zero_slide.elements.is_empty(),
+            "zero-alpha transparency Form with letter and rectangle must produce no visible slide elements, got {:?}",
+            zero_slide.elements
+        );
+
+        // 50%-alpha Form: must flatten the entire group at ~50% opacity (no opaque TextBox/Rect).
+        let half_pdf = build_pdf(b"<< /Type /ExtGState /ca 0.5 >>");
+        let doc = zpdf_document::PdfDocument::open(half_pdf).expect("open half pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+        let half_slide =
+            display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+                .expect("half slide");
+        assert_eq!(
+            half_slide.elements.len(),
+            1,
+            "translucent transparency Form must flatten to one translucent Image, got {:?}",
+            half_slide.elements
+        );
+        let SlideElement::Image { image_data, .. } = &half_slide.elements[0] else {
+            panic!(
+                "expected translucent SlideElement::Image, got {:?}",
+                half_slide.elements[0]
+            );
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let letter_px = rgba.get_pixel(w / 5, h / 2).0;
+        let rect_px = rgba.get_pixel(w * 4 / 5, h / 2).0;
+        assert!(
+            (120..=136).contains(&letter_px[3]) && letter_px[0] < 15 && letter_px[2] < 15,
+            "letter inside 50%-alpha Form must have ~50% black opacity, got {letter_px:?}"
+        );
+        assert!(
+            (120..=136).contains(&rect_px[3]) && rect_px[0] > 240 && rect_px[2] < 15,
+            "rectangle inside 50%-alpha Form must have ~50% red opacity, got {rect_px:?}"
+        );
+    }
+
+    #[test]
+    fn non_normal_multiply_blend_preserves_backdrop_color_in_pptx() {
+        let page_rect = Rect::new(0.0, 0.0, 140.0, 140.0);
+        let mut dl = DisplayList::new(page_rect);
+        let mut blue_rect = zpdf_display_list::Path::new();
+        blue_rect.rect(Rect::new(10.0, 10.0, 90.0, 90.0));
+        dl.push(RenderCommand::FillPath {
+            path: blue_rect,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: zpdf_display_list::BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: page_rect,
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut red_rect = zpdf_display_list::Path::new();
+        red_rect.rect(Rect::new(40.0, 40.0, 120.0, 120.0));
+        dl.push(RenderCommand::FillPath {
+            path: red_rect,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "expected blue Rectangle backdrop plus blended Image, got {:?}",
+            slide.elements
+        );
+        assert!(matches!(
+            slide.elements[0],
+            SlideElement::Rectangle {
+                fill_rgb: Some((0, 0, 255)),
+                ..
+            }
+        ));
+        let SlideElement::Image { image_data, .. } = &slide.elements[1] else {
+            panic!(
+                "expected blended SlideElement::Image, got {:?}",
+                slide.elements[1]
+            );
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let (w, h) = rgba.dimensions();
+        // Bottom-left quadrant of the red [40..120] crop overlaps blue [10..90] -> Multiply(red, blue) = black.
+        let overlap_px = rgba.get_pixel(w / 4, h * 3 / 4).0;
+        assert_eq!(
+            overlap_px,
+            [0, 0, 0, 255],
+            "red Multiply over opaque blue backdrop must produce black overlap, got {overlap_px:?}"
+        );
+        // Top-right quadrant [90..120] is over white backdrop -> Multiply(red, white) = red.
+        let non_overlap_px = rgba.get_pixel(w * 3 / 4, h / 4).0;
+        assert_eq!(
+            non_overlap_px,
+            [255, 0, 0, 255],
+            "red Multiply over white backdrop must stay red, got {non_overlap_px:?}"
+        );
+        // Outer padding corner outside [40..120] must remain transparent so backdrop shapes stay untouched.
+        assert_eq!(
+            rgba.get_pixel(0, 0).0[3],
+            0,
+            "padding outside the blended shape must stay transparent"
+        );
+    }
+
+    #[test]
+    fn unmapped_type3_opaque_icon_using_nested_font_exports_as_artwork_not_text() {
+        const BOLD_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-bold.ttf");
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Unmapped Type 3 glyph `/icon_custom` (no /ToUnicode) draws its opaque shape
+        // using an embedded ordinary TrueType font with no soft mask.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 120] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"0 0 0 rg BT /F1 60 Tf 20 20 Td (A) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] \
+              /Resources << /Font << /FNest 9 0 R >> >> >>"
+                .to_vec(), // 5
+            b"<< /icon_custom 8 0 R >>".to_vec(),          // 6
+            b"<< /Type /Encoding /Differences [65 /icon_custom] >>".to_vec(), // 7
+            stream("", b"1000 0 d0 1 0 0 rg BT /FNest 900 Tf 0 0 Td (A) Tj ET"), // 8
+            b"<< /Type /Font /Subtype /TrueType /BaseFont /BoldSquare \
+              /FirstChar 65 /LastChar 65 /Widths [600] /Encoding /WinAnsiEncoding \
+              /FontDescriptor 10 0 R >>"
+                .to_vec(), // 9
+            b"<< /Type /FontDescriptor /FontName /BoldSquare /Flags 32 \
+              /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+              /CapHeight 700 /StemV 80 /FontFile2 11 0 R >>"
+                .to_vec(), // 10
+            stream(&format!("/Length1 {}", BOLD_TTF.len()), BOLD_TTF), // 11
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+
+        assert!(
+            !slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::TextBox { .. })),
+            "unmapped Type 3 icon using nested font must NOT leak as editable TextBox: {:?}",
+            slide.elements
+        );
+        assert_eq!(slide.elements.len(), 1);
+        let SlideElement::Image { image_data, .. } = &slide.elements[0] else {
+            panic!("expected SlideElement::Image, got {:?}", slide.elements[0]);
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        assert!(
+            rgba.pixels()
+                .any(|p| p.0[3] > 200 && p.0[0] > 200 && p.0[2] < 40),
+            "unmapped Type 3 nested-font icon must preserve its opaque red glyph artwork"
+        );
+    }
+
+    #[test]
+    fn ordinary_translucent_rectangle_remains_editable_shape() {
+        let page_rect = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let mut dl = DisplayList::new(page_rect);
+        let mut rect_path = zpdf_display_list::Path::new();
+        rect_path.rect(Rect::new(20.0, 20.0, 80.0, 70.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect_path,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        let mut line_path = zpdf_display_list::Path::new();
+        line_path.move_to(zpdf_core::Point::new(100.0, 20.0));
+        line_path.line_to(zpdf_core::Point::new(180.0, 70.0));
+        dl.push(RenderCommand::StrokePath {
+            path: line_path,
+            style: zpdf_display_list::StrokeStyle {
+                width: 4.0,
+                cap: zpdf_display_list::LineCap::Butt,
+                join: zpdf_display_list::LineJoin::Miter,
+                miter_limit: 10.0,
+                dash: None,
+            },
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 0.5,
+            overprint: None,
+        });
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        assert_eq!(slide.elements.len(), 2);
+        assert!(
+            matches!(
+                slide.elements[0],
+                SlideElement::Rectangle {
+                    fill_rgb: Some((255, 0, 0)),
+                    ..
+                }
+            ),
+            "ordinary translucent rectangle must stay native editable SlideElement::Rectangle, got {:?}",
+            slide.elements[0]
+        );
+        assert!(
+            matches!(
+                slide.elements[1],
+                SlideElement::Line {
+                    stroke_rgb: (0, 0, 255),
+                    ..
+                }
+            ),
+            "ordinary translucent line must stay native editable SlideElement::Line, got {:?}",
+            slide.elements[1]
+        );
+    }
+
+    #[test]
+    fn wide_thin_crop_preserves_one_device_pixel_hairline_strokes_and_clips() {
+        let page_rect = Rect::new(0.0, 0.0, 16_384.0, 12.0);
+        let mut mask_dl = DisplayList::new(page_rect);
+        let mut full = zpdf_display_list::Path::new();
+        full.rect(page_rect);
+        mask_dl.push(RenderCommand::FillPath {
+            path: full.clone(),
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mask = zpdf_display_list::SoftMask {
+            kind: zpdf_display_list::SoftMaskKind::Alpha,
+            commands: std::sync::Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        // Anchor the full 16,384 × 12 crop with an opaque dot at the far right edge,
+        // and place a vertical zero-width hairline at x=12pt (exact center of pixel column 1
+        // at scale 1/8 = 8pt/px).
+        let mut vline = zpdf_display_list::Path::new();
+        vline.move_to(zpdf_core::Point::new(12.0, 0.0));
+        vline.line_to(zpdf_core::Point::new(12.0, 12.0));
+        let mut far_right = zpdf_display_list::Path::new();
+        far_right.rect(Rect::new(16_368.0, 0.0, 16_384.0, 12.0));
+        let hairline_style = zpdf_display_list::StrokeStyle {
+            width: 0.0,
+            cap: zpdf_display_list::LineCap::Butt,
+            join: zpdf_display_list::LineJoin::Miter,
+            miter_limit: 10.0,
+            dash: None,
+        };
+
+        // 1. Vertical zero-width StrokePath and PushClipStroke must cover 1 full device pixel on X.
+        for is_clip_stroke in [false, true] {
+            let mut dl = DisplayList::new(page_rect);
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: page_rect,
+                alpha: 1.0,
+                mask: Some(mask.clone()),
+            });
+            // Keep crop extent fixed at full [0..16384] × [0..12].
+            let mut far_left = zpdf_display_list::Path::new();
+            far_left.rect(Rect::new(0.0, 0.0, 4.0, 12.0));
+            dl.push(RenderCommand::FillPath {
+                path: far_left,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::FillPath {
+                path: far_right.clone(),
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            if is_clip_stroke {
+                dl.push(RenderCommand::PushClipStroke {
+                    path: vline.clone(),
+                    style: hairline_style.clone(),
+                });
+                dl.push(RenderCommand::FillPath {
+                    path: full.clone(),
+                    rule: zpdf_display_list::FillRule::NonZero,
+                    paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+                dl.push(RenderCommand::PopClip);
+            } else {
+                dl.push(RenderCommand::StrokePath {
+                    path: vline.clone(),
+                    style: hairline_style.clone(),
+                    paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+            dl.push(RenderCommand::PopBlendGroup);
+
+            let slide = display_list_to_slide(
+                &dl,
+                0,
+                &FontCache::new(),
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+            .expect("slide export");
+            let SlideElement::Image { image_data, .. } = &slide.elements[0] else {
+                panic!("expected SlideElement::Image");
+            };
+            let rgba = image::load_from_memory(image_data)
+                .expect("decode PNG")
+                .to_rgba8();
+            assert_eq!(rgba.dimensions(), (2048, 2));
+            let expected = if is_clip_stroke {
+                [0, 255, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            for row in 0..2 {
+                assert_eq!(
+                    rgba.get_pixel(1, row).0,
+                    expected,
+                    "vertical 0-width hairline (row={row}, clip={is_clip_stroke}) must occupy 1 full device pixel (alpha=255)"
+                );
+                assert_eq!(
+                    rgba.get_pixel(2, row).0[3],
+                    0,
+                    "neighboring column outside vertical hairline must stay transparent"
+                );
+            }
+        }
+
+        // 2. Horizontal zero-width dashed hairline at y=9pt (center of row 0) must keep 1px height & exact 64pt X dashes.
+        let mut hline = zpdf_display_list::Path::new();
+        hline.move_to(zpdf_core::Point::new(0.0, 9.0));
+        hline.line_to(zpdf_core::Point::new(16_384.0, 9.0));
+        let dashed_hairline = zpdf_display_list::StrokeStyle {
+            width: 0.0,
+            cap: zpdf_display_list::LineCap::Butt,
+            join: zpdf_display_list::LineJoin::Miter,
+            miter_limit: 10.0,
+            dash: Some(zpdf_display_list::DashPattern {
+                array: vec![64.0, 64.0],
+                phase: 0.0,
+            }),
+        };
+        let mut dl = DisplayList::new(page_rect);
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: zpdf_display_list::BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: page_rect,
+            alpha: 1.0,
+            mask: Some(mask),
+        });
+        dl.push(RenderCommand::FillPath {
+            path: far_right,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::StrokePath {
+            path: hline,
+            style: dashed_hairline,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let SlideElement::Image { image_data, .. } = &slide.elements[0] else {
+            panic!("expected SlideElement::Image");
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        assert_eq!(rgba.dimensions(), (2048, 2));
+        assert_eq!(rgba.get_pixel(4, 0).0, [0, 0, 255, 255]);
+        assert_eq!(rgba.get_pixel(12, 0).0[3], 0);
+        assert_eq!(rgba.get_pixel(28, 0).0[3], 0);
+        assert_eq!(rgba.get_pixel(36, 0).0, [0, 0, 255, 255]);
+        assert_eq!(
+            rgba.get_pixel(4, 1).0[3],
+            0,
+            "horizontal 0-width hairline centered in row 0 must stay 1 device pixel tall"
         );
     }
 }
