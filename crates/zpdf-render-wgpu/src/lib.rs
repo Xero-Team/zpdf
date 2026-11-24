@@ -97,7 +97,7 @@ fn estimate_page_target_bytes(width: u32, height: u32, sample_count: u32) -> u64
 
 /// Unique image textures referenced by a page, including images nested in any
 /// soft-mask op list. Preserve first-use order for deterministic upload traces.
-fn referenced_image_ids(ops: &[PageOp]) -> Vec<u32> {
+fn referenced_image_ids(ops: &[PageOp]) -> Vec<record::ImageKey> {
     let mut ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![ops];
@@ -487,6 +487,31 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                     }
                 }
             }
+            RenderCommand::DrawInlineImage(draw) => {
+                let img = &draw.image;
+                if !image::is_valid_rgba_image(img.width, img.height, img.data.len()) {
+                    tracing::warn!(
+                        width = img.width,
+                        height = img.height,
+                        bytes = img.data.len(),
+                        "skipping malformed inline image"
+                    );
+                    return Ok(());
+                }
+                let quad = image::image_quad(
+                    img.width as f32,
+                    img.height as f32,
+                    &draw.transform,
+                    &page.map,
+                    draw.alpha,
+                );
+                if image::is_safe_quad(&quad) {
+                    page.recorder
+                        .add_inline_image(quad, std::sync::Arc::clone(img));
+                } else {
+                    tracing::warn!("skipping out-of-range inline image transform");
+                }
+            }
             RenderCommand::PushBlendGroup {
                 blend_mode,
                 alpha,
@@ -584,26 +609,29 @@ impl<'a> WgpuRenderer<'a> {
         let referenced_images = referenced_image_ids(&batched_ops);
         let mut uploadable_images = Vec::new();
         let mut image_texture_bytes = 0u64;
-        if let Some(images) = self.image_cache {
-            for image_id in referenced_images {
-                let Some(img) = images.get(image_id) else {
-                    continue;
-                };
-                if !image::is_valid_decoded_image(img)
-                    || img.width > ctx.max_texture_dim
-                    || img.height > ctx.max_texture_dim
-                {
-                    tracing::warn!(
-                        "image {image_id} {}x{} skipped (exceeds limits)",
-                        img.width,
-                        img.height
-                    );
-                    continue;
-                }
-                image_texture_bytes =
-                    image_texture_bytes.saturating_add(img.width as u64 * img.height as u64 * 4);
-                uploadable_images.push(image_id);
+        for image_key in referenced_images {
+            let dims = match image_key {
+                record::ImageKey::Cache(image_id) => self
+                    .image_cache
+                    .and_then(|images| images.get(image_id))
+                    .filter(|img| image::is_valid_decoded_image(img))
+                    .map(|img| (img.width, img.height)),
+                record::ImageKey::Inline(idx) => rec
+                    .inline_images
+                    .get(idx as usize)
+                    .filter(|img| image::is_valid_rgba_image(img.width, img.height, img.data.len()))
+                    .map(|img| (img.width, img.height)),
+            };
+            let Some((width, height)) = dims else {
+                continue;
+            };
+            if width > ctx.max_texture_dim || height > ctx.max_texture_dim {
+                tracing::warn!("image {image_key:?} {width}x{height} skipped (exceeds limits)");
+                continue;
             }
+            image_texture_bytes =
+                image_texture_bytes.saturating_add(width as u64 * height as u64 * 4);
+            uploadable_images.push(image_key);
         }
         let glyph_texture_bytes = rec.glyph_atlas.gpu_texture_bytes();
         let target_bytes = if has_blend_groups {
@@ -713,12 +741,24 @@ impl<'a> WgpuRenderer<'a> {
             Some(glyph_atlas::upload_atlas_bind_group(ctx, &rec.glyph_atlas))
         };
 
-        let mut tex_bgs: std::collections::HashMap<u32, wgpu::BindGroup> =
+        let mut tex_bgs: std::collections::HashMap<record::ImageKey, wgpu::BindGroup> =
             std::collections::HashMap::new();
-        if let Some(images) = self.image_cache {
-            for image_id in uploadable_images {
-                if let Some(img) = images.get(image_id) {
-                    tex_bgs.insert(image_id, image::upload_image_bind_group(ctx, img));
+        for image_key in uploadable_images {
+            match image_key {
+                record::ImageKey::Cache(image_id) => {
+                    if let Some(img) = self.image_cache.and_then(|images| images.get(image_id)) {
+                        tex_bgs.insert(image_key, image::upload_image_bind_group(ctx, img));
+                    }
+                }
+                record::ImageKey::Inline(idx) => {
+                    if let Some(img) = rec.inline_images.get(idx as usize) {
+                        let pixels =
+                            image::premultiply_rgba_if_needed(&img.data, img.premultiplied);
+                        tex_bgs.insert(
+                            image_key,
+                            image::upload_rgba_bind_group(ctx, img.width, img.height, &pixels),
+                        );
+                    }
                 }
             }
         }
@@ -803,7 +843,7 @@ struct ReplayRes<'a> {
     bind_group: &'a wgpu::BindGroup,
     solid: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     tex: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
-    tex_bgs: &'a std::collections::HashMap<u32, wgpu::BindGroup>,
+    tex_bgs: &'a std::collections::HashMap<record::ImageKey, wgpu::BindGroup>,
     /// Glyph-atlas quad buffers, present iff any glyph took the atlas path.
     glyph: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     /// The page's single atlas texture bind group (no per-op id, unlike `tex_bgs`).
@@ -987,6 +1027,21 @@ fn record_dl_commands(
                     );
                     if image::is_safe_quad(&quad) {
                         rec.add_image(quad, draw.image_id);
+                    }
+                }
+            }
+            RenderCommand::DrawInlineImage(draw) => {
+                let img = &draw.image;
+                if image::is_valid_rgba_image(img.width, img.height, img.data.len()) {
+                    let quad = image::image_quad(
+                        img.width as f32,
+                        img.height as f32,
+                        &draw.transform,
+                        map,
+                        draw.alpha,
+                    );
+                    if image::is_safe_quad(&quad) {
+                        rec.add_inline_image(quad, std::sync::Arc::clone(img));
                     }
                 }
             }
@@ -1688,6 +1743,65 @@ mod resource_tests {
         assert_eq!(
             quantize_clear_color(&Color::rgba(f32::NAN, 0.5, f32::INFINITY, 1.0)),
             expect(0, 128, 255, 255)
+        );
+    }
+
+    #[test]
+    fn inline_image_straight_alpha_matches_premultiplied_on_gpu() {
+        let straight = [128u8, 0, 0, 128];
+        let premul = [64u8, 0, 0, 128];
+        assert_eq!(
+            image::premultiply_rgba_if_needed(&straight, false).as_ref(),
+            &premul
+        );
+        assert_eq!(
+            image::premultiply_rgba_if_needed(&premul, true).as_ref(),
+            &premul
+        );
+
+        let make_dl = |data: Vec<u8>, premultiplied: bool| {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+            dl.push(RenderCommand::DrawInlineImage(
+                zpdf_display_list::InlineImageDraw {
+                    image: std::sync::Arc::new(zpdf_display_list::InlineImage {
+                        width: 1,
+                        height: 1,
+                        data,
+                        has_alpha: true,
+                        is_image_mask: false,
+                        premultiplied,
+                    }),
+                    transform: zpdf_core::Matrix::new(8.0, 0.0, 0.0, 8.0, 0.0, 0.0),
+                    alpha: 1.0,
+                },
+            ));
+            dl
+        };
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(WgpuRenderError::NoAdapter) => {
+                // Headless environment without a compatible GPU adapter: helper assertion above still ran.
+                return;
+            }
+            Err(err) => panic!("unexpected GPU adapter initialization error: {err}"),
+        };
+        let mut renderer = WgpuRenderer::new().with_context(ctx);
+        let straight_page = renderer
+            .render_display_list(&make_dl(straight.to_vec(), false), 1.0)
+            .expect("render straight-alpha inline image");
+        let premul_page = renderer
+            .render_display_list(&make_dl(premul.to_vec(), true), 1.0)
+            .expect("render premultiplied inline image");
+        let px_idx = ((4 * straight_page.width + 4) * 4) as usize;
+        assert_eq!(
+            &straight_page.data[px_idx..px_idx + 4],
+            &premul_page.data[px_idx..px_idx + 4],
+            "straight-alpha and premultiplied inline images must composite identically on white"
+        );
+        assert!(
+            straight_page.data[px_idx] <= 195 && straight_page.data[px_idx] >= 187,
+            "straight [128,0,0,128] on white should composite near [191,127,127], got {:?}",
+            &straight_page.data[px_idx..px_idx + 4]
         );
     }
 }

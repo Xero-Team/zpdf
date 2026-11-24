@@ -12,7 +12,7 @@
 //! calls with one covering their concatenation draws the exact same triangles
 //! in the exact same order — bit-identical output, not an approximation.
 
-use crate::record::{MeshRange, PageOp};
+use crate::record::{ImageKey, MeshRange, PageOp};
 
 /// The state a `Draw`/`Image`/`StampClip` op renders under. Two adjacent ops
 /// with an equal key (and contiguous ranges) are merge-eligible. `Other`
@@ -21,10 +21,10 @@ use crate::record::{MeshRange, PageOp};
 /// this bucket (`batch_ops` never attempts to merge an `Other`-keyed op).
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum BatchKey {
-    Draw(u32),       // clip_ref
-    Image(u32, u32), // image_id, clip_ref
-    Glyph(u32),      // clip_ref — a page has exactly one atlas, no id needed
-    StampClip(u32),  // ref_value
+    Draw(u32),            // clip_ref
+    Image(ImageKey, u32), // image_id, clip_ref
+    Glyph(u32),           // clip_ref — a page has exactly one atlas, no id needed
+    StampClip(u32),       // ref_value
     Other,
 }
 
@@ -145,7 +145,7 @@ mod tests {
                 index_count,
                 base_vertex: 0,
             },
-            image_id,
+            image_id: ImageKey::Cache(image_id),
             clip_ref,
         }
     }
@@ -244,7 +244,7 @@ mod tests {
                 range, image_id, ..
             } => {
                 assert_eq!(range.index_count, 12);
-                assert_eq!(*image_id, 5);
+                assert_eq!(*image_id, ImageKey::Cache(5));
             }
             _ => panic!("expected Image"),
         }

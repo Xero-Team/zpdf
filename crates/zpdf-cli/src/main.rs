@@ -1198,6 +1198,8 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 .with_colors(&mut icc_cache)
                 .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
+                .with_skip_images(true)
+                .with_skip_type3_painting(true)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             if struct_tree.is_some() {
                 interpreter = interpreter.with_span_streams(&mut span_streams);
@@ -1296,6 +1298,8 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
                 .with_colors(&mut icc_cache)
                 .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
+                .with_skip_images(true)
+                .with_skip_type3_painting(true)
                 // Hit rectangles follow the glyphs actually matched.
                 .with_text_geometry(true)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -1392,6 +1396,8 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
                 .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
                 .with_rule_sink(&mut rules)
+                .with_skip_images(true)
+                .with_skip_type3_painting(true)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
@@ -1540,7 +1546,8 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             zpdf::display_list::RenderCommand::StrokePath { .. } => strokes += 1,
             zpdf::display_list::RenderCommand::DrawGlyphRun(_) => glyphs += 1,
             zpdf::display_list::RenderCommand::PushClip { .. } => clips += 1,
-            zpdf::display_list::RenderCommand::DrawImage(_) => images += 1,
+            zpdf::display_list::RenderCommand::DrawImage(_)
+            | zpdf::display_list::RenderCommand::DrawInlineImage(_) => images += 1,
             _ => {}
         }
     }

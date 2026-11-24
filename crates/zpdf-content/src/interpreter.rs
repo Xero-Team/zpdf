@@ -62,6 +62,14 @@ pub struct ContentInterpreter<'a> {
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
+    /// Skip all image decoding, including self-contained Type 3 inline bitmaps
+    /// and shading rasters (used by extraction-only callers that discard the
+    /// display list).
+    skip_images: bool,
+    /// Skip visual CharProc replay for Type 3 glyphs (used by extraction-only
+    /// callers that discard the display list so repeated vector glyphs do not
+    /// exhaust the page's shared operator budget).
+    skip_type3_painting: bool,
     max_image_cache_bytes: u64,
     max_font_cache_bytes: u64,
     /// Active document/standalone parsing policy used by inline image filters
@@ -132,14 +140,87 @@ pub struct ContentInterpreter<'a> {
     /// The current font is a leak override for this show operator, not one
     /// a `Tf` selected; its shows are not recovery evidence.
     font_override: bool,
-    /// Owned /Resources of the form XObjects currently being interpreted,
-    /// innermost last. Lookups search these before the page resources.
-    form_resources: Vec<ResourceDict>,
+    /// Owned `/Resources` of active Form XObjects, tiling patterns, and Type 3
+    /// scopes, paired with each defining scope's default `base_ctm` (ISO 32000-1
+    /// §8.7.2), innermost last. Lookups search these before the page resources.
+    form_resources: Vec<(std::sync::Arc<ResourceDict>, Matrix)>,
     form_depth: u32,
+    /// Nesting depth inside `paint_tiling_pattern` on the current display list;
+    /// outermost depth records `[cmd_start, cmd_end)` ranges on `DisplayList`.
+    pattern_depth: u32,
     /// Object ids of the form XObjects currently being interpreted. A form
     /// that draws itself (directly, or through a pattern cell) recurses
     /// forever, so re-entry is refused instead of fanning out to the budget.
     active_forms: Vec<ObjectId>,
+    /// Active `(FontId, glyph_id)` pairs for Type 3 CharProcs currently being
+    /// interpreted, guarding against direct or indirect self-recursion.
+    active_type3_glyphs: Vec<(FontId, u16)>,
+    /// Cached parsed `/Resources`, pre-loaded font bindings, and `/CharProcs`
+    /// stream IDs for Type 3 fonts interpreted on this page (parsed once per
+    /// Type 3 font within `max_type3_resource_cache_bytes`).
+    type3_font_resources: HashMap<FontId, std::sync::Arc<CachedType3FontResources>>,
+    /// Shared parsed `/Resources` scopes keyed by indirect `/Resources` object
+    /// ID so distinct CharProc streams (or a Type 3 font and its CharProcs)
+    /// referencing the same indirect resource dictionary reuse one `Arc`.
+    type3_shared_resources: HashMap<ObjectId, std::sync::Arc<CachedType3ResourceScope>>,
+    /// Cached per-CharProc `/Resources` lookup keyed by CharProc stream object
+    /// ID (`None` when the CharProc carries no `/Resources`).
+    type3_glyph_resources: HashMap<ObjectId, Option<std::sync::Arc<CachedType3ResourceScope>>>,
+    /// Estimated bytes retained across `type3_font_resources`,
+    /// `type3_shared_resources`, and `type3_glyph_resources`.
+    type3_resource_cache_bytes: usize,
+    /// Hard cap on retained Type 3 resource scopes for this page; scopes beyond
+    /// the cap are still parsed for the current glyph and dropped afterward.
+    max_type3_resource_cache_bytes: usize,
+    /// Set when any painting operation inside the active Type 3 glyph is
+    /// suppressed by an inactive optional-content group (`oc_suppressed()`).
+    type3_oc_suppressed_mark: bool,
+    /// Set when an image decode/admission drops an image inside the active
+    /// Type 3 glyph so the incomplete glyph is excluded from `expanded_glyph_runs`.
+    type3_image_dropped: bool,
+    /// Set when an image draw inside the active Type 3 glyph carries paint
+    /// outside the caller's solid fill (non-mask image or `d0`-recolored stencil).
+    type3_local_image_paint: bool,
+    /// Caller solid fill color active when entering the innermost Type 3 glyph.
+    type3_caller_fill: Option<Color>,
+    /// Active Type 3 glyph context `(font_id, glyph_id, inline_image_ordinal)`
+    /// used to deduplicate repeated inline bitmap images (e.g. TeX Type 3
+    /// glyphs) into a single `ImageId` per `(glyph, colour, footprint)`.
+    type3_inline_ctx: Option<(FontId, u16, u32)>,
+    /// Deduplication cache for inline images decoded inside Type 3 glyphs when
+    /// an external `ImageCache` is supplied.
+    #[allow(clippy::type_complexity)]
+    type3_inline_image_cache: HashMap<
+        (FontId, u16, u32, Type3InlineColorKey, (u32, u32)),
+        (zpdf_display_list::ImageId, bool),
+    >,
+    /// Deduplication cache for Type 3 inline images embedded directly on
+    /// `RenderCommand::DrawInlineImage` when no external `ImageCache` was
+    /// supplied.
+    #[allow(clippy::type_complexity)]
+    type3_inline_fallback_cache: HashMap<
+        (FontId, u16, u32, Type3InlineColorKey, (u32, u32)),
+        std::sync::Arc<zpdf_display_list::InlineImage>,
+    >,
+    /// Deduplication cache for Type 3 Image XObjects embedded directly on
+    /// `RenderCommand::DrawInlineImage` when no external `ImageCache` was
+    /// supplied.
+    #[allow(clippy::type_complexity)]
+    type3_inline_xobject_cache: HashMap<
+        (ObjectId, Option<[u8; 3]>, (u32, u32)),
+        std::sync::Arc<zpdf_display_list::InlineImage>,
+    >,
+    /// Original decoded source dimensions of non-stencil Image XObjects seen
+    /// on the no-`ImageCache` Type 3 inline path, so footprint lookup uses the
+    /// source size rather than a previously downscaled cached copy.
+    type3_inline_xobject_sizes: HashMap<ObjectId, (u32, u32)>,
+    /// Footprints rejected for image budget on the no-`ImageCache` Type 3
+    /// XObject path, scoped per `(obj_id, footprint)` so a smaller footprint
+    /// of the same object can still be admitted if it fits the remaining budget.
+    type3_rejected_xobject_footprints: HashSet<(ObjectId, (u32, u32))>,
+    /// Decoded RGBA bytes retained by `DrawInlineImage` commands emitted
+    /// without an external `ImageCache`, charged against `max_image_cache_bytes`.
+    type3_inline_fallback_bytes: u64,
     /// `Q` must never pop the state stack below this index — a form XObject
     /// raises it past its own saved state so an unbalanced `Q` inside the
     /// form cannot corrupt the page-level state.
@@ -162,6 +243,10 @@ pub struct ContentInterpreter<'a> {
     /// The CTM at page-content start (identity or the baked page rotation).
     /// Pattern space is anchored to this, not to the CTM at fill time.
     base_ctm: Matrix,
+    /// Snapshot of top-level page `base_ctm` preserved across nested Form,
+    /// pattern, and Type 3 scopes so patterns resolved from page `/Resources`
+    /// remain anchored to page default user space (ISO 32000-1 §8.7.2).
+    page_base_ctm: Matrix,
     /// Inside an uncolored (PaintType 2) tiling-pattern cell: color operators
     /// are ignored so the cell paints with the pattern's `scn` color.
     suppress_color_ops: bool,
@@ -567,6 +652,10 @@ const DEFAULT_MAX_OPS: u64 = 4_000_000;
 /// content is decoded per use again.
 const MAX_CONTENT_CACHE_BYTES: usize = 32 << 20;
 
+/// Maximum retained bytes for cached Type 3 font/CharProc `/Resources` scopes
+/// per page; distinct scopes past this cap are parsed per use and dropped.
+const MAX_TYPE3_RESOURCE_CACHE_BYTES: usize = 4 << 20;
+
 #[derive(Debug, Clone)]
 enum ActiveColorSpace {
     DeviceGray,
@@ -682,13 +771,22 @@ fn cs_produces_no_marks(cs: &ActiveColorSpace) -> bool {
 #[derive(Debug, Clone)]
 enum PatternPaint {
     Shading(std::sync::Arc<crate::shading::ShadingDef>),
-    Tiling(std::sync::Arc<TilingPatternDef>),
+    Tiling {
+        def: std::sync::Arc<TilingPatternDef>,
+        /// Initial coordinate space (`base_ctm`) of the stream in which `scn`
+        /// selected this pattern (ISO 32000-1 §8.7.2).
+        base_ctm: Matrix,
+    },
 }
 
 /// A tiling pattern (PatternType 1), resolved at `scn` time and replicated
 /// cell-by-cell at fill time.
 #[derive(Debug)]
 struct TilingPatternDef {
+    /// Indirect object ID of the pattern stream (used to reload inline Type 3
+    /// fonts declared in the pattern's `/Resources` without cloning them into
+    /// `FontCache`).
+    pattern_id: ObjectId,
     /// Decoded cell content stream.
     content: Vec<u8>,
     /// The pattern's raw stream dict (fonts/resources are loaded at paint time).
@@ -754,6 +852,250 @@ struct DeviceClipBounds {
     y0: u32,
     x1: u32,
     y1: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InlineFontOwner {
+    /// Indirect container object (Form XObject, tiling pattern, Type 3 font, or
+    /// CharProc stream) whose `/Resources /Font /<name>` holds the inline font.
+    Container(ObjectId),
+    /// Indirect `/Resources` dictionary whose `/Font /<name>` holds the inline
+    /// font directly.
+    ResourcesDict(ObjectId),
+}
+
+fn is_paint_command(cmd: &RenderCommand) -> bool {
+    matches!(
+        cmd,
+        RenderCommand::FillPath { .. }
+            | RenderCommand::StrokePath { .. }
+            | RenderCommand::DrawGlyphRun(_)
+            | RenderCommand::DrawImage(_)
+            | RenderCommand::DrawInlineImage(_)
+    )
+}
+
+fn colors_close(a: Color, b: Color) -> bool {
+    const EPS: f32 = 1e-3;
+    (a.r - b.r).abs() <= EPS
+        && (a.g - b.g).abs() <= EPS
+        && (a.b - b.b).abs() <= EPS
+        && (a.a - b.a).abs() <= EPS
+}
+
+fn overprint_matches(a: Option<Overprint>, b: Option<Overprint>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.active == y.active
+                && x.cmyk
+                    .iter()
+                    .zip(y.cmyk.iter())
+                    .all(|(cx, cy)| (cx - cy).abs() <= 1e-3)
+        }
+        _ => false,
+    }
+}
+
+fn command_matches_caller_fill(
+    cmd: &RenderCommand,
+    caller_color: Color,
+    caller_alpha: f32,
+    caller_overprint: Option<Overprint>,
+) -> bool {
+    const EPS: f32 = 1e-3;
+    match cmd {
+        RenderCommand::FillPath {
+            paint,
+            alpha,
+            overprint,
+            ..
+        }
+        | RenderCommand::StrokePath {
+            paint,
+            alpha,
+            overprint,
+            ..
+        } => {
+            matches!(*paint, Paint::Solid(c) if colors_close(c, caller_color) && (*alpha - caller_alpha).abs() <= EPS)
+                && overprint_matches(*overprint, caller_overprint)
+        }
+        RenderCommand::DrawGlyphRun(run) => {
+            matches!(run.paint, Paint::Solid(c) if colors_close(c, caller_color) && (run.alpha - caller_alpha).abs() <= EPS)
+                && overprint_matches(run.overprint, caller_overprint)
+        }
+        RenderCommand::DrawImage(d) => {
+            d.is_image_mask && (d.alpha - caller_alpha).abs() <= EPS && caller_overprint.is_none()
+        }
+        RenderCommand::DrawInlineImage(d) => {
+            d.image.is_image_mask
+                && (d.alpha - caller_alpha).abs() <= EPS
+                && caller_overprint.is_none()
+        }
+        RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => false,
+        RenderCommand::PopClip | RenderCommand::PopBlendGroup => true,
+        RenderCommand::PushBlendGroup {
+            blend_mode,
+            alpha,
+            mask,
+            ..
+        } => mask.is_none() && *blend_mode == BlendMode::Normal && (*alpha - 1.0).abs() <= EPS,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CachedFontBinding {
+    /// Font resource points to the same `ObjectId` as the page's font under
+    /// this name; only pushed as an explicit rebinding when an enclosing scope
+    /// shadowed the name.
+    PageSlot(String),
+    /// Font resource maps `resource_name` to an already-admitted cache slot.
+    CacheSlot(String, String),
+}
+
+#[derive(Debug, Default)]
+struct CachedType3ResourceScope {
+    parsed_resources: Option<std::sync::Arc<ResourceDict>>,
+    font_bindings: Vec<CachedFontBinding>,
+}
+
+#[derive(Debug, Default)]
+struct CachedType3FontResources {
+    scope: Option<std::sync::Arc<CachedType3ResourceScope>>,
+    char_proc_ids: HashMap<String, ObjectId>,
+}
+
+/// Iteratively estimate retained heap bytes for an inline PDF object tree inside
+/// a cached `ResourceDict` (no recursion, so deep dicts cannot overflow stack).
+fn estimate_pdf_object_bytes_iter(root: &PdfObject) -> usize {
+    enum Node<'a> {
+        Dict(&'a PdfDict),
+        Obj(&'a PdfObject),
+    }
+
+    let mut total = 0usize;
+    let mut stack = vec![Node::Obj(root)];
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Dict(d) => {
+                total = total.saturating_add(64);
+                for (k, v) in &d.0 {
+                    total = total.saturating_add(32).saturating_add(k.0.len());
+                    stack.push(Node::Obj(v));
+                }
+            }
+            Node::Obj(obj) => match obj {
+                PdfObject::Null
+                | PdfObject::Bool(_)
+                | PdfObject::Integer(_)
+                | PdfObject::Real(_)
+                | PdfObject::Ref(_) => {
+                    total = total.saturating_add(24);
+                }
+                PdfObject::Name(n) => {
+                    total = total.saturating_add(32).saturating_add(n.0.len());
+                }
+                PdfObject::String(s) => {
+                    total = total.saturating_add(32).saturating_add(s.as_bytes().len());
+                }
+                PdfObject::Array(items) => {
+                    total = total.saturating_add(32);
+                    for item in items {
+                        stack.push(Node::Obj(item));
+                    }
+                }
+                PdfObject::Dict(d) => stack.push(Node::Dict(d)),
+                PdfObject::Stream(stream) => {
+                    total = total.saturating_add(64).saturating_add(stream.data.len());
+                    stack.push(Node::Dict(&stream.dict));
+                }
+            },
+        }
+    }
+    total
+}
+
+fn estimate_pdf_dict_bytes_iter(dict: &PdfDict) -> usize {
+    dict.0.iter().fold(64usize, |acc, (k, v)| {
+        acc.saturating_add(32)
+            .saturating_add(k.0.len())
+            .saturating_add(estimate_pdf_object_bytes_iter(v))
+    })
+}
+
+fn estimate_type3_resource_scope_bytes(scope: &CachedType3ResourceScope) -> usize {
+    let mut total = 64usize;
+    if let Some(res) = scope.parsed_resources.as_ref() {
+        total = total.saturating_add(256);
+        let map_entries = |m: &HashMap<String, ObjectId>| -> usize {
+            m.keys().fold(0usize, |acc, k| {
+                acc.saturating_add(48).saturating_add(k.len())
+            })
+        };
+        total = total
+            .saturating_add(map_entries(&res.fonts))
+            .saturating_add(map_entries(&res.xobjects))
+            .saturating_add(map_entries(&res.ext_g_state))
+            .saturating_add(map_entries(&res.color_spaces))
+            .saturating_add(map_entries(&res.patterns))
+            .saturating_add(map_entries(&res.shadings))
+            .saturating_add(map_entries(&res.properties));
+        for (k, d) in &res.ext_g_state_inline {
+            total = total
+                .saturating_add(48)
+                .saturating_add(k.len())
+                .saturating_add(estimate_pdf_dict_bytes_iter(d));
+        }
+        for (k, o) in &res.color_spaces_inline {
+            total = total
+                .saturating_add(48)
+                .saturating_add(k.len())
+                .saturating_add(estimate_pdf_object_bytes_iter(o));
+        }
+        for (k, o) in &res.shadings_inline {
+            total = total
+                .saturating_add(48)
+                .saturating_add(k.len())
+                .saturating_add(estimate_pdf_object_bytes_iter(o));
+        }
+        for (k, d) in &res.properties_inline {
+            total = total
+                .saturating_add(48)
+                .saturating_add(k.len())
+                .saturating_add(estimate_pdf_dict_bytes_iter(d));
+        }
+    }
+    for binding in &scope.font_bindings {
+        match binding {
+            CachedFontBinding::PageSlot(name) => {
+                total = total.saturating_add(32).saturating_add(name.len());
+            }
+            CachedFontBinding::CacheSlot(name, slot) => {
+                total = total
+                    .saturating_add(64)
+                    .saturating_add(name.len())
+                    .saturating_add(slot.len());
+            }
+        }
+    }
+    total
+}
+
+/// Colour-resolution qualifier for reusing decoded pixels of an inline image
+/// inside a Type 3 glyph. Images whose `/ColorSpace` comes from an inline
+/// resource entry are not cached because distinct enclosing scopes can bind
+/// the same resource name to different inline palettes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Type3InlineColorKey {
+    /// `/ImageMask true` stencil tinted with the active fill RGB.
+    Mask([u8; 3]),
+    /// Non-mask inline image with a self-contained `/ColorSpace` (`cs_ref: None`)
+    /// or an indirect `/ColorSpace` resource (`cs_ref: Some(id)`), qualified by
+    /// the effective rendering intent.
+    Color {
+        cs_ref: Option<ObjectId>,
+        intent: zpdf_color::RenderIntent,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -924,6 +1266,8 @@ impl<'a> ContentInterpreter<'a> {
             file: None,
             resources: None,
             image_cache: None,
+            skip_images: false,
+            skip_type3_painting: false,
             max_image_cache_bytes: limits.max_image_cache_bytes,
             max_font_cache_bytes: limits.max_font_cache_bytes,
             parse_limits: limits,
@@ -948,7 +1292,25 @@ impl<'a> ContentInterpreter<'a> {
             font_override: false,
             form_resources: Vec::new(),
             form_depth: 0,
+            pattern_depth: 0,
             active_forms: Vec::new(),
+            active_type3_glyphs: Vec::new(),
+            type3_font_resources: HashMap::new(),
+            type3_shared_resources: HashMap::new(),
+            type3_glyph_resources: HashMap::new(),
+            type3_resource_cache_bytes: 0,
+            max_type3_resource_cache_bytes: MAX_TYPE3_RESOURCE_CACHE_BYTES,
+            type3_oc_suppressed_mark: false,
+            type3_image_dropped: false,
+            type3_local_image_paint: false,
+            type3_caller_fill: None,
+            type3_inline_ctx: None,
+            type3_inline_image_cache: HashMap::new(),
+            type3_inline_fallback_cache: HashMap::new(),
+            type3_inline_xobject_cache: HashMap::new(),
+            type3_inline_xobject_sizes: HashMap::new(),
+            type3_rejected_xobject_footprints: HashSet::new(),
+            type3_inline_fallback_bytes: 0,
             state_floor: 0,
             text_sink: None,
             span_streams: None,
@@ -957,6 +1319,7 @@ impl<'a> ContentInterpreter<'a> {
             extracted_text_bytes: 0,
             rule_sink: None,
             base_ctm: Matrix::identity(),
+            page_base_ctm: Matrix::identity(),
             suppress_color_ops: false,
             oc_config: None,
             annotations: None,
@@ -1171,14 +1534,52 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Look a value up through the form-resources stack (innermost first),
-    /// falling back to the page-level resources.
-    fn lookup_res<T>(&self, get: impl Fn(&ResourceDict) -> Option<T>) -> Option<T> {
-        for r in self.form_resources.iter().rev() {
-            if let Some(v) = get(r) {
-                return Some(v);
+    /// falling back to the page-level resources, and return the defining
+    /// scope's default `base_ctm` alongside the resource.
+    fn lookup_res_with_base_ctm<T>(
+        &self,
+        get: impl Fn(&ResourceDict) -> Option<T>,
+    ) -> Option<(T, Matrix)> {
+        for (r, scope_base_ctm) in self.form_resources.iter().rev() {
+            if let Some(v) = get(r.as_ref()) {
+                return Some((v, *scope_base_ctm));
             }
         }
-        self.resources.and_then(get)
+        let page_ctm = if self.form_depth == 0 {
+            self.base_ctm
+        } else {
+            self.page_base_ctm
+        };
+        self.resources.and_then(get).map(|v| (v, page_ctm))
+    }
+
+    /// Look a value up through the form-resources stack (innermost first),
+    /// falling back to the page-level resources.
+    fn lookup_res<T>(&self, get: impl Fn(&ResourceDict) -> Option<T>) -> Option<T> {
+        self.lookup_res_with_base_ctm(get).map(|(v, _)| v)
+    }
+
+    /// Resolve a `/ColorSpace` resource by name, checking both direct (inline)
+    /// and indirect entries within each scope before advancing to its parent.
+    fn lookup_color_space_resource(&self, name: &str) -> Option<PdfObject> {
+        self.lookup_res(|r| {
+            r.color_spaces_inline
+                .get(name)
+                .cloned()
+                .or_else(|| r.color_spaces.get(name).copied().map(PdfObject::Ref))
+        })
+    }
+
+    /// Resolve a `/Properties` resource by name, checking both direct (inline)
+    /// and indirect entries within each scope before advancing to its parent.
+    fn lookup_property_resource(&self, name: &str) -> Option<PdfObject> {
+        self.lookup_res(|r| {
+            r.properties_inline
+                .get(name)
+                .cloned()
+                .map(PdfObject::Dict)
+                .or_else(|| r.properties.get(name).copied().map(PdfObject::Ref))
+        })
     }
 
     /// Apply the page `/Rotate` entry (clockwise degrees, normalized to
@@ -1377,6 +1778,28 @@ impl<'a> ContentInterpreter<'a> {
 
     pub fn with_images(mut self, cache: &'a mut ImageCache) -> Self {
         self.image_cache = Some(cache);
+        self
+    }
+
+    /// Skip all image decoding, including self-contained Type 3 inline bitmaps
+    /// and shading rasters when no external `ImageCache` is attached.
+    ///
+    /// Intended for extraction-only callers (such as `ConversionMode::TextOnly`)
+    /// that discard the display list and must not spend image-decode work or
+    /// emit image-budget diagnostics.
+    pub fn with_skip_images(mut self, skip: bool) -> Self {
+        self.skip_images = skip;
+        self
+    }
+
+    /// Skip visual replay of Type 3 glyph CharProc streams while preserving
+    /// text advances and decoded text extraction.
+    ///
+    /// Intended for extraction-only callers (such as `ConversionMode::TextOnly`)
+    /// that discard the display list so repeated vector glyphs cannot consume
+    /// the page's shared operator budget.
+    pub fn with_skip_type3_painting(mut self, skip: bool) -> Self {
+        self.skip_type3_painting = skip;
         self
     }
 
@@ -1610,12 +2033,26 @@ impl<'a> ContentInterpreter<'a> {
         if self.soft_mask_reuse.is_some() {
             self.tile_op_index += 1;
         }
-        // Uncolored (PaintType 2) pattern cells paint exclusively with the
-        // color given at `scn` time; their own color operators are ignored.
+        // Uncolored (PaintType 2) pattern cells and Type 3 `d1` glyphs paint
+        // exclusively with the enclosing color; their own color, rendering-
+        // intent, and shading operators are ignored (ISO 32000-1 §8.7.3.3,
+        // §9.6.5.4).
         if self.suppress_color_ops
             && matches!(
                 op,
-                "g" | "G" | "rg" | "RG" | "k" | "K" | "cs" | "CS" | "sc" | "scn" | "SC" | "SCN"
+                "g" | "G"
+                    | "rg"
+                    | "RG"
+                    | "k"
+                    | "K"
+                    | "cs"
+                    | "CS"
+                    | "sc"
+                    | "scn"
+                    | "SC"
+                    | "SCN"
+                    | "ri"
+                    | "sh"
             )
         {
             return;
@@ -2074,12 +2511,35 @@ impl<'a> ContentInterpreter<'a> {
                 self.execute_do(&name);
             }
 
-            // -- Type3 glyph operators --
+            // -- Type3 glyph operators (ISO 32000-1 §9.6.5.4) --
             "d0" => {
-                // wx wy d0: set glyph width (2 operands, consume them)
+                // wx wy d0: set glyph width; colour operators remain enabled
+                // unless an enclosing uncoloured pattern or `d1` glyph already
+                // locked colour.
+                let _wy = self.pop_f64();
+                let _wx = self.pop_f64();
             }
             "d1" => {
-                // wx wy llx lly urx ury d1: set glyph width and bbox (6 operands)
+                // wx wy llx lly urx ury d1: set glyph width and bbox, and lock
+                // colours to the enclosing non-stroking (fill) paint. Per
+                // ISO 32000-1 Table 113, `d1` is only valid in a Type 3
+                // CharProc stream; ignore misplaced `d1` in page, Form, or
+                // pattern streams so it cannot lock outer colour operators.
+                let _ury = self.pop_f64();
+                let _urx = self.pop_f64();
+                let _lly = self.pop_f64();
+                let _llx = self.pop_f64();
+                let _wy = self.pop_f64();
+                let _wx = self.pop_f64();
+                if self.type3_inline_ctx.is_some() {
+                    self.suppress_color_ops = true;
+                    self.current.stroke_color = self.current.fill_color;
+                    self.current.stroke_alpha = self.current.fill_alpha;
+                    self.current.stroke_cs = self.current.fill_cs.clone();
+                    self.current.stroke_pattern = self.current.fill_pattern.clone();
+                    self.current.stroke_overprint = self.current.fill_overprint;
+                    self.current.stroke_colorant = self.current.fill_colorant;
+                }
             }
 
             // -- Marked content --
@@ -2164,17 +2624,13 @@ impl<'a> ContentInterpreter<'a> {
             "DeviceCMYK" | "CMYK" => ActiveColorSpace::DeviceCMYK,
             "Pattern" => ActiveColorSpace::Pattern { base: None },
             _ => {
-                // Resource lookup: direct (inline) values first, then refs.
-                if let Some(obj) = self.lookup_res(|r| r.color_spaces_inline.get(name).cloned()) {
-                    return self.resolve_color_space_obj(&obj, depth);
-                }
-                let cs_id = match self.lookup_res(|r| r.color_spaces.get(name).copied()) {
-                    Some(id) => id,
-                    None => return ActiveColorSpace::DeviceGray,
+                // Check both direct and indirect entries within each scope
+                // before advancing to its parent; indirect refs pass through as
+                // `PdfObject::Ref` so `cs_cache` builds each space once.
+                let Some(obj) = self.lookup_color_space_resource(name) else {
+                    return ActiveColorSpace::DeviceGray;
                 };
-                // Pass the reference itself so the space is built once per
-                // object (`cs_cache`), not on every `cs`/`CS`/`sh` naming it.
-                self.resolve_color_space_obj(&PdfObject::Ref(cs_id), depth)
+                self.resolve_color_space_obj(&obj, depth)
             }
         }
     }
@@ -2904,14 +3360,22 @@ impl<'a> ContentInterpreter<'a> {
         let Some(file) = self.file else {
             return (None, Color::gray(0.5));
         };
-        let Some(pat_id) = self.lookup_res(|r| r.patterns.get(name).copied()) else {
+        let Some((pat_id, scope_base_ctm)) =
+            self.lookup_res_with_base_ctm(|r| r.patterns.get(name).copied())
+        else {
             tracing::debug!("pattern {name} not found in resources");
             return (None, Color::gray(0.5));
         };
         if let Some(def) = self.tiling_pattern_cache.get(&pat_id) {
-            return (def.clone().map(PatternPaint::Tiling), Color::gray(0.5));
+            return (
+                def.clone().map(|def| PatternPaint::Tiling {
+                    def,
+                    base_ctm: scope_base_ctm,
+                }),
+                Color::gray(0.5),
+            );
         }
-        let shading_key = (pat_id, matrix_bits(&self.base_ctm));
+        let shading_key = (pat_id, matrix_bits(&scope_base_ctm));
         if let Some(built) = self.shading_pattern_cache.get(&shading_key) {
             return shading_pattern_paint(built.as_ref());
         }
@@ -2934,13 +3398,12 @@ impl<'a> ContentInterpreter<'a> {
             .unwrap_or_else(Matrix::identity);
 
         if ptype == 2 {
-            // The pattern /Matrix maps pattern space to the page's *default*
-            // user space, so the shading→page transform is base_ctm · matrix
-            // (mirrors the tiling path). Without base_ctm a shading pattern
-            // ignores page /Rotate and any enclosing form CTM.
+            // The pattern /Matrix maps pattern space to the defining scope's
+            // *default* user space (ISO 32000-1 §8.7.2), so the shading→page
+            // transform is scope_base_ctm · matrix.
             let built = dict
                 .get("Shading")
-                .and_then(|sh_obj| self.build_shading(sh_obj, self.base_ctm.concat(&matrix)))
+                .and_then(|sh_obj| self.build_shading(sh_obj, scope_base_ctm.concat(&matrix)))
                 .map(|def| {
                     let avg = def.average_rgb();
                     (std::sync::Arc::new(def), Color::rgb(avg[0], avg[1], avg[2]))
@@ -2961,7 +3424,13 @@ impl<'a> ContentInterpreter<'a> {
         if self.reserve_content_cache(bytes) {
             self.tiling_pattern_cache.insert(pat_id, def.clone());
         }
-        (def.map(PatternPaint::Tiling), Color::gray(0.5))
+        (
+            def.map(|def| PatternPaint::Tiling {
+                def,
+                base_ctm: scope_base_ctm,
+            }),
+            Color::gray(0.5),
+        )
     }
 
     /// For an uncolored (PaintType 2) tiling pattern selected by `scn`, pop the
@@ -2972,7 +3441,7 @@ impl<'a> ContentInterpreter<'a> {
         pattern: &Option<PatternPaint>,
         base: Option<&ActiveColorSpace>,
     ) -> Option<Color> {
-        let Some(PatternPaint::Tiling(def)) = pattern else {
+        let Some(PatternPaint::Tiling { def, .. }) = pattern else {
             return None;
         };
         if def.paint_type != 2 {
@@ -3509,24 +3978,36 @@ impl<'a> ContentInterpreter<'a> {
     /// whole page — that rasterizes a full-page gradient per call, which a map
     /// with hundreds of small `sh` markers makes pathologically slow).
     fn paint_shading_op(&mut self, name: &str) {
+        if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+            return;
+        }
         // Shadings are represented by decoded images in the display list. Text
         // and table extraction intentionally omit an image cache, so avoid all
         // function parsing, mesh construction, and raster work when there is no
         // store in which the resulting pixels could be retained.
-        if self.image_cache.is_none() {
+        if self.skip_images || (self.image_cache.is_none() && self.active_type3_glyphs.is_empty()) {
             return;
         }
-        let (sh_obj, cache_id) = match self.lookup_res(|r| r.shadings_inline.get(name).cloned()) {
-            Some(o) => (o, None),
-            None => match self.lookup_res(|r| r.shadings.get(name).copied()) {
-                Some(id) => (PdfObject::Ref(id), Some(id)),
-                None => {
-                    self.stats.diagnostics.missing_resources =
-                        self.stats.diagnostics.missing_resources.saturating_add(1);
-                    tracing::debug!("shading {name} not found in resources");
-                    return;
-                }
-            },
+        let (sh_obj, cache_id) = match self.lookup_res(|r| {
+            r.shadings_inline
+                .get(name)
+                .cloned()
+                .map(|o| (o, None))
+                .or_else(|| {
+                    r.shadings
+                        .get(name)
+                        .copied()
+                        .map(|id| (PdfObject::Ref(id), Some(id)))
+                })
+        }) {
+            Some(found) => found,
+            None => {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
+                tracing::debug!("shading {name} not found in resources");
+                return;
+            }
         };
 
         // Only rasterize what the clip actually exposes.
@@ -3564,10 +4045,12 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Rasterize `def` over the page-space `region` and emit it as an image.
-    fn emit_shading_image(&mut self, def: &crate::shading::ShadingDef, region: Rect) {
-        if region.width() <= 0.0 || region.height() <= 0.0 {
-            return;
+    /// Returns `true` when an image command was emitted.
+    fn emit_shading_image(&mut self, def: &crate::shading::ShadingDef, region: Rect) -> bool {
+        if self.skip_images || region.width() <= 0.0 || region.height() <= 0.0 {
+            return false;
         }
+        let embed_inline = self.image_cache.is_none() && !self.active_type3_glyphs.is_empty();
         // Resolution: smooth gradients upscale cleanly; cap the long side.
         let long = region.width().max(region.height());
         let scale = (768.0 / long).min(2.0);
@@ -3581,7 +4064,7 @@ impl<'a> ContentInterpreter<'a> {
         let buf = crate::shading::rasterize(def, region, w, h);
         self.stats.shading_ns += shading_started.elapsed().as_nanos() as u64;
         let Some(buf) = buf else {
-            return;
+            return false;
         };
         self.stats.shading_rasters += 1;
         let image = zpdf_image::DecodedImage {
@@ -3601,11 +4084,15 @@ impl<'a> ContentInterpreter<'a> {
             region.x0,
             region.y0,
         );
+        if embed_inline {
+            return self.emit_draw_inline_image_at(image, transform).is_some();
+        }
         let image = self.fit_image_to_footprint(image, &transform);
         let Some(image_id) = self.admit_image(image) else {
-            return;
+            return false;
         };
         self.emit_image_draw(image_id, transform, false);
+        true
     }
 
     /// Page-space bounding box of a path (for clipping shading fills).
@@ -3642,19 +4129,10 @@ impl<'a> ContentInterpreter<'a> {
     /// looked up in the /Properties resource.
     fn oc_properties_visible(&self, props: &PdfObject) -> bool {
         match props {
-            PdfObject::Name(n) => {
-                let obj = self
-                    .lookup_res(|r| r.properties_inline.get(n.as_str()).cloned())
-                    .map(PdfObject::Dict)
-                    .or_else(|| {
-                        self.lookup_res(|r| r.properties.get(n.as_str()).copied())
-                            .map(PdfObject::Ref)
-                    });
-                match obj {
-                    Some(o) => self.oc_object_visible(&o, 0),
-                    None => true,
-                }
-            }
+            PdfObject::Name(n) => match self.lookup_property_resource(n.as_str()) {
+                Some(o) => self.oc_object_visible(&o, 0),
+                None => true,
+            },
             other => self.oc_object_visible(other, 0),
         }
     }
@@ -3792,13 +4270,11 @@ impl<'a> ContentInterpreter<'a> {
     fn resolve_property_dict(&self, props: &PdfObject) -> Option<PdfDict> {
         match props {
             PdfObject::Dict(d) => Some(d.clone()),
-            PdfObject::Name(n) => {
-                if let Some(d) = self.lookup_res(|r| r.properties_inline.get(n.as_str()).cloned()) {
-                    return Some(d);
-                }
-                let id = self.lookup_res(|r| r.properties.get(n.as_str()).copied())?;
-                self.file?.resolve(id).ok()?.as_dict().ok().cloned()
-            }
+            PdfObject::Name(n) => match self.lookup_property_resource(n.as_str())? {
+                PdfObject::Dict(d) => Some(d),
+                PdfObject::Ref(id) => self.file?.resolve(id).ok()?.as_dict().ok().cloned(),
+                _ => None,
+            },
             PdfObject::Ref(r) => self.file?.resolve(*r).ok()?.as_dict().ok().cloned(),
             _ => None,
         }
@@ -3986,6 +4462,7 @@ impl<'a> ContentInterpreter<'a> {
     /// that mode/mask).
     fn emit_painted(&mut self, cmd: RenderCommand) {
         if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
             return;
         }
         if self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some() {
@@ -4009,36 +4486,45 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn apply_ext_gstate(&mut self, name: &str) {
-        // Try inline dict first (common in TikZ/PGF-generated PDFs)
-        if let Some(dict) = self.lookup_res(|r| r.ext_g_state_inline.get(name).cloned()) {
-            self.apply_ext_gstate_dict(&dict, None);
-            return;
+        enum LookedUpGs {
+            Inline(PdfDict),
+            Ref(ObjectId),
         }
 
-        let file = match self.file {
-            Some(f) => f,
-            None => return,
-        };
-
-        let gs_id = match self.lookup_res(|r| r.ext_g_state.get(name).copied()) {
-            Some(id) => id,
+        // Check both inline and indirect entries within each scope before
+        // advancing to its parent so an outer inline /GS never shadows an
+        // inner indirect /GS.
+        match self.lookup_res(|r| {
+            r.ext_g_state_inline
+                .get(name)
+                .cloned()
+                .map(LookedUpGs::Inline)
+                .or_else(|| r.ext_g_state.get(name).copied().map(LookedUpGs::Ref))
+        }) {
+            Some(LookedUpGs::Inline(dict)) => {
+                self.apply_ext_gstate_dict(&dict, None);
+            }
+            Some(LookedUpGs::Ref(gs_id)) => {
+                let Some(file) = self.file else {
+                    return;
+                };
+                let obj = match file.resolve_shared(gs_id) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        self.stats.diagnostics.record_decode_failure(&e);
+                        return;
+                    }
+                };
+                if let Ok(dict) = obj.as_dict() {
+                    self.apply_ext_gstate_dict(dict, Some(gs_id));
+                }
+            }
             None => {
-                self.stats.diagnostics.missing_resources =
-                    self.stats.diagnostics.missing_resources.saturating_add(1);
-                return;
+                if self.file.is_some() {
+                    self.stats.diagnostics.missing_resources =
+                        self.stats.diagnostics.missing_resources.saturating_add(1);
+                }
             }
-        };
-
-        let obj = match file.resolve_shared(gs_id) {
-            Ok(o) => o,
-            Err(e) => {
-                self.stats.diagnostics.record_decode_failure(&e);
-                return;
-            }
-        };
-
-        if let Ok(dict) = obj.as_dict() {
-            self.apply_ext_gstate_dict(dict, Some(gs_id));
         }
     }
 
@@ -4052,27 +4538,30 @@ impl<'a> ContentInterpreter<'a> {
             self.current.stroke_alpha = a as f32;
         }
         // Overprint (8.6.7): /OP = stroking, /op = nonstroking. Per spec, if
-        // /op is absent, /OP also sets the nonstroking parameter.
-        let op_for_stroke = match dict.get("OP") {
-            Some(PdfObject::Bool(b)) => Some(*b),
-            _ => None,
-        };
-        if let Some(b) = op_for_stroke {
-            self.current.stroke_overprint = b;
-        }
-        match dict.get("op") {
-            Some(PdfObject::Bool(b)) => self.current.fill_overprint = *b,
-            _ => {
-                if let Some(b) = op_for_stroke {
-                    self.current.fill_overprint = b;
+        // /op is absent, /OP also sets the nonstroking parameter. Ignored when
+        // colour-related state is locked (uncoloured pattern or Type 3 `d1`).
+        if !self.suppress_color_ops {
+            let op_for_stroke = match dict.get("OP") {
+                Some(PdfObject::Bool(b)) => Some(*b),
+                _ => None,
+            };
+            if let Some(b) = op_for_stroke {
+                self.current.stroke_overprint = b;
+            }
+            match dict.get("op") {
+                Some(PdfObject::Bool(b)) => self.current.fill_overprint = *b,
+                _ => {
+                    if let Some(b) = op_for_stroke {
+                        self.current.fill_overprint = b;
+                    }
                 }
             }
-        }
-        // /OPM: overprint mode (only 0 and 1 are defined; clamp others to 1).
-        // Read as a number so a real-valued `/OPM 1.0` (some producers emit it)
-        // is honoured, not just an integer.
-        if let Ok(m) = dict.get_f64("OPM") {
-            self.current.overprint_mode = if m.round() == 0.0 { 0 } else { 1 };
+            // /OPM: overprint mode (only 0 and 1 are defined; clamp others to 1).
+            // Read as a number so a real-valued `/OPM 1.0` (some producers emit it)
+            // is honoured, not just an integer.
+            if let Ok(m) = dict.get_f64("OPM") {
+                self.current.overprint_mode = if m.round() == 0.0 { 0 } else { 1 };
+            }
         }
         if let Ok(w) = dict.get_f64("LW") {
             self.current.line_width = w as f32;
@@ -4113,9 +4602,11 @@ impl<'a> ContentInterpreter<'a> {
                 self.select_font_object(*font_ref, size as f32);
             }
         }
-        // /RI: rendering intent name.
-        if let Ok(ri) = dict.get_name("RI") {
-            self.current.rendering_intent = zpdf_color::RenderIntent::from_pdf_name(ri);
+        // /RI: rendering intent name (ignored when colour-related state is locked).
+        if !self.suppress_color_ops {
+            if let Ok(ri) = dict.get_name("RI") {
+                self.current.rendering_intent = zpdf_color::RenderIntent::from_pdf_name(ri);
+            }
         }
         // /BM: a name or an array of names (use the first supported one).
         let bm_name = match dict.get("BM") {
@@ -4305,6 +4796,7 @@ impl<'a> ContentInterpreter<'a> {
         // takes effect later, possibly in visible content).
         let page_rect = self.display_list.page_rect;
         let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
+        let saved_pattern_depth = std::mem::replace(&mut self.pattern_depth, 0);
         let saved_state = self.current.clone();
         let saved_oc_hidden = self.oc_hidden_from.take();
         // Mask glyphs and rules define opacity, not logical page content.
@@ -4331,6 +4823,7 @@ impl<'a> ContentInterpreter<'a> {
         self.text_sink = saved_text_sink;
         self.span_streams = saved_span_streams;
         self.rule_sink = saved_rule_sink;
+        self.pattern_depth = saved_pattern_depth;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
         // /BC components live in the group's /CS; the mean is a serviceable
@@ -4377,6 +4870,7 @@ impl<'a> ContentInterpreter<'a> {
         // A hidden draw does not need a resource. In strict mode, failures in
         // invisible layers must not reject otherwise complete visible output.
         if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
             return;
         }
         let file = match self.file {
@@ -4415,6 +4909,7 @@ impl<'a> ContentInterpreter<'a> {
         // surrounding BDC /OC state and the XObject's own /OC key).
         if let Some(oc) = stream.dict.get("OC") {
             if !self.oc_object_visible(oc, 0) {
+                self.type3_oc_suppressed_mark = true;
                 return;
             }
         }
@@ -4444,47 +4939,89 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn do_image_xobject(&mut self, obj_id: zpdf_core::ObjectId, stream: &zpdf_core::PdfStream) {
-        // Without an image cache there is nowhere to retain the decoded pixels
-        // referenced by a DrawImage command, so avoid paying the stream/image
-        // decode cost only to discard the result below.
-        if self.image_cache.is_none() {
+        if self.skip_images {
+            return;
+        }
+        // Outside Type 3 glyphs, omit Image XObjects when no `ImageCache` is
+        // attached. Inside an active Type 3 glyph (including helper Forms),
+        // embed decoded pixels directly on `DrawInlineImage` so stencil and
+        // bitmap XObject glyphs survive fonts-only rendering.
+        let embed_type3_inline = self.image_cache.is_none() && !self.active_type3_glyphs.is_empty();
+        if self.image_cache.is_none() && !embed_type3_inline {
             return;
         }
         let transform = self.current.ctm;
 
-        // Fast path: this image object is already stored at the size this
-        // draw uses — re-emit it under the current CTM/alpha without
-        // re-decoding (huge win for repeated symbols).
-        if let Some(image_id) = self.stored_image(obj_id, &transform) {
-            self.emit_image_draw(image_id, transform, false);
-            return;
-        }
-        if self.rejected_image_objects.contains(&obj_id) {
-            return;
-        }
-        if let Some(&(width, height)) = self.image_mask_sizes.get(&obj_id) {
-            if cs_produces_no_marks(&self.current.fill_cs) {
-                return;
+        if embed_type3_inline {
+            if let Some(&(width, height)) = self.image_mask_sizes.get(&obj_id) {
+                if cs_produces_no_marks(&self.current.fill_cs) {
+                    return;
+                }
+                let footprint = self.image_footprint(&transform, width, height);
+                let key = (obj_id, Some(self.fill_rgb_u8()), footprint);
+                if let Some(inline) = self.type3_inline_xobject_cache.get(&key).cloned() {
+                    self.emit_inline_image_draw(inline, transform);
+                    return;
+                }
+                if self
+                    .type3_rejected_xobject_footprints
+                    .contains(&(obj_id, footprint))
+                {
+                    self.type3_image_dropped = true;
+                    return;
+                }
+            } else if let Some(&(width, height)) = self.type3_inline_xobject_sizes.get(&obj_id) {
+                let footprint = self.image_footprint(&transform, width, height);
+                let key = (obj_id, None, footprint);
+                if let Some(inline) = self.type3_inline_xobject_cache.get(&key).cloned() {
+                    self.emit_inline_image_draw(inline, transform);
+                    return;
+                }
+                if self
+                    .type3_rejected_xobject_footprints
+                    .contains(&(obj_id, footprint))
+                {
+                    self.type3_image_dropped = true;
+                    return;
+                }
             }
-            let (width, height) = self.image_footprint(&transform, width, height);
-            let key = (obj_id, self.fill_rgb_u8(), width, height);
-            if let Some(&image_id) = self.image_mask_cache.get(&key) {
-                self.emit_image_draw(image_id, transform, true);
-                return;
-            }
-        }
-        // A new footprint of a known image comes from its retained source
-        // rather than from decoding the stream again.
-        match self.store_from_retained(obj_id, &transform) {
-            Stored::Image(image_id) => {
+        } else {
+            // Fast path: this image object is already stored at the size this
+            // draw uses — re-emit it under the current CTM/alpha without
+            // re-decoding (huge win for repeated symbols).
+            if let Some(image_id) = self.stored_image(obj_id, &transform) {
                 self.emit_image_draw(image_id, transform, false);
                 return;
             }
-            Stored::Skipped => {
-                self.rejected_image_objects.insert(obj_id);
+            if self.rejected_image_objects.contains(&obj_id) {
+                self.type3_image_dropped = true;
                 return;
             }
-            Stored::NeedsDecode => {}
+            if let Some(&(width, height)) = self.image_mask_sizes.get(&obj_id) {
+                if cs_produces_no_marks(&self.current.fill_cs) {
+                    return;
+                }
+                let (width, height) = self.image_footprint(&transform, width, height);
+                let key = (obj_id, self.fill_rgb_u8(), width, height);
+                if let Some(&image_id) = self.image_mask_cache.get(&key) {
+                    self.emit_image_draw(image_id, transform, true);
+                    return;
+                }
+            }
+            // A new footprint of a known image comes from its retained source
+            // rather than from decoding the stream again.
+            match self.store_from_retained(obj_id, &transform) {
+                Stored::Image(image_id) => {
+                    self.emit_image_draw(image_id, transform, false);
+                    return;
+                }
+                Stored::Skipped => {
+                    self.type3_image_dropped = true;
+                    self.rejected_image_objects.insert(obj_id);
+                    return;
+                }
+                Stored::NeedsDecode => {}
+            }
         }
 
         let file = match self.file {
@@ -4495,6 +5032,7 @@ impl<'a> ContentInterpreter<'a> {
         let decoded_data = match file.resolve_stream_data_shared(obj_id) {
             Ok(d) => d,
             Err(e) => {
+                self.type3_image_dropped = true;
                 self.stats.diagnostics.record_object_failure(obj_id, &e);
                 tracing::warn!("failed to decode image stream: {e}");
                 return;
@@ -4534,7 +5072,10 @@ impl<'a> ContentInterpreter<'a> {
         // On the first minified draw, opaque Gray/RGB scans need only one
         // converted source row, not a full-resolution RGBA allocation. Later
         // sizes retain the existing two-decode/source-retention policy.
-        if self.image_downscale_scale > 0.0 && !self.image_sources.contains_key(&obj_id) {
+        if !embed_type3_inline
+            && self.image_downscale_scale > 0.0
+            && !self.image_sources.contains_key(&obj_id)
+        {
             match zpdf_image::decode_scan_at_footprint(
                 &decoded_data,
                 &image_dict,
@@ -4586,6 +5127,7 @@ impl<'a> ContentInterpreter<'a> {
         ) {
             Ok(img) => img,
             Err(e) => {
+                self.type3_image_dropped = true;
                 self.stats.diagnostics.record_object_failure(obj_id, &e);
                 tracing::warn!("failed to decode image: {e}");
                 return;
@@ -4613,6 +5155,27 @@ impl<'a> ContentInterpreter<'a> {
                 &self.parse_limits,
                 &mut self.stats.diagnostics,
             );
+        }
+
+        if embed_type3_inline {
+            let is_mask = image.is_image_mask;
+            let (src_w, src_h) = (image.width, image.height);
+            if is_mask {
+                self.image_mask_sizes.insert(obj_id, (src_w, src_h));
+            } else {
+                self.type3_inline_xobject_sizes
+                    .insert(obj_id, (src_w, src_h));
+            }
+            let footprint = self.image_footprint(&transform, src_w, src_h);
+            let color_key = is_mask.then(|| self.fill_rgb_u8());
+            if let Some(inline) = self.emit_draw_inline_image(image) {
+                self.type3_inline_xobject_cache
+                    .insert((obj_id, color_key, footprint), inline);
+            } else {
+                self.type3_rejected_xobject_footprints
+                    .insert((obj_id, footprint));
+            }
+            return;
         }
 
         // `/ImageMask` stencils bake in the fill colour, so they are cached
@@ -4860,8 +5423,99 @@ impl<'a> ContentInterpreter<'a> {
             .as_ref()
             .map_or(0, |cache| cache.bytes_used())
             .saturating_add(self.retained_image_bytes)
+            .saturating_add(self.type3_inline_fallback_bytes)
             .saturating_add(bytes)
             <= self.max_image_cache_bytes
+    }
+
+    /// Paint an `/ImageMask true` stencil with the active fill pattern by
+    /// rendering `pat` inside a blend group modulated by a `SoftMaskKind::Alpha`
+    /// carrying the stencil coverage. Returns `false` if the stencil transform
+    /// is degenerate or tiling replication cannot proceed (caller falls back to
+    /// the solid fill approximation).
+    fn emit_patterned_image_mask(
+        &mut self,
+        mask_cmd: RenderCommand,
+        transform: Matrix,
+        pat: &PatternPaint,
+    ) -> bool {
+        if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+            return true;
+        }
+        let corners = [
+            Point::new(0.0, 0.0).transform(&transform),
+            Point::new(1.0, 0.0).transform(&transform),
+            Point::new(0.0, 1.0).transform(&transform),
+            Point::new(1.0, 1.0).transform(&transform),
+        ];
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for c in &corners {
+            x0 = x0.min(c.x);
+            y0 = y0.min(c.y);
+            x1 = x1.max(c.x);
+            y1 = y1.max(c.y);
+        }
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+            || x1 <= x0
+            || y1 <= y0
+        {
+            return false;
+        }
+        let bounds = Rect::new(x0, y0, x1, y1);
+        let mut mask_dl = DisplayList::new(self.display_list.page_rect);
+        mask_dl.push(mask_cmd);
+        let stencil_mask = SoftMask {
+            kind: SoftMaskKind::Alpha,
+            commands: std::sync::Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let cmd_mark = self.display_list.commands.len();
+        let has_outer_group =
+            self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some();
+        if has_outer_group {
+            self.display_list.push(RenderCommand::PushBlendGroup {
+                blend_mode: self.current.blend_mode,
+                isolated: true,
+                knockout: false,
+                bounds: self.display_list.page_rect,
+                alpha: 1.0,
+                mask: self.current.soft_mask.clone(),
+            });
+        }
+        self.display_list.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: self.display_list.page_rect,
+            alpha: self.current.fill_alpha,
+            mask: Some(stencil_mask),
+        });
+
+        let saved_blend = std::mem::replace(&mut self.current.blend_mode, BlendMode::Normal);
+        let saved_soft_mask = self.current.soft_mask.take();
+        let saved_fill_alpha = std::mem::replace(&mut self.current.fill_alpha, 1.0);
+        let saved_stroke_alpha = std::mem::replace(&mut self.current.stroke_alpha, 1.0);
+        let painted = self.paint_pattern_in_region(pat, bounds);
+        self.current.blend_mode = saved_blend;
+        self.current.soft_mask = saved_soft_mask;
+        self.current.fill_alpha = saved_fill_alpha;
+        self.current.stroke_alpha = saved_stroke_alpha;
+
+        if painted {
+            self.display_list.push(RenderCommand::PopBlendGroup);
+            if has_outer_group {
+                self.display_list.push(RenderCommand::PopBlendGroup);
+            }
+            true
+        } else {
+            self.display_list.truncate_commands(cmd_mark);
+            false
+        }
     }
 
     fn emit_image_draw(
@@ -4870,6 +5524,28 @@ impl<'a> ContentInterpreter<'a> {
         transform: Matrix,
         is_image_mask: bool,
     ) {
+        if !self.active_type3_glyphs.is_empty()
+            && (!is_image_mask
+                || self.current.fill_pattern.is_some()
+                || self
+                    .type3_caller_fill
+                    .is_some_and(|caller| !colors_close(self.current.fill_color, caller)))
+        {
+            self.type3_local_image_paint = true;
+        }
+        if is_image_mask {
+            if let Some(pat) = self.current.fill_pattern.clone() {
+                let mask_cmd = RenderCommand::DrawImage(ImageDraw {
+                    image_id,
+                    transform,
+                    alpha: 1.0,
+                    is_image_mask: true,
+                });
+                if self.emit_patterned_image_mask(mask_cmd, transform, &pat) {
+                    return;
+                }
+            }
+        }
         self.emit_painted(RenderCommand::DrawImage(ImageDraw {
             image_id,
             transform,
@@ -4878,23 +5554,159 @@ impl<'a> ContentInterpreter<'a> {
         }));
     }
 
+    fn emit_inline_image_draw(
+        &mut self,
+        image: std::sync::Arc<zpdf_display_list::InlineImage>,
+        transform: Matrix,
+    ) {
+        if !self.active_type3_glyphs.is_empty()
+            && (!image.is_image_mask
+                || self.current.fill_pattern.is_some()
+                || self
+                    .type3_caller_fill
+                    .is_some_and(|caller| !colors_close(self.current.fill_color, caller)))
+        {
+            self.type3_local_image_paint = true;
+        }
+        if image.is_image_mask {
+            if let Some(pat) = self.current.fill_pattern.clone() {
+                let mask_cmd = RenderCommand::DrawInlineImage(zpdf_display_list::InlineImageDraw {
+                    image: std::sync::Arc::clone(&image),
+                    transform,
+                    alpha: 1.0,
+                });
+                if self.emit_patterned_image_mask(mask_cmd, transform, &pat) {
+                    return;
+                }
+            }
+        }
+        self.emit_painted(RenderCommand::DrawInlineImage(
+            zpdf_display_list::InlineImageDraw {
+                image,
+                transform,
+                alpha: self.current.fill_alpha,
+            },
+        ));
+    }
+
     fn do_inline_image(&mut self, dict: zpdf_core::PdfDict, data: Vec<u8>) {
         // BI ... EI is one operation in every content loop. Charge it even
-        // when rendering is skipped (for example a Type3 child without an
-        // image cache), just as execute_operator charges suppressed operators.
+        // when rendering is skipped (for example a page without an image
+        // cache), just as execute_operator charges suppressed operators.
         self.ops_executed = self.ops_executed.saturating_add(1);
 
-        if self.image_cache.is_none() || self.oc_suppressed() {
+        // Allocate the per-glyph inline-image ordinal in source order before
+        // visibility or cache guards so an OC-hidden image never shifts a later
+        // visible image into an earlier cache slot.
+        let type3_slot = self
+            .type3_inline_ctx
+            .as_mut()
+            .map(|(font_id, glyph_id, ordinal)| {
+                let idx = *ordinal;
+                *ordinal = ordinal.saturating_add(1);
+                (*font_id, *glyph_id, idx)
+            });
+        if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
             return;
         }
         let mut norm = normalize_inline_image_dict(&dict);
+        let is_mask = matches!(norm.get("ImageMask"), Some(PdfObject::Bool(true)));
         // An inline /ImageMask stencil paints in the current fill colour, so a
         // `/None` (no-marks) fill colour space suppresses it.
-        if cs_produces_no_marks(&self.current.fill_cs)
-            && matches!(norm.get("ImageMask"), Some(PdfObject::Bool(true)))
-        {
+        if cs_produces_no_marks(&self.current.fill_cs) && is_mask {
             return;
         }
+        if self.skip_images {
+            return;
+        }
+        // Outside Type 3 glyphs, omit inline images when the caller supplied no
+        // `ImageCache`. Inside a Type 3 glyph (including helper Forms it calls),
+        // embed decoded pixels directly on `DrawInlineImage` so bitmap glyphs
+        // and mixed Form+stencil glyphs preserve every mark in paint order.
+        let embed_type3_inline = self.image_cache.is_none()
+            && (type3_slot.is_some() || !self.active_type3_glyphs.is_empty());
+        if self.image_cache.is_none() && !embed_type3_inline {
+            return;
+        }
+        let intent = norm
+            .get_name("Intent")
+            .ok()
+            .map(zpdf_color::RenderIntent::from_pdf_name)
+            .unwrap_or(self.current.rendering_intent);
+        // Resolve any named non-device `/ColorSpace` resource BEFORE checking
+        // the Type 3 inline-image cache so placements inheriting different
+        // colour spaces or rendering intents never alias each other's pixels.
+        let mut resolved_named_cs: Option<Option<ObjectId>> = None;
+        if !is_mask {
+            if let Some(PdfObject::Name(n)) = norm.get("ColorSpace") {
+                let cs_name = n.0.clone();
+                if !matches!(
+                    cs_name.as_str(),
+                    "DeviceGray" | "G" | "DeviceRGB" | "RGB" | "DeviceCMYK" | "CMYK"
+                ) {
+                    if let Some(obj) = self.lookup_color_space_resource(&cs_name) {
+                        let ref_id = match &obj {
+                            PdfObject::Ref(id) => Some(*id),
+                            _ => None,
+                        };
+                        norm.0.insert(zpdf_core::PdfName("ColorSpace".into()), obj);
+                        resolved_named_cs = Some(ref_id);
+                    } else {
+                        resolved_named_cs = Some(None);
+                    }
+                }
+            }
+        }
+        let color_key = if is_mask {
+            Some(Type3InlineColorKey::Mask(self.fill_rgb_u8()))
+        } else {
+            match resolved_named_cs {
+                // Named resource resolved to a concrete indirect object id.
+                Some(Some(cs_id)) => Some(Type3InlineColorKey::Color {
+                    cs_ref: Some(cs_id),
+                    intent,
+                }),
+                // Named resource resolved to an inline object or was missing:
+                // skip cross-placement pixel reuse because enclosing scopes can
+                // bind different inline palettes under the same resource name.
+                Some(None) => None,
+                // Self-contained device/array/absent `/ColorSpace`.
+                None => Some(Type3InlineColorKey::Color {
+                    cs_ref: None,
+                    intent,
+                }),
+            }
+        };
+        let type3_cache_key =
+            if let (Some((font_id, glyph_id, idx)), Some(color_key)) = (type3_slot, color_key) {
+                let w = norm
+                    .get_i64("Width")
+                    .ok()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+                let h = norm
+                    .get_i64("Height")
+                    .ok()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+                let footprint = self.image_footprint(&self.current.ctm, w, h);
+                let key = (font_id, glyph_id, idx, color_key, footprint);
+                if embed_type3_inline {
+                    if let Some(image) = self.type3_inline_fallback_cache.get(&key) {
+                        self.emit_inline_image_draw(std::sync::Arc::clone(image), self.current.ctm);
+                        return;
+                    }
+                } else if let Some(&(image_id, cached_is_mask)) =
+                    self.type3_inline_image_cache.get(&key)
+                {
+                    self.emit_image_draw(image_id, self.current.ctm, cached_is_mask);
+                    return;
+                }
+                Some(key)
+            } else {
+                None
+            };
         let decoded = match zpdf_parser::filters::decode_stream_borrowed_with_limits(
             &data,
             &norm,
@@ -4902,35 +5714,12 @@ impl<'a> ContentInterpreter<'a> {
         ) {
             Ok(d) => d,
             Err(e) => {
+                self.type3_image_dropped = true;
                 self.stats.diagnostics.record_decode_failure(&e);
                 tracing::warn!("inline image: filter decode failed: {e}");
                 return;
             }
         };
-        // An inline-image /CS naming a non-device space refers to a
-        // /ColorSpace resource; substitute the resolved object.
-        if let Some(PdfObject::Name(n)) = norm.get("ColorSpace") {
-            let cs_name = n.0.clone();
-            if !matches!(
-                cs_name.as_str(),
-                "DeviceGray" | "G" | "DeviceRGB" | "RGB" | "DeviceCMYK" | "CMYK"
-            ) {
-                let from_res = self
-                    .lookup_res(|r| r.color_spaces_inline.get(&cs_name).cloned())
-                    .or_else(|| {
-                        self.lookup_res(|r| r.color_spaces.get(&cs_name).copied())
-                            .map(PdfObject::Ref)
-                    });
-                if let Some(obj) = from_res {
-                    norm.0.insert(zpdf_core::PdfName("ColorSpace".into()), obj);
-                }
-            }
-        }
-        let intent = norm
-            .get_name("Intent")
-            .ok()
-            .map(zpdf_color::RenderIntent::from_pdf_name)
-            .unwrap_or(self.current.rendering_intent);
         let colorspace = resolve_image_colorspace(
             self.file,
             self.icc_cache.as_deref_mut(),
@@ -4946,8 +5735,22 @@ impl<'a> ContentInterpreter<'a> {
             colorspace,
             &self.parse_limits,
         ) {
-            Ok(img) => self.emit_draw_image(img),
+            Ok(img) => {
+                if embed_type3_inline {
+                    if let Some(inline) = self.emit_draw_inline_image(img) {
+                        if let Some(key) = type3_cache_key {
+                            self.type3_inline_fallback_cache.insert(key, inline);
+                        }
+                    }
+                } else if let Some(image_id) = self.emit_draw_image(img) {
+                    if let Some(key) = type3_cache_key {
+                        self.type3_inline_image_cache
+                            .insert(key, (image_id, is_mask));
+                    }
+                }
+            }
             Err(e) => {
+                self.type3_image_dropped = true;
                 self.stats.diagnostics.record_decode_failure(&e);
                 tracing::warn!("inline image: {e}");
             }
@@ -4961,14 +5764,44 @@ impl<'a> ContentInterpreter<'a> {
         [to_u8(c.r), to_u8(c.g), to_u8(c.b)]
     }
 
-    fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
+    fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) -> Option<zpdf_image::ImageId> {
         let transform = self.current.ctm;
         let image = self.fit_image_to_footprint(image, &transform);
         let is_image_mask = image.is_image_mask;
-        let Some(image_id) = self.admit_image(image) else {
-            return;
-        };
+        let image_id = self.admit_image(image)?;
         self.emit_image_draw(image_id, transform, is_image_mask);
+        Some(image_id)
+    }
+
+    fn emit_draw_inline_image(
+        &mut self,
+        image: zpdf_image::DecodedImage,
+    ) -> Option<std::sync::Arc<zpdf_display_list::InlineImage>> {
+        self.emit_draw_inline_image_at(image, self.current.ctm)
+    }
+
+    fn emit_draw_inline_image_at(
+        &mut self,
+        image: zpdf_image::DecodedImage,
+        transform: Matrix,
+    ) -> Option<std::sync::Arc<zpdf_display_list::InlineImage>> {
+        let image = self.fit_image_to_footprint(image, &transform);
+        let bytes = u64::try_from(image.data.capacity()).unwrap_or(u64::MAX);
+        if !self.image_room(bytes) {
+            self.warn_image_dropped(bytes);
+            return None;
+        }
+        self.type3_inline_fallback_bytes = self.type3_inline_fallback_bytes.saturating_add(bytes);
+        let inline = std::sync::Arc::new(zpdf_display_list::InlineImage {
+            width: image.width,
+            height: image.height,
+            data: image.data,
+            has_alpha: image.has_alpha,
+            is_image_mask: image.is_image_mask,
+            premultiplied: image.premultiplied,
+        });
+        self.emit_inline_image_draw(std::sync::Arc::clone(&inline), transform);
+        Some(inline)
     }
 
     fn admit_image(&mut self, image: zpdf_image::DecodedImage) -> Option<zpdf_image::ImageId> {
@@ -4984,13 +5817,15 @@ impl<'a> ContentInterpreter<'a> {
     fn insert_image(&mut self, image: zpdf_image::DecodedImage) -> Option<zpdf_image::ImageId> {
         let limit = self
             .max_image_cache_bytes
-            .saturating_sub(self.retained_image_bytes);
+            .saturating_sub(self.retained_image_bytes)
+            .saturating_sub(self.type3_inline_fallback_bytes);
         self.image_cache
             .as_mut()?
             .try_insert_with_limit(image, limit)
     }
 
     fn warn_image_dropped(&mut self, bytes: u64) {
+        self.type3_image_dropped = true;
         self.stats.diagnostics.resource_limit_reached = true;
         tracing::warn!(
             "image cache byte limit ({}) or ID capacity reached; dropping {bytes}-byte image",
@@ -5085,9 +5920,11 @@ impl<'a> ContentInterpreter<'a> {
             }
             None => None,
         };
+        let form_ctm = self.current.ctm.concat(&form_matrix);
         let pushed_resources = own_resources.is_some();
         if let Some(res) = own_resources {
-            self.form_resources.push(res);
+            self.form_resources
+                .push((std::sync::Arc::new(res), form_ctm));
         }
 
         // Save full state including text matrices
@@ -5111,12 +5948,16 @@ impl<'a> ContentInterpreter<'a> {
         let saved_mc_stack = std::mem::take(&mut self.mc_stack);
         let saved_mc_stream = std::mem::replace(&mut self.current_mc_stream, xobj_id.map(Some));
         let saved_oc_hidden = self.oc_hidden_from;
+        let saved_type3_inline_ctx = self.type3_inline_ctx.take();
 
-        self.current.ctm = self.current.ctm.concat(&form_matrix);
+        if self.form_depth == 0 {
+            self.page_base_ctm = self.base_ctm;
+        }
+        self.current.ctm = form_ctm;
         // Pattern space inside the form anchors to the form's default space
         // (the CTM established by Do + the form /Matrix), not the page's.
         let saved_base_ctm = self.base_ctm;
-        self.base_ctm = self.current.ctm;
+        self.base_ctm = form_ctm;
         self.text_matrix = Matrix::identity();
         self.text_line_matrix = Matrix::identity();
         self.current.clip_depth = 0;
@@ -5241,6 +6082,7 @@ impl<'a> ContentInterpreter<'a> {
         self.enclosing_struct_actual_text = saved_enclosing_struct_actual_text;
         self.compatibility_depth = saved_compatibility;
         self.oc_hidden_from = saved_oc_hidden;
+        self.type3_inline_ctx = saved_type3_inline_ctx;
         self.base_ctm = saved_base_ctm;
         self.pop_form_fonts();
         if pushed_resources {
@@ -5292,8 +6134,44 @@ impl<'a> ContentInterpreter<'a> {
         form_id: Option<ObjectId>,
         file: &PdfFile,
     ) {
-        // Either level may be an indirect reference.
-        let fonts_of = |res: &zpdf_core::PdfDict| match res.get("Font") {
+        let (res_dict, owner) = match form_dict.get("Resources") {
+            Some(PdfObject::Dict(res)) => {
+                (Some(res.clone()), form_id.map(InlineFontOwner::Container))
+            }
+            Some(PdfObject::Ref(r)) => (
+                file.resolve(*r)
+                    .ok()
+                    .and_then(|o| o.as_dict().ok().cloned()),
+                Some(InlineFontOwner::ResourcesDict(*r)),
+            ),
+            _ => (None, None),
+        };
+        match res_dict {
+            Some(res) => self.load_fonts_from_resources_dict(&res, owner, file),
+            None => self.form_font_overrides.push(HashMap::new()),
+        }
+    }
+
+    fn load_fonts_from_resources_dict(
+        &mut self,
+        res_dict: &zpdf_core::PdfDict,
+        owner: Option<InlineFontOwner>,
+        file: &PdfFile,
+    ) {
+        let bindings = self.prepare_font_bindings(res_dict, owner, file);
+        self.push_cached_font_bindings(&bindings);
+    }
+
+    /// Resolve and admit fonts from `res_dict`'s `/Font` subdictionary once,
+    /// returning lightweight bindings that can be pushed against any enclosing
+    /// scope stack via [`Self::push_cached_font_bindings`].
+    fn prepare_font_bindings(
+        &mut self,
+        res_dict: &zpdf_core::PdfDict,
+        owner: Option<InlineFontOwner>,
+        file: &PdfFile,
+    ) -> Vec<CachedFontBinding> {
+        let fonts_dict = match res_dict.get("Font") {
             Some(PdfObject::Dict(f)) => Some(f.clone()),
             Some(PdfObject::Ref(r)) => file
                 .resolve(*r)
@@ -5301,21 +6179,9 @@ impl<'a> ContentInterpreter<'a> {
                 .and_then(|o| o.as_dict().ok().cloned()),
             _ => None,
         };
-        let fonts_dict = match form_dict.get("Resources") {
-            Some(PdfObject::Dict(res)) => fonts_of(res),
-            Some(PdfObject::Ref(r)) => file
-                .resolve(*r)
-                .ok()
-                .and_then(|o| o.as_dict().ok().and_then(fonts_of)),
-            _ => None,
-        };
 
-        let fonts = match fonts_dict {
-            Some(f) => f,
-            None => {
-                self.form_font_overrides.push(HashMap::new());
-                return;
-            }
+        let Some(fonts) = fonts_dict else {
+            return Vec::new();
         };
 
         // Build page font ObjectId mapping for collision detection
@@ -5324,16 +6190,12 @@ impl<'a> ContentInterpreter<'a> {
             .map(|r| r.fonts.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
 
-        let mut overrides = HashMap::new();
+        let mut bindings = Vec::new();
         let max_font_bytes = self.max_font_cache_bytes;
         let shared_doc = self.shared_font_doc;
 
-        let fc = match self.font_cache.as_mut() {
-            Some(fc) => fc,
-            None => {
-                self.form_font_overrides.push(HashMap::new());
-                return;
-            }
+        let Some(fc) = self.font_cache.as_mut() else {
+            return Vec::new();
         };
 
         // Page resources are capped by MAX_RESOURCE_ENTRIES; a form's raw
@@ -5347,12 +6209,15 @@ impl<'a> ContentInterpreter<'a> {
             match obj {
                 PdfObject::Ref(font_ref) => {
                     // If the page already caches this exact font under this same
-                    // name, the plain name already resolves to it — no override.
+                    // name, reuse the page's cache slot and record a `PageSlot`
+                    // binding so `push_cached_font_bindings` emits an explicit
+                    // rebinding whenever an enclosing scope shadows `name`.
                     let page_same_obj = page_font_ids
                         .get(&name.0)
                         .map(|id| *id == *font_ref)
                         .unwrap_or(false);
                     if page_same_obj {
+                        bindings.push(CachedFontBinding::PageSlot(name.0.clone()));
                         continue;
                     }
 
@@ -5387,7 +6252,7 @@ impl<'a> ContentInterpreter<'a> {
                             }
                         }
                     }
-                    overrides.insert(name.0.clone(), unique_name);
+                    bindings.push(CachedFontBinding::CacheSlot(name.0.clone(), unique_name));
                 }
                 PdfObject::Dict(font_dict) => {
                     // Inline font dict: key the slot by the dictionary itself.
@@ -5397,8 +6262,28 @@ impl<'a> ContentInterpreter<'a> {
                     // stable across repeated paints and across interpreters
                     // sharing one FontCache.
                     let target = format!("__inline_font_{:016x}", inline_font_key(font_dict));
-                    overrides.insert(name.0.clone(), target.clone());
-                    if fc.get_by_name(&target).is_none() {
+                    bindings.push(CachedFontBinding::CacheSlot(name.0.clone(), target.clone()));
+                    if let Some((fid, _)) = fc.get_by_name(&target) {
+                        if matches!(
+                            fc.type3_source(fid),
+                            Some(zpdf_font::Type3Source::Unavailable)
+                        ) {
+                            let upgraded = match owner {
+                                Some(InlineFontOwner::Container(owner_id)) => {
+                                    fc.record_type3_container_source(fid, owner_id, name.0.clone());
+                                    true
+                                }
+                                Some(InlineFontOwner::ResourcesDict(res_id)) => {
+                                    fc.record_type3_resources_source(fid, res_id, name.0.clone());
+                                    true
+                                }
+                                None => false,
+                            };
+                            if upgraded {
+                                self.type3_font_resources.remove(&fid);
+                            }
+                        }
+                    } else {
                         match zpdf_document::font_loader::load_single_font_dict_with_fallback(
                             file,
                             font_dict,
@@ -5413,6 +6298,38 @@ impl<'a> ContentInterpreter<'a> {
                                     max_font_bytes,
                                 ) {
                                     Ok(fid) => {
+                                        if fc.get(fid).is_some_and(|f| f.has_type3_programs()) {
+                                            match owner {
+                                                Some(InlineFontOwner::Container(owner_id)) => {
+                                                    fc.record_type3_container_source(
+                                                        fid,
+                                                        owner_id,
+                                                        name.0.clone(),
+                                                    );
+                                                }
+                                                Some(InlineFontOwner::ResourcesDict(res_id)) => {
+                                                    fc.record_type3_resources_source(
+                                                        fid,
+                                                        res_id,
+                                                        name.0.clone(),
+                                                    );
+                                                }
+                                                None => {
+                                                    if !fc.record_type3_inline_source_with_limit(
+                                                        fid,
+                                                        std::sync::Arc::new(font_dict.clone()),
+                                                        max_font_bytes,
+                                                    ) && (font_dict.get("Resources").is_some()
+                                                        || font_dict.get("CharProcs").is_some())
+                                                    {
+                                                        fc.record_type3_source_unavailable(fid);
+                                                        self.stats
+                                                            .diagnostics
+                                                            .resource_limit_reached = true;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if fc.get(fid).is_some_and(|f| f.has_font_data()) {
                                             if let Some(spec) = descriptor_spec {
                                                 fc.record_descriptor_substitute(
@@ -5421,10 +6338,18 @@ impl<'a> ContentInterpreter<'a> {
                                                     max_font_bytes,
                                                 );
                                             } else if companion.is_some() {
-                                                let source = match form_id {
-                                                    Some(id) => {
+                                                let source = match owner {
+                                                    Some(InlineFontOwner::Container(id)) => {
                                                         zpdf_font::CompanionSource::FormInlineFont {
                                                             form_id: id,
+                                                            font_name: name.0.clone(),
+                                                        }
+                                                    }
+                                                    Some(InlineFontOwner::ResourcesDict(
+                                                        resources_id,
+                                                    )) => {
+                                                        zpdf_font::CompanionSource::ResourcesInlineFont {
+                                                            resources_id,
                                                             font_name: name.0.clone(),
                                                         }
                                                     }
@@ -5458,6 +6383,29 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
 
+        bindings
+    }
+
+    /// Push a font override scope from cached bindings, resolving `PageSlot`
+    /// entries against the currently active parent override stack.
+    fn push_cached_font_bindings(&mut self, bindings: &[CachedFontBinding]) {
+        let mut overrides = HashMap::new();
+        for binding in bindings {
+            match binding {
+                CachedFontBinding::PageSlot(name) => {
+                    if self
+                        .form_font_overrides
+                        .iter()
+                        .any(|m| m.contains_key(name))
+                    {
+                        overrides.insert(name.clone(), name.clone());
+                    }
+                }
+                CachedFontBinding::CacheSlot(name, target) => {
+                    overrides.insert(name.clone(), target.clone());
+                }
+            }
+        }
         if !overrides.is_empty() {
             self.font_repair.scope_changed();
         }
@@ -5848,24 +6796,40 @@ impl<'a> ContentInterpreter<'a> {
     /// Returns false when a tiling pattern could not be replicated, so the
     /// caller can fall back to a solid approximation.
     fn paint_pattern_in_region(&mut self, pattern: &PatternPaint, bounds: Rect) -> bool {
+        if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+            return true;
+        }
         match pattern {
             PatternPaint::Shading(def) => {
-                self.emit_shading_image(def, bounds);
-                true
+                if self.skip_images
+                    || (self.image_cache.is_none() && self.active_type3_glyphs.is_empty())
+                {
+                    return false;
+                }
+                self.emit_shading_image(def, bounds)
             }
-            PatternPaint::Tiling(def) => self.paint_tiling_pattern(def, bounds),
+            PatternPaint::Tiling { def, base_ctm } => {
+                self.paint_tiling_pattern(def, *base_ctm, bounds)
+            }
         }
     }
 
     /// Replicate a tiling-pattern cell across the page-space `bounds` of a
     /// fill. Returns false when the pattern is degenerate or the tile count
     /// explodes, in which case the caller falls back to a solid fill.
-    fn paint_tiling_pattern(&mut self, def: &TilingPatternDef, bounds: Rect) -> bool {
+    fn paint_tiling_pattern(
+        &mut self,
+        def: &TilingPatternDef,
+        pattern_base_ctm: Matrix,
+        bounds: Rect,
+    ) -> bool {
         const MAX_FORM_DEPTH: u32 = 16;
         const MAX_TILES: i64 = 4096;
         if self.oc_suppressed() {
             // Hidden layer: skip the tile replication work entirely (the
             // surrounding clip pair is balanced and paints nothing).
+            self.type3_oc_suppressed_mark = true;
             return true;
         }
         if self.form_depth >= MAX_FORM_DEPTH {
@@ -5873,9 +6837,9 @@ impl<'a> ContentInterpreter<'a> {
             tracing::warn!("tiling pattern nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return false;
         }
-        // Pattern space is anchored to the page's default user space, not the
-        // CTM at fill time.
-        let to_page = self.base_ctm.concat(&def.matrix);
+        // Pattern space is anchored to the defining stream's initial user space
+        // (`pattern_base_ctm`), not the CTM at fill time or a glyph's FontMatrix.
+        let to_page = pattern_base_ctm.concat(&def.matrix);
         let Some(from_page) = to_page.inverse() else {
             return false;
         };
@@ -5933,16 +6897,21 @@ impl<'a> ContentInterpreter<'a> {
 
         // Pattern /Resources and fonts shadow the page's for the cell body,
         // exactly like a form XObject's.
-        self.load_form_fonts(&def.dict, None, file);
+        self.load_form_fonts(&def.dict, Some(def.pattern_id), file);
         let own_resources = def
             .dict
             .get("Resources")
             .and_then(|res_obj| self.resolve_dict_of(res_obj))
             .and_then(|d| zpdf_document::page::parse_resource_dict(&d, file).ok());
         let pushed_resources = own_resources.is_some();
-        if let Some(res) = own_resources {
-            self.form_resources.push(res);
-        }
+        let pattern_res_idx = if let Some(res) = own_resources {
+            let idx = self.form_resources.len();
+            self.form_resources
+                .push((std::sync::Arc::new(res), to_page));
+            Some(idx)
+        } else {
+            None
+        };
 
         let saved_text_matrix = self.text_matrix;
         let saved_text_line_matrix = self.text_line_matrix;
@@ -5959,6 +6928,7 @@ impl<'a> ContentInterpreter<'a> {
         let saved_mc_stack = self.mc_stack.clone();
         let saved_compatibility = self.compatibility_depth;
         let saved_oc_hidden = self.oc_hidden_from;
+        let saved_type3_inline_ctx = self.type3_inline_ctx.take();
         // Patterns selected inside the cell anchor to the cell's space.
         let saved_base_ctm = self.base_ctm;
         let uncolored = def.paint_type == 2;
@@ -5981,6 +6951,12 @@ impl<'a> ContentInterpreter<'a> {
         let saved_tile_op_index = self.tile_op_index;
         let saved_mc_stream = self.current_mc_stream.take();
 
+        if self.form_depth == 0 {
+            self.page_base_ctm = self.base_ctm;
+        }
+        let pattern_cmd_start = self.display_list.commands.len();
+        let is_outer_pattern = self.pattern_depth == 0;
+        self.pattern_depth += 1;
         self.form_depth += 1;
         'tiles: for j in j0..=j1 {
             for i in i0..=i1 {
@@ -6029,10 +7005,18 @@ impl<'a> ContentInterpreter<'a> {
                     // colour op in the cell uses black's colorant, not a stale one.
                     self.current.fill_colorant = Some(gray_colorant(0.0));
                     self.current.stroke_colorant = Some(gray_colorant(0.0));
+                    // Colored (PaintType 1) tiling patterns define their own
+                    // colours per ISO 32000-1 §8.7.2, even when inherited as
+                    // the active paint of a `d1` Type 3 glyph; `saved_suppress`
+                    // restores the glyph's colour lock once the cell finishes.
+                    self.suppress_color_ops = false;
                 }
                 self.text_matrix = Matrix::identity();
                 self.text_line_matrix = Matrix::identity();
                 self.base_ctm = tile_ctm;
+                if let Some(idx) = pattern_res_idx {
+                    self.form_resources[idx].1 = tile_ctm;
+                }
 
                 // Clip the cell to its /BBox.
                 let mut bbox_path = Path::new();
@@ -6104,11 +7088,20 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.form_depth -= 1;
+        self.pattern_depth -= 1;
+        if is_outer_pattern {
+            let pattern_cmd_end = self.display_list.commands.len();
+            if pattern_cmd_end > pattern_cmd_start {
+                self.display_list
+                    .push_pattern_range(pattern_cmd_start, pattern_cmd_end);
+            }
+        }
         self.current_mc_stream = saved_mc_stream;
         self.soft_mask_reuse = saved_mask_reuse;
         self.tile_op_index = saved_tile_op_index;
         self.text_sink = saved_text_sink;
         self.span_streams = saved_span_streams;
+        self.type3_inline_ctx = saved_type3_inline_ctx;
 
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
@@ -6130,8 +7123,32 @@ impl<'a> ContentInterpreter<'a> {
         transform: Matrix,
         h_scale: f32,
     ) {
-        // GlyphRun is a fill operation. Stroke modes use actual outline paths;
-        // Type3 CharProcs retain their ordinary nonstroking paint.
+        let is_type3 = self
+            .font_cache
+            .as_ref()
+            .and_then(|fc| fc.get(font_id))
+            .is_some_and(|font| font.is_type3());
+        if is_type3 {
+            if self.skip_type3_painting {
+                return;
+            }
+            let paint_color = self.current.fill_color;
+            let alpha = self.current.fill_alpha;
+            let overprint =
+                self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant);
+            self.paint_type3_glyph_run(
+                font_id,
+                font_size,
+                &glyphs,
+                transform,
+                h_scale,
+                paint_color,
+                alpha,
+                overprint,
+            );
+            return;
+        }
+        // GlyphRun is a fill operation. Stroke modes use actual outline paths.
         let paint_color = self.current.fill_color;
         let overprint =
             self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant);
@@ -6146,6 +7163,629 @@ impl<'a> ContentInterpreter<'a> {
             h_scale,
         });
         self.emit_painted(cmd);
+    }
+
+    /// Resolve an inline Type 3 font dictionary stored under `/Resources /Font`
+    /// of an indirect container object (`owner_id`).
+    fn resolve_container_inline_font_dict(
+        &self,
+        file: &PdfFile,
+        owner_id: ObjectId,
+        font_name: &str,
+    ) -> Option<zpdf_core::PdfDict> {
+        let owner_obj = file.resolve_shared(owner_id).ok()?;
+        let owner_dict = match &*owner_obj {
+            PdfObject::Dict(d) => d,
+            PdfObject::Stream(s) => &s.dict,
+            _ => return None,
+        };
+        let res_dict = self.resolve_dict_of(owner_dict.get("Resources")?)?;
+        let fonts_dict = self.resolve_dict_of(res_dict.get("Font")?)?;
+        match fonts_dict.get(font_name)? {
+            PdfObject::Dict(d) => Some(d.clone()),
+            PdfObject::Ref(r) => file.resolve(*r).ok()?.as_dict().ok().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Resolve an inline Type 3 font dictionary stored directly under `/Font`
+    /// of an indirect `/Resources` dictionary object (`resources_id`).
+    fn resolve_resources_inline_font_dict(
+        &self,
+        file: &PdfFile,
+        resources_id: ObjectId,
+        font_name: &str,
+    ) -> Option<zpdf_core::PdfDict> {
+        let res_obj = file.resolve_shared(resources_id).ok()?;
+        let res_dict = res_obj.as_dict().ok()?;
+        let fonts_dict = self.resolve_dict_of(res_dict.get("Font")?)?;
+        match fonts_dict.get(font_name)? {
+            PdfObject::Dict(d) => Some(d.clone()),
+            PdfObject::Ref(r) => file.resolve(*r).ok()?.as_dict().ok().cloned(),
+            _ => None,
+        }
+    }
+
+    fn reserve_type3_resource_cache(&mut self, bytes: usize) -> bool {
+        let total = self.type3_resource_cache_bytes.saturating_add(bytes);
+        if total > self.max_type3_resource_cache_bytes {
+            return false;
+        }
+        self.type3_resource_cache_bytes = total;
+        true
+    }
+
+    /// Parse a `/Resources` object for a Type 3 font or CharProc, sharing a
+    /// single parsed `Arc<CachedType3ResourceScope>` across all callers that
+    /// reference the same indirect `/Resources` object ID and bounding retained
+    /// bytes for distinct scopes.
+    ///
+    /// Returns `(scope, direct_cache_cost)`: `Some(0)` when an indirect scope is
+    /// already owned by `type3_shared_resources`, `Some(cost)` when a direct
+    /// scope must be reserved atomically alongside its owning cache entry, and
+    /// `None` when the indirect scope exceeded the cache cap.
+    fn load_type3_resource_scope(
+        &mut self,
+        res_obj: &PdfObject,
+        container_owner_id: Option<ObjectId>,
+        file: &PdfFile,
+    ) -> Option<(std::sync::Arc<CachedType3ResourceScope>, Option<usize>)> {
+        if let PdfObject::Ref(res_id) = res_obj {
+            if let Some(shared) = self.type3_shared_resources.get(res_id) {
+                return Some((std::sync::Arc::clone(shared), Some(0)));
+            }
+            let res_dict = self.resolve_dict_of(res_obj)?;
+            let parsed_resources = zpdf_document::page::parse_resource_dict(&res_dict, file)
+                .ok()
+                .map(std::sync::Arc::new);
+            let font_bindings = self.prepare_font_bindings(
+                &res_dict,
+                Some(InlineFontOwner::ResourcesDict(*res_id)),
+                file,
+            );
+            let scope = std::sync::Arc::new(CachedType3ResourceScope {
+                parsed_resources,
+                font_bindings,
+            });
+            let cost = estimate_type3_resource_scope_bytes(&scope).saturating_add(64);
+            let cache_cost = if self.reserve_type3_resource_cache(cost) {
+                self.type3_shared_resources
+                    .insert(*res_id, std::sync::Arc::clone(&scope));
+                Some(0)
+            } else {
+                None
+            };
+            return Some((scope, cache_cost));
+        }
+
+        let res_dict = self.resolve_dict_of(res_obj)?;
+        let parsed_resources = zpdf_document::page::parse_resource_dict(&res_dict, file)
+            .ok()
+            .map(std::sync::Arc::new);
+        let font_bindings = self.prepare_font_bindings(
+            &res_dict,
+            container_owner_id.map(InlineFontOwner::Container),
+            file,
+        );
+        let scope = std::sync::Arc::new(CachedType3ResourceScope {
+            parsed_resources,
+            font_bindings,
+        });
+        let cost = estimate_type3_resource_scope_bytes(&scope);
+        Some((scope, Some(cost)))
+    }
+
+    /// Parse and cache the font-level `/Resources` scope, pre-loaded font
+    /// bindings, and `/CharProcs` stream object IDs once per Type 3 font on
+    /// this page.
+    fn cached_type3_font_resources(
+        &mut self,
+        font_id: FontId,
+    ) -> std::sync::Arc<CachedType3FontResources> {
+        if let Some(cached) = self.type3_font_resources.get(&font_id) {
+            return std::sync::Arc::clone(cached);
+        }
+        let mut info = CachedType3FontResources::default();
+        let mut direct_scope_cost: Option<usize> = Some(0);
+        if let Some(file) = self.file {
+            let source = self
+                .font_cache
+                .as_ref()
+                .and_then(|fc| fc.type3_source(font_id))
+                .cloned();
+            let (font_dict, owner_id) = match source {
+                Some(zpdf_font::Type3Source::Object(id)) => (
+                    file.resolve(id)
+                        .ok()
+                        .and_then(|o| o.as_dict().ok().cloned()),
+                    Some(id),
+                ),
+                Some(zpdf_font::Type3Source::ContainerInlineFont {
+                    owner_id,
+                    font_name,
+                }) => (
+                    self.resolve_container_inline_font_dict(file, owner_id, &font_name),
+                    None,
+                ),
+                Some(zpdf_font::Type3Source::ResourcesInlineFont {
+                    resources_id,
+                    font_name,
+                }) => (
+                    self.resolve_resources_inline_font_dict(file, resources_id, &font_name),
+                    None,
+                ),
+                Some(zpdf_font::Type3Source::Inline(dict)) => (Some((*dict).clone()), None),
+                Some(zpdf_font::Type3Source::Unavailable) | None => (None, None),
+            };
+            if let Some(dict) = font_dict {
+                if let Some(res_obj) = dict.get("Resources") {
+                    if let Some((scope, scope_cost)) =
+                        self.load_type3_resource_scope(res_obj, owner_id, file)
+                    {
+                        info.scope = Some(scope);
+                        direct_scope_cost = scope_cost;
+                    }
+                }
+                if let Some(cp_obj) = dict.get("CharProcs") {
+                    if let Some(cp_dict) = self.resolve_dict_of(cp_obj) {
+                        for (name, val) in &cp_dict.0 {
+                            if let PdfObject::Ref(r) = val {
+                                info.char_proc_ids.insert(name.0.clone(), *r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let map_cost = info.char_proc_ids.keys().fold(64usize, |acc, k| {
+            acc.saturating_add(48).saturating_add(k.len())
+        });
+        let arc = std::sync::Arc::new(info);
+        if let Some(scope_cost) = direct_scope_cost {
+            let total_cost = map_cost.saturating_add(scope_cost);
+            if self.reserve_type3_resource_cache(total_cost) {
+                self.type3_font_resources
+                    .insert(font_id, std::sync::Arc::clone(&arc));
+            }
+        }
+        arc
+    }
+
+    /// Parse and cache a CharProc stream's optional `/Resources` scope and
+    /// font bindings, sharing parsed indirect `/Resources` scopes across
+    /// CharProc streams and bounding retention for distinct scopes.
+    fn cached_type3_glyph_resources(
+        &mut self,
+        cp_id: ObjectId,
+    ) -> Option<std::sync::Arc<CachedType3ResourceScope>> {
+        if let Some(cached) = self.type3_glyph_resources.get(&cp_id) {
+            return cached.as_ref().map(std::sync::Arc::clone);
+        }
+        let file = self.file?;
+        let res_obj = file.resolve_shared(cp_id).ok().and_then(|obj| {
+            obj.as_stream()
+                .ok()
+                .and_then(|s| s.dict.get("Resources").cloned())
+        });
+        let Some(res_obj) = res_obj else {
+            if self.reserve_type3_resource_cache(48) {
+                self.type3_glyph_resources.insert(cp_id, None);
+            }
+            return None;
+        };
+        let Some((scope, scope_cost)) = self.load_type3_resource_scope(&res_obj, Some(cp_id), file)
+        else {
+            if self.reserve_type3_resource_cache(48) {
+                self.type3_glyph_resources.insert(cp_id, None);
+            }
+            return None;
+        };
+        if let Some(direct_cost) = scope_cost {
+            if self.reserve_type3_resource_cache(48usize.saturating_add(direct_cost)) {
+                self.type3_glyph_resources
+                    .insert(cp_id, Some(std::sync::Arc::clone(&scope)));
+            }
+        }
+        Some(scope)
+    }
+
+    /// Interpret each Type 3 glyph's CharProc content stream directly in
+    /// `ContentInterpreter` (ISO 32000-1 §9.6.5), with resource lookup ordered
+    /// glyph → font → parent, honoring `d0` (coloured) vs `d1` (uncoloured),
+    /// and emitting the full `RenderCommand` set across all backends.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_type3_glyph_run(
+        &mut self,
+        font_id: FontId,
+        font_size: f32,
+        glyphs: &[PositionedGlyph],
+        transform: Matrix,
+        h_scale: f32,
+        paint_color: Color,
+        alpha: f32,
+        overprint: Option<Overprint>,
+    ) {
+        const MAX_TYPE3_DEPTH: u32 = 16;
+        if self.skip_type3_painting || glyphs.is_empty() || self.over_budget() {
+            return;
+        }
+        if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+            return;
+        }
+        if self.form_depth >= MAX_TYPE3_DEPTH {
+            self.stats.diagnostics.resource_limit_reached = true;
+            tracing::warn!("Type 3 glyph nesting exceeds {MAX_TYPE3_DEPTH}; skipping");
+            return;
+        }
+        if matches!(
+            self.font_cache
+                .as_ref()
+                .and_then(|fc| fc.type3_source(font_id)),
+            Some(zpdf_font::Type3Source::Unavailable)
+        ) {
+            self.stats.diagnostics.resource_limit_reached = true;
+            tracing::warn!(
+                "Type 3 font {font_id} resources could not be retained within budget; skipping replay"
+            );
+            return;
+        }
+
+        let record_semantic = self.active_type3_glyphs.is_empty() && self.soft_mask_reuse.is_none();
+        let caller_no_marks = cs_produces_no_marks(&self.current.fill_cs);
+        let font_meta = self.cached_type3_font_resources(font_id);
+        let mut pushed_font_res = false;
+        let mut font_res_idx = None;
+        let mut pushed_font_overrides = false;
+        if let Some(scope) = font_meta.scope.as_ref() {
+            if let Some(res) = scope.parsed_resources.as_ref() {
+                font_res_idx = Some(self.form_resources.len());
+                self.form_resources
+                    .push((std::sync::Arc::clone(res), self.base_ctm));
+                pushed_font_res = true;
+            }
+            if !scope.font_bindings.is_empty() {
+                self.push_cached_font_bindings(&scope.font_bindings);
+                pushed_font_overrides = true;
+            }
+        }
+
+        let mut completed = true;
+        let mut verified_segments: Vec<(usize, usize, Vec<PositionedGlyph>)> = Vec::new();
+        let mut active_verified: Option<(usize, usize, Vec<PositionedGlyph>)> = None;
+
+        for glyph in glyphs {
+            if self.over_budget() {
+                completed = false;
+                break;
+            }
+            let mut verified_text = String::new();
+            let glyph_verified = record_semantic
+                && self
+                    .font_cache
+                    .as_ref()
+                    .and_then(|fc| fc.get(font_id))
+                    .is_some_and(|font| {
+                        font.append_verified_type3_unicode(
+                            glyph.code,
+                            glyph.code_len,
+                            &mut verified_text,
+                        )
+                    });
+            let is_whitespace_glyph = glyph_verified
+                && !verified_text.is_empty()
+                && verified_text.chars().all(char::is_whitespace);
+            let Some((glyph_name, stream_bytes, font_matrix)) = self
+                .font_cache
+                .as_ref()
+                .and_then(|fc| fc.get(font_id))
+                .and_then(|font| font.type3_glyph_entry(glyph.glyph_id))
+            else {
+                if is_whitespace_glyph && !caller_no_marks {
+                    let pos = self.display_list.commands.len();
+                    match active_verified.as_mut() {
+                        Some((_, end, seg_glyphs)) if *end == pos => seg_glyphs.push(*glyph),
+                        _ => {
+                            if let Some(prev) = active_verified.take() {
+                                verified_segments.push(prev);
+                            }
+                            active_verified = Some((pos, pos, vec![*glyph]));
+                        }
+                    }
+                } else if let Some(prev) = active_verified.take() {
+                    verified_segments.push(prev);
+                }
+                continue;
+            };
+            if self
+                .active_type3_glyphs
+                .contains(&(font_id, glyph.glyph_id))
+            {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                tracing::warn!(
+                    "Type 3 glyph ({font_id}, {}) draws itself; skipping recursion",
+                    glyph.glyph_id
+                );
+                if let Some(prev) = active_verified.take() {
+                    verified_segments.push(prev);
+                }
+                continue;
+            }
+
+            let glyph_ctm = transform
+                .concat(&Matrix::translate(glyph.x as f64, glyph.y as f64))
+                .concat(&Matrix::scale(
+                    font_size as f64 * h_scale as f64,
+                    font_size as f64,
+                ))
+                .concat(&Matrix::new(
+                    font_matrix[0],
+                    font_matrix[1],
+                    font_matrix[2],
+                    font_matrix[3],
+                    font_matrix[4],
+                    font_matrix[5],
+                ));
+            if ![
+                glyph_ctm.a,
+                glyph_ctm.b,
+                glyph_ctm.c,
+                glyph_ctm.d,
+                glyph_ctm.e,
+                glyph_ctm.f,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            {
+                if let Some(prev) = active_verified.take() {
+                    verified_segments.push(prev);
+                }
+                continue;
+            }
+
+            if let Some(idx) = font_res_idx {
+                self.form_resources[idx].1 = glyph_ctm;
+            }
+            // Optional per-glyph `/Resources` on the CharProc stream shadows
+            // the Type 3 font's `/Resources`, which in turn shadows the parent.
+            let mut pushed_glyph_res = false;
+            let mut pushed_glyph_overrides = false;
+            if let Some(&cp_id) = font_meta.char_proc_ids.get(&glyph_name) {
+                if let Some(glyph_meta) = self.cached_type3_glyph_resources(cp_id) {
+                    if let Some(res) = glyph_meta.parsed_resources.as_ref() {
+                        self.form_resources
+                            .push((std::sync::Arc::clone(res), glyph_ctm));
+                        pushed_glyph_res = true;
+                    }
+                    if !glyph_meta.font_bindings.is_empty() {
+                        self.push_cached_font_bindings(&glyph_meta.font_bindings);
+                        pushed_glyph_overrides = true;
+                    }
+                }
+            }
+
+            let glyph_cmd_start = self.display_list.commands.len();
+            let depth_floor = self.state_stack.len();
+            self.state_stack.push(self.current.clone());
+            let saved_floor = self.state_floor;
+            self.state_floor = depth_floor + 1;
+            let saved_text_matrix = self.text_matrix;
+            let saved_text_line_matrix = self.text_line_matrix;
+            let saved_text_active = std::mem::replace(&mut self.text_active, false);
+            let saved_text_clip_accum = self.text_clip_accum.take();
+            let saved_text_clip_requested = std::mem::replace(&mut self.text_clip_requested, false);
+            let saved_text_clip_unavailable =
+                std::mem::replace(&mut self.text_clip_unavailable, false);
+            let saved_current_font_id = self.current_font_id;
+            let saved_operand_stack = std::mem::take(&mut self.operand_stack);
+            let saved_current_path = std::mem::take(&mut self.current_path);
+            let saved_pending_clip = self.pending_clip.take();
+            let saved_compatibility = std::mem::replace(&mut self.compatibility_depth, 0);
+            let saved_mc_depth = self.mc_depth;
+            let saved_enclosing_struct_actual_text = self.enclosing_struct_actual_text;
+            let saved_mc_stack = std::mem::take(&mut self.mc_stack);
+            let saved_mc_stream = self.current_mc_stream.take();
+            let saved_oc_hidden = self.oc_hidden_from;
+            let saved_text_sink = self.text_sink.take();
+            let saved_span_streams = self.span_streams.take();
+            let saved_rule_sink = self.rule_sink.take();
+            let saved_active_actual_text = self.active_actual_text.take();
+            let saved_base_ctm = self.base_ctm;
+            let saved_suppress_color_ops = self.suppress_color_ops;
+            let saved_type3_inline_ctx =
+                self.type3_inline_ctx.replace((font_id, glyph.glyph_id, 0));
+            let saved_type3_oc_suppressed =
+                std::mem::replace(&mut self.type3_oc_suppressed_mark, false);
+            let saved_type3_image_dropped = std::mem::replace(&mut self.type3_image_dropped, false);
+            let saved_type3_local_image_paint =
+                std::mem::replace(&mut self.type3_local_image_paint, false);
+            let saved_type3_caller_fill = self.type3_caller_fill.replace(paint_color);
+
+            if self.form_depth == 0 {
+                self.page_base_ctm = self.base_ctm;
+            }
+            self.current.ctm = glyph_ctm;
+            self.base_ctm = glyph_ctm;
+            self.current.clip_depth = 0;
+            self.current.render_mode = 0;
+            self.text_matrix = Matrix::identity();
+            self.text_line_matrix = Matrix::identity();
+
+            self.form_depth += 1;
+            self.active_type3_glyphs.push((font_id, glyph.glyph_id));
+
+            let mut tokenizer = ContentTokenizer::new(&stream_bytes);
+            while let Some(token) = tokenizer.next_borrowed_recovering() {
+                if self.over_budget() {
+                    completed = false;
+                    break;
+                }
+                match token {
+                    ContentToken::Operand(obj) => {
+                        if !self.push_operand(obj) {
+                            completed = false;
+                            break;
+                        }
+                    }
+                    ContentToken::Operator(op) => {
+                        self.execute_operator(&op);
+                        self.operand_stack.clear();
+                    }
+                    ContentToken::InlineImage { dict, data } => {
+                        self.do_inline_image(dict, data);
+                        self.operand_stack.clear();
+                    }
+                }
+            }
+            if self.over_budget() {
+                completed = false;
+            }
+            self.stats.diagnostics.merge(tokenizer.diagnostics());
+            self.close_marked_content();
+
+            self.active_type3_glyphs.pop();
+            self.form_depth -= 1;
+
+            // Balance any unclosed q-levels and clips opened inside the glyph.
+            while self.state_stack.len() > depth_floor + 1 {
+                for _ in 0..self.current.clip_depth {
+                    self.display_list.push(RenderCommand::PopClip);
+                }
+                if let Some(state) = self.state_stack.pop() {
+                    self.current = state;
+                }
+            }
+            for _ in 0..self.current.clip_depth {
+                self.display_list.push(RenderCommand::PopClip);
+            }
+            if let Some(state) = self.state_stack.pop() {
+                self.current = state;
+            }
+
+            self.state_floor = saved_floor;
+            self.text_matrix = saved_text_matrix;
+            self.text_line_matrix = saved_text_line_matrix;
+            self.text_active = saved_text_active;
+            self.text_clip_accum = saved_text_clip_accum;
+            self.text_clip_requested = saved_text_clip_requested;
+            self.text_clip_unavailable = saved_text_clip_unavailable;
+            self.current_font_id = saved_current_font_id;
+            self.operand_stack = saved_operand_stack;
+            self.current_path = saved_current_path;
+            self.pending_clip = saved_pending_clip;
+            self.compatibility_depth = saved_compatibility;
+            self.mc_depth = saved_mc_depth;
+            self.enclosing_struct_actual_text = saved_enclosing_struct_actual_text;
+            self.mc_stack = saved_mc_stack;
+            self.current_mc_stream = saved_mc_stream;
+            self.oc_hidden_from = saved_oc_hidden;
+            self.text_sink = saved_text_sink;
+            self.span_streams = saved_span_streams;
+            self.rule_sink = saved_rule_sink;
+            self.active_actual_text = saved_active_actual_text;
+            self.base_ctm = saved_base_ctm;
+            self.suppress_color_ops = saved_suppress_color_ops;
+            self.type3_inline_ctx = saved_type3_inline_ctx;
+            let glyph_oc_suppressed = std::mem::replace(
+                &mut self.type3_oc_suppressed_mark,
+                saved_type3_oc_suppressed,
+            );
+            let glyph_image_dropped =
+                std::mem::replace(&mut self.type3_image_dropped, saved_type3_image_dropped);
+            let glyph_local_image_paint = std::mem::replace(
+                &mut self.type3_local_image_paint,
+                saved_type3_local_image_paint,
+            );
+            self.type3_caller_fill = saved_type3_caller_fill;
+
+            if pushed_glyph_overrides {
+                self.pop_form_fonts();
+            }
+            if pushed_glyph_res {
+                self.form_resources.pop();
+            }
+
+            let glyph_cmd_end = self.display_list.commands.len();
+            if self.active_type3_glyphs.is_empty() && glyph_cmd_end > glyph_cmd_start {
+                self.display_list
+                    .push_type3_glyph_range(glyph_cmd_start, glyph_cmd_end);
+            }
+            let glyph_cmds = &self.display_list.commands[glyph_cmd_start..glyph_cmd_end];
+            let emitted_paint = glyph_cmds.iter().any(is_paint_command);
+            let fully_hidden_by_oc = glyph_oc_suppressed && !emitted_paint;
+            if fully_hidden_by_oc {
+                // Propagate OC suppression to any enclosing Type 3 glyph.
+                self.type3_oc_suppressed_mark = true;
+            }
+            if glyph_image_dropped {
+                self.type3_image_dropped = true;
+            }
+            if glyph_local_image_paint {
+                self.type3_local_image_paint = true;
+            }
+            let suppressed_by_none = caller_no_marks && !emitted_paint;
+            let matches_caller_paint = !glyph_local_image_paint
+                && glyph_cmds
+                    .iter()
+                    .all(|cmd| command_matches_caller_fill(cmd, paint_color, alpha, overprint));
+            if completed
+                && glyph_verified
+                && (emitted_paint != is_whitespace_glyph)
+                && !fully_hidden_by_oc
+                && !suppressed_by_none
+                && !glyph_image_dropped
+                && matches_caller_paint
+            {
+                match active_verified.as_mut() {
+                    Some((_, end, seg_glyphs)) if *end == glyph_cmd_start => {
+                        *end = glyph_cmd_end;
+                        seg_glyphs.push(*glyph);
+                    }
+                    _ => {
+                        if let Some(prev) = active_verified.take() {
+                            verified_segments.push(prev);
+                        }
+                        active_verified = Some((glyph_cmd_start, glyph_cmd_end, vec![*glyph]));
+                    }
+                }
+            } else if let Some(prev) = active_verified.take() {
+                verified_segments.push(prev);
+            }
+
+            if !completed {
+                break;
+            }
+        }
+
+        if pushed_font_overrides {
+            self.pop_form_fonts();
+        }
+        if pushed_font_res {
+            self.form_resources.pop();
+        }
+
+        if completed && record_semantic {
+            if let Some(prev) = active_verified.take() {
+                verified_segments.push(prev);
+            }
+            for (seg_start, seg_end, seg_glyphs) in verified_segments {
+                self.display_list.push_expanded_glyph_run(
+                    seg_start,
+                    seg_end,
+                    GlyphRun {
+                        font_id,
+                        font_size,
+                        glyphs: seg_glyphs,
+                        paint: Paint::Solid(paint_color),
+                        alpha,
+                        overprint,
+                        transform,
+                        h_scale,
+                    },
+                );
+            }
+        }
     }
 
     /// CAD output can show text under a font leaked from another text block.
@@ -6988,9 +8628,16 @@ impl<'a> ContentInterpreter<'a> {
             }
             _ => cs_produces_no_marks(&self.current.fill_cs),
         };
-        let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
+        let is_type3 = self
+            .current_font_id
+            .and_then(|fid| self.font_cache.as_ref().and_then(|fc| fc.get(fid)))
+            .is_some_and(|f| f.is_type3());
+        let invisible = matches!(self.current.render_mode, 3 | 7) || (no_marks && !is_type3);
         let wants_clip = matches!(self.current.render_mode, 4..=7);
         let paints = !invisible && !self.oc_suppressed();
+        if !invisible && self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+        }
         // Gate drawing-font resolution on whether the show actually paints or
         // contributes a clip so disabled-OCG and `/None`-colorant shows never
         // permanently consume page font-cache budget.
@@ -7363,6 +9010,15 @@ impl<'a> ContentInterpreter<'a> {
                                             } => {
                                                 zpdf_document::font_loader::load_embedded_companion_form_inline(
                                                     file, *form_id, font_name, remaining,
+                                                )
+                                                .map(std::sync::Arc::new)
+                                            }
+                                            zpdf_font::CompanionSource::ResourcesInlineFont {
+                                                resources_id,
+                                                font_name,
+                                            } => {
+                                                zpdf_document::font_loader::load_embedded_companion_resources_inline(
+                                                    file, *resources_id, font_name, remaining,
                                                 )
                                                 .map(std::sync::Arc::new)
                                             }
@@ -7961,6 +9617,7 @@ fn build_tiling_pattern(
     }
     let paint_type = dict.get_i64("PaintType").unwrap_or(1);
     Some(std::sync::Arc::new(TilingPatternDef {
+        pattern_id: pat_id,
         content,
         dict: dict.clone(),
         bbox,
@@ -11061,5 +12718,807 @@ mod tests {
             .with_clip_elision_scale(1.0)
             .interpret(b"q 0 0 2 1 re W n 0 -268435000 2 268435001 re W n 0 0 2 1 re f Q");
         assert_eq!(clip_counts_and_balance(&dl_safe), (1, 1, 0));
+    }
+
+    #[test]
+    fn type3_inline_image_cache_distinguishes_rendering_intent() {
+        let mut char_procs = HashMap::new();
+        let mut glyph_bytes =
+            b"1000 0 d0 1000 0 0 1000 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /RGB ID ".to_vec();
+        glyph_bytes.extend_from_slice(&[255, 0, 0]);
+        glyph_bytes.extend_from_slice(b" EI");
+        char_procs.insert("A".to_string(), std::sync::Arc::from(glyph_bytes));
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".to_string();
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0],
+                first_char: 65,
+            },
+            "Type3Intent".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        fonts.insert("F1".into(), font);
+        let mut images = zpdf_image::ImageCache::new();
+        let page = Rect::new(0.0, 0.0, 200.0, 80.0);
+
+        // First two draws share /Perceptual (must deduplicate to 1 entry);
+        // third draw switches to /AbsoluteColorimetric (must miss and create a 2nd entry).
+        let dl = ContentInterpreter::new(page)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret(
+                b"/Perceptual ri BT /F1 40 Tf 10 20 Td (AA) Tj ET \
+                  /AbsoluteColorimetric ri BT /F1 40 Tf 110 20 Td (A) Tj ET",
+            );
+        let draw_ids: Vec<zpdf_image::ImageId> = dl
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawImage(d) => Some(d.image_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(draw_ids.len(), 3);
+        assert_eq!(
+            draw_ids[0], draw_ids[1],
+            "same intent must reuse cached image"
+        );
+        assert_ne!(
+            draw_ids[0], draw_ids[2],
+            "distinct rendering intent must not reuse cached image"
+        );
+        assert_eq!(images.len(), 2);
+    }
+
+    #[test]
+    fn inner_indirect_properties_shadow_outer_inline_properties() {
+        // Object 1: Form XObject with indirect /Properties << /P1 2 0 R >> (MCID 7).
+        // Object 2: << /MCID 7 >>.
+        // Page has inline /Properties << /P1 << /MCID 99 >> >>.
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        let form_body = b"/Span /P1 BDC BT /F1 12 Tf 10 10 Td (A) Tj ET EMC";
+        pdf.extend_from_slice(
+            format!(
+                "1 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Resources << /Properties << /P1 2 0 R >> >> /Length {} >>\nstream\n",
+                form_body.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(form_body);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /MCID 7 >>\nendobj\n");
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n\
+                 trailer\n<< /Size 3 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let file = zpdf_parser::PdfFile::parse(pdf).expect("open pdf");
+
+        let mut resources = ResourceDict::default();
+        resources.xobjects.insert("Fm1".into(), ObjectId(1, 0));
+        let mut outer_prop = PdfDict::new();
+        outer_prop.insert(zpdf_core::PdfName::new("MCID"), PdfObject::Integer(99));
+        resources.properties_inline.insert("P1".into(), outer_prop);
+
+        let mut fonts = FontCache::new();
+        fonts.insert(
+            "F1".into(),
+            zpdf_font::LoadedFont::new_placeholder("Helvetica".into()),
+        );
+        let mut spans = Vec::new();
+        let _dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .with_fonts(&mut fonts)
+            .with_text_sink(&mut spans)
+            .interpret(b"/Fm1 Do");
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].mcid,
+            Some(7),
+            "inner indirect /Properties /P1 (MCID 7) must shadow page inline /P1 (MCID 99)"
+        );
+    }
+
+    #[test]
+    fn type3_early_budget_stop_omits_expanded_glyph_run() {
+        let mut char_procs = HashMap::new();
+        char_procs.insert(
+            "A".to_string(),
+            std::sync::Arc::<[u8]>::from(b"1000 0 d0 0 0 800 800 re f".as_slice()),
+        );
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".to_string();
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0],
+                first_char: 65,
+            },
+            "Type3Budget".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        fonts.insert("F1".into(), font);
+
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 200.0, 80.0))
+            .with_fonts(&mut fonts)
+            .with_command_limit(1)
+            .interpret(b"BT /F1 40 Tf 10 20 Td (AA) Tj ET");
+
+        assert_eq!(
+            dl.commands.len(),
+            1,
+            "first glyph's command must be retained when budget stops replay"
+        );
+        assert!(
+            dl.expanded_glyph_runs().is_empty(),
+            "partial Type 3 replay stopped by budget must not publish an ExpandedGlyphRun"
+        );
+    }
+
+    #[test]
+    fn type3_inline_image_without_cache_deduplicates_and_respects_budget() {
+        let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
+            800 0 0 800 0 0 cm\n\
+            BI /IM true /W 2 /H 2 /BPC 1 ID "
+            .to_vec();
+        glyph_bytes.extend_from_slice(&[0x00, 0x00]);
+        glyph_bytes.extend_from_slice(b"\nEI");
+
+        let mut char_procs = HashMap::new();
+        char_procs.insert(
+            "A".to_string(),
+            std::sync::Arc::<[u8]>::from(glyph_bytes.as_slice()),
+        );
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".to_string();
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0],
+                first_char: 65,
+            },
+            "Type3InlineDedup".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        fonts.insert("F1".into(), font);
+
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 200.0, 80.0))
+            .with_fonts(&mut fonts)
+            .interpret(b"1 0 0 rg BT /F1 40 Tf 10 20 Td (AA) Tj ET");
+        let inline_draws: Vec<_> = dl
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCommand::DrawInlineImage(draw) => Some(draw),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inline_draws.len(),
+            2,
+            "both glyph instances emit inline draws"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&inline_draws[0].image, &inline_draws[1].image),
+            "repeated Type 3 inline images without ImageCache must share one decoded Arc"
+        );
+
+        // Tight budget smaller than a 2x2 RGBA buffer (16 bytes) drops the inline
+        // image and records `resource_limit_reached`.
+        let tight = zpdf_core::ParseLimits {
+            max_image_cache_bytes: 8,
+            ..zpdf_core::ParseLimits::default()
+        };
+        let (dl_tight, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 200.0, 80.0))
+            .with_fonts(&mut fonts)
+            .with_limits(&tight)
+            .interpret_with_stats(b"1 0 0 rg BT /F1 40 Tf 10 20 Td (A) Tj ET");
+        assert!(
+            dl_tight.commands.is_empty(),
+            "inline image exceeding max_image_cache_bytes must be dropped"
+        );
+        assert!(
+            stats.diagnostics.resource_limit_reached,
+            "dropping an over-budget inline image must report resource_limit_reached"
+        );
+    }
+
+    #[test]
+    fn type3_inline_image_stopped_by_operator_budget_preserves_cutoff() {
+        // CharProc paints an inline stencil, then a vector rectangle. Under an
+        // operator budget that expires right after the inline image (with no
+        // ImageCache), the interpreter must preserve the stopping point: emit
+        // only the pre-cutoff DrawInlineImage, never emit a DrawGlyphRun that
+        // would replay the post-cutoff FillPath, and omit ExpandedGlyphRun.
+        let mut glyph_bytes = b"1000 0 d0\n\
+            800 0 0 800 0 0 cm\n\
+            BI /IM true /W 1 /H 1 /BPC 1 ID "
+            .to_vec();
+        glyph_bytes.push(0x00);
+        glyph_bytes.extend_from_slice(b"\nEI\n0 1 0 rg 0 0 500 500 re f");
+
+        let mut char_procs = HashMap::new();
+        char_procs.insert(
+            "A".to_string(),
+            std::sync::Arc::<[u8]>::from(glyph_bytes.as_slice()),
+        );
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".to_string();
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0],
+                first_char: 65,
+            },
+            "Type3OpCutoff".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        fonts.insert("F1".into(), font);
+
+        // Page ops: BT (1), Tf (2), Td (3), Tj (4) -> inside CharProc: d0 (5),
+        // cm (6), BI/EI (7). Cap at 7 operators so `0 1 0 rg 0 0 500 500 re f`
+        // is cut off immediately after the inline image.
+        let limits = zpdf_core::ParseLimits {
+            max_page_operators: 7,
+            ..zpdf_core::ParseLimits::default()
+        };
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_fonts(&mut fonts)
+            .with_limits(&limits)
+            .interpret(b"BT /F1 40 Tf 10 20 Td (A) Tj ET");
+
+        assert_eq!(
+            dl.commands.len(),
+            1,
+            "only the pre-cutoff inline image must be emitted"
+        );
+        assert!(matches!(dl.commands[0], RenderCommand::DrawInlineImage(_)));
+        assert!(
+            !dl.commands.iter().any(|c| matches!(
+                c,
+                RenderCommand::DrawGlyphRun(_) | RenderCommand::FillPath { .. }
+            )),
+            "cutoff after inline image must not emit DrawGlyphRun or post-cutoff FillPath"
+        );
+        assert!(
+            dl.expanded_glyph_runs().is_empty(),
+            "interrupted glyph must not publish an ExpandedGlyphRun"
+        );
+    }
+
+    #[test]
+    fn type3_glyph_resources_share_indirect_scope_and_bound_distinct_scopes() {
+        let stream_obj = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objs: &[Vec<u8>]| -> Vec<u8> {
+            let mut out = b"%PDF-1.7\n".to_vec();
+            let mut offs = Vec::with_capacity(objs.len());
+            for (i, body) in objs.iter().enumerate() {
+                offs.push(out.len());
+                out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = out.len();
+            let n = objs.len() + 1;
+            out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+            for off in offs {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            out.extend_from_slice(
+                format!("trailer\n<< /Size {n} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            );
+            out
+        };
+
+        // 1. Two distinct CharProcs (obj 1 and obj 2) share one indirect
+        //    `/Resources 3 0 R` carrying a large inline ExtGState payload.
+        // 2. Two other CharProcs (obj 4 and obj 5) each carry distinct inline
+        //    `/Resources` dictionaries with large inline payloads.
+        let shared_payload = "s".repeat(2048);
+        let inline_payload = "i".repeat(2048);
+        let shared_res =
+            format!("<< /ExtGState << /GS1 << /ca 0.5 /Pad ({shared_payload}) >> >> >>");
+        let inline_res =
+            format!("/Resources << /ExtGState << /GS1 << /ca 0.5 /Pad ({inline_payload}) >> >> >>");
+        let pdf = assemble(&[
+            stream_obj("/Resources 3 0 R", b"1000 0 d0 /GS1 gs 0 0 500 500 re f"), // 1
+            stream_obj("/Resources 3 0 R", b"1000 0 d0 /GS1 gs 0 0 500 500 re f"), // 2
+            shared_res.into_bytes(),                                               // 3
+            stream_obj(&inline_res, b"1000 0 d0 /GS1 gs 0 0 500 500 re f"),        // 4
+            stream_obj(&inline_res, b"1000 0 d0 /GS1 gs 0 0 500 500 re f"),        // 5
+        ]);
+        let file = zpdf_parser::PdfFile::parse(pdf).expect("parse pdf");
+        let page_res = ResourceDict::default();
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &page_res);
+        interp.max_type3_resource_cache_bytes = 4096;
+
+        let s1 = interp
+            .cached_type3_glyph_resources(ObjectId(1, 0))
+            .expect("cp 1 scope");
+        let bytes_after_first = interp.type3_resource_cache_bytes;
+        let s2 = interp
+            .cached_type3_glyph_resources(ObjectId(2, 0))
+            .expect("cp 2 scope");
+        assert!(
+            std::sync::Arc::ptr_eq(&s1, &s2),
+            "distinct CharProcs pointing to the same indirect /Resources must share one Arc"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                s1.parsed_resources.as_ref().expect("parsed"),
+                s2.parsed_resources.as_ref().expect("parsed"),
+            ),
+            "parsed ResourceDict must be shared, not cloned per CharProc"
+        );
+        assert!(
+            interp.type3_resource_cache_bytes <= bytes_after_first + 48,
+            "second CharProc sharing an indirect /Resources must not multiply retained bytes"
+        );
+
+        // Distinct inline scopes past `max_type3_resource_cache_bytes` still
+        // parse and return usable scopes, but are not retained past the cap.
+        let s4 = interp
+            .cached_type3_glyph_resources(ObjectId(4, 0))
+            .expect("cp 4 scope still returned");
+        let s5 = interp
+            .cached_type3_glyph_resources(ObjectId(5, 0))
+            .expect("cp 5 scope still returned");
+        assert!(s4.parsed_resources.is_some());
+        assert!(s5.parsed_resources.is_some());
+        assert!(
+            interp.type3_resource_cache_bytes <= interp.max_type3_resource_cache_bytes,
+            "retained Type 3 resource cache bytes ({}) must stay within cap ({})",
+            interp.type3_resource_cache_bytes,
+            interp.max_type3_resource_cache_bytes
+        );
+        assert!(
+            !interp.type3_glyph_resources.contains_key(&ObjectId(4, 0)),
+            "over-budget distinct inline glyph scope must not be retained"
+        );
+        assert!(
+            !interp.type3_glyph_resources.contains_key(&ObjectId(5, 0)),
+            "over-budget distinct inline glyph scope must not be retained"
+        );
+    }
+
+    #[test]
+    fn direct_type3_resource_scope_does_not_leak_cache_budget_when_entry_rejected() {
+        let stream_obj = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objs: &[Vec<u8>]| -> Vec<u8> {
+            let mut out = b"%PDF-1.7\n".to_vec();
+            let mut offs = Vec::with_capacity(objs.len());
+            for (i, body) in objs.iter().enumerate() {
+                offs.push(out.len());
+                out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = out.len();
+            let n = objs.len() + 1;
+            out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+            for off in offs {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            out.extend_from_slice(
+                format!("trailer\n<< /Size {n} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            );
+            out
+        };
+
+        let payload = "p".repeat(2048);
+        let inline_res =
+            format!("/Resources << /ExtGState << /GS1 << /ca 0.5 /Pad ({payload}) >> >> >>");
+        let pdf = assemble(&[stream_obj(&inline_res, b"1000 0 d0 0 0 500 500 re f")]);
+        let file = zpdf_parser::PdfFile::parse(pdf).expect("parse pdf");
+        let page_res = ResourceDict::default();
+
+        // Measure the exact direct scope cost, then set the cap to `scope_cost + 16`:
+        // enough for the scope alone, but 32 bytes short of `scope_cost + 48`.
+        let mut probe = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &page_res);
+        let scope = probe
+            .cached_type3_glyph_resources(ObjectId(1, 0))
+            .expect("probe scope");
+        let scope_cost = estimate_type3_resource_scope_bytes(&scope);
+
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &page_res);
+        interp.max_type3_resource_cache_bytes = scope_cost + 16;
+
+        let returned = interp
+            .cached_type3_glyph_resources(ObjectId(1, 0))
+            .expect("scope still returned for immediate replay");
+        assert!(returned.parsed_resources.is_some());
+        assert!(
+            !interp.type3_glyph_resources.contains_key(&ObjectId(1, 0)),
+            "entry must not be inserted when scope_cost + 48 exceeds cap"
+        );
+        assert_eq!(
+            interp.type3_resource_cache_bytes, 0,
+            "rejected direct scope must not leak bytes into type3_resource_cache_bytes"
+        );
+    }
+
+    #[test]
+    fn rejected_ownerless_inline_type3_source_does_not_replay_against_parent_resources() {
+        let stream_obj = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objs: &[Vec<u8>]| -> Vec<u8> {
+            let mut out = b"%PDF-1.7\n".to_vec();
+            let mut offs = Vec::with_capacity(objs.len());
+            for (i, body) in objs.iter().enumerate() {
+                offs.push(out.len());
+                out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = out.len();
+            let n = objs.len() + 1;
+            out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+            for off in offs {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            out.extend_from_slice(
+                format!("trailer\n<< /Size {n} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            );
+            out
+        };
+
+        // Obj 1: parent's /Stamp Form (paints RED).
+        // Obj 2: Type 3 font's /Stamp Form (paints GREEN).
+        // Obj 3: CharProc /A invoking `/Stamp Do`.
+        let pdf = assemble(&[
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 0 0 rg 0 0 100 100 re f",
+            ),
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"0 1 0 rg 0 0 100 100 re f",
+            ),
+            stream_obj("", b"1000 0 d0 /Stamp Do"),
+        ]);
+        let file = zpdf_parser::PdfFile::parse(pdf).expect("parse pdf");
+
+        let mut page_res = ResourceDict::default();
+        page_res.xobjects.insert("Stamp".into(), ObjectId(1, 0));
+
+        // Build an owner-less inline Type 3 font whose small CharProc fits in the
+        // font budget, while its large `/Pad` entry makes the inline source dict
+        // exceed `max_font_cache_bytes`.
+        let mut char_procs = zpdf_core::PdfDict::new();
+        char_procs.insert(zpdf_core::PdfName::new("A"), PdfObject::Ref(ObjectId(3, 0)));
+        let mut enc_dict = zpdf_core::PdfDict::new();
+        enc_dict.insert(
+            zpdf_core::PdfName::new("Differences"),
+            PdfObject::Array(vec![
+                PdfObject::Integer(65),
+                PdfObject::Name(zpdf_core::PdfName::new("A")),
+            ]),
+        );
+        let mut font_xobjs = zpdf_core::PdfDict::new();
+        font_xobjs.insert(
+            zpdf_core::PdfName::new("Stamp"),
+            PdfObject::Ref(ObjectId(2, 0)),
+        );
+        let mut font_res = zpdf_core::PdfDict::new();
+        font_res.insert(
+            zpdf_core::PdfName::new("XObject"),
+            PdfObject::Dict(font_xobjs),
+        );
+        let mut font_dict = zpdf_core::PdfDict::new();
+        font_dict.insert(
+            zpdf_core::PdfName::new("Type"),
+            PdfObject::Name(zpdf_core::PdfName::new("Font")),
+        );
+        font_dict.insert(
+            zpdf_core::PdfName::new("Subtype"),
+            PdfObject::Name(zpdf_core::PdfName::new("Type3")),
+        );
+        font_dict.insert(
+            zpdf_core::PdfName::new("FontMatrix"),
+            PdfObject::Array(vec![
+                PdfObject::Real(0.001),
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.001),
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.0),
+            ]),
+        );
+        font_dict.insert(
+            zpdf_core::PdfName::new("CharProcs"),
+            PdfObject::Dict(char_procs),
+        );
+        font_dict.insert(
+            zpdf_core::PdfName::new("Encoding"),
+            PdfObject::Dict(enc_dict),
+        );
+        font_dict.insert(zpdf_core::PdfName::new("FirstChar"), PdfObject::Integer(65));
+        font_dict.insert(zpdf_core::PdfName::new("LastChar"), PdfObject::Integer(65));
+        font_dict.insert(
+            zpdf_core::PdfName::new("Widths"),
+            PdfObject::Array(vec![PdfObject::Integer(1000)]),
+        );
+        font_dict.insert(
+            zpdf_core::PdfName::new("Resources"),
+            PdfObject::Dict(font_res),
+        );
+        font_dict.insert(
+            zpdf_core::PdfName::new("Pad"),
+            PdfObject::String(zpdf_core::PdfString::new(vec![b'x'; 16_384])),
+        );
+
+        let mut form_fonts = zpdf_core::PdfDict::new();
+        form_fonts.insert(zpdf_core::PdfName::new("F3"), PdfObject::Dict(font_dict));
+        let mut synth_res = zpdf_core::PdfDict::new();
+        synth_res.insert(zpdf_core::PdfName::new("Font"), PdfObject::Dict(form_fonts));
+
+        // Synthetic owner-less Form XObject (xobj_id = None) holding the inline Type 3 font.
+        let mut synth_dict = zpdf_core::PdfDict::new();
+        synth_dict.insert(
+            zpdf_core::PdfName::new("Resources"),
+            PdfObject::Dict(synth_res),
+        );
+        synth_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            PdfObject::Array(vec![
+                PdfObject::Integer(0),
+                PdfObject::Integer(0),
+                PdfObject::Integer(100),
+                PdfObject::Integer(100),
+            ]),
+        );
+        let synth_form = zpdf_core::PdfStream {
+            dict: synth_dict,
+            data: zpdf_core::PdfStreamData::from(b"BT /F3 50 Tf 0 0 Td (A) Tj ET".as_slice()),
+        };
+
+        let limits = zpdf_core::ParseLimits {
+            max_font_cache_bytes: 12_000,
+            ..zpdf_core::ParseLimits::default()
+        };
+        let mut fc = FontCache::new();
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &page_res)
+            .with_fonts(&mut fc)
+            .with_limits(&limits);
+        interp.do_form_xobject(None, &synth_form, &file);
+
+        assert!(
+            interp.stats.diagnostics.resource_limit_reached,
+            "rejected owner-less Type 3 source must report resource_limit_reached"
+        );
+        assert!(
+            !interp.display_list.commands.iter().any(is_paint_command),
+            "rejected owner-less Type 3 font must not replay against parent's red /Stamp, got {:?}",
+            interp.display_list.commands
+        );
+        assert!(
+            fc.get(0).is_some_and(|f| f.has_type3_programs()),
+            "test setup must admit the small Type 3 program while rejecting its oversized source dict"
+        );
+    }
+
+    #[test]
+    fn ownerless_inline_type3_recovers_when_reloadable_source_encountered_in_either_order() {
+        let stream_obj = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objs: &[Vec<u8>]| -> Vec<u8> {
+            let mut out = b"%PDF-1.7\n".to_vec();
+            let mut offs = Vec::with_capacity(objs.len());
+            for (i, body) in objs.iter().enumerate() {
+                offs.push(out.len());
+                out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = out.len();
+            let n = objs.len() + 1;
+            out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+            for off in offs {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            out.extend_from_slice(
+                format!("trailer\n<< /Size {n} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            );
+            out
+        };
+
+        // Oversized inline Type 3 font dictionary: small CharProc fits in 12 KiB,
+        // while 16 KiB `/Pad` exceeds `max_font_cache_bytes`.
+        let pad = "x".repeat(16_384);
+        let inline_font_pdf = format!(
+            "<< /Type /Font /Subtype /Type3 /FontMatrix [0.001 0 0 0.001 0 0] \
+             /CharProcs << /A 3 0 R >> /Encoding << /Differences [65 /A] >> \
+             /FirstChar 65 /LastChar 65 /Widths [1000] \
+             /Resources << /XObject << /Stamp 2 0 R >> >> \
+             /Pad ({pad}) >>"
+        );
+        let form_with_inline_res = stream_obj(
+            &format!(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Resources << /Font << /F3 {inline_font_pdf} >> >>"
+            ),
+            b"BT /F3 50 Tf 0 0 Td (A) Tj ET",
+        );
+        let indirect_res_dict = format!("<< /Font << /F3 {inline_font_pdf} >> >>").into_bytes();
+        let form_with_indirect_res = stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources 5 0 R",
+            b"BT /F3 50 Tf 0 0 Td (A) Tj ET",
+        );
+
+        // Obj 1: parent RED /Stamp; Obj 2: Type 3 GREEN /Stamp; Obj 3: CharProc /A;
+        // Obj 4: indirect Form with inline /Resources; Obj 5: indirect /Resources;
+        // Obj 6: Form pointing to indirect /Resources 5 0 R.
+        let pdf = assemble(&[
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 0 0 rg 0 0 100 100 re f",
+            ),
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"0 1 0 rg 0 0 100 100 re f",
+            ),
+            stream_obj("", b"1000 0 d0 /Stamp Do"),
+            form_with_inline_res,
+            indirect_res_dict,
+            form_with_indirect_res,
+        ]);
+        let file = zpdf_parser::PdfFile::parse(pdf).expect("parse pdf");
+        let container_stream = file
+            .resolve(ObjectId(4, 0))
+            .expect("obj 4")
+            .as_stream()
+            .expect("form stream 4")
+            .clone();
+        let indirect_res_stream = file
+            .resolve(ObjectId(6, 0))
+            .expect("obj 6")
+            .as_stream()
+            .expect("form stream 6")
+            .clone();
+        // Owner-less synthetic Form carrying the identical inline font dict.
+        let ownerless_stream = container_stream.clone();
+
+        let mut page_res = ResourceDict::default();
+        page_res.xobjects.insert("Stamp".into(), ObjectId(1, 0));
+
+        let limits = zpdf_core::ParseLimits {
+            max_font_cache_bytes: 12_000,
+            ..zpdf_core::ParseLimits::default()
+        };
+
+        let count_green_and_red = |cmds: &[RenderCommand]| -> (usize, usize) {
+            let mut green = 0usize;
+            let mut red = 0usize;
+            for cmd in cmds {
+                if let RenderCommand::FillPath {
+                    paint: Paint::Solid(c),
+                    ..
+                } = cmd
+                {
+                    if c.g > 0.9 && c.r < 0.1 {
+                        green += 1;
+                    }
+                    if c.r > 0.9 && c.g < 0.1 {
+                        red += 1;
+                    }
+                }
+            }
+            (green, red)
+        };
+
+        // Order 1: owner-less first (Unavailable) -> indirect Form container second (recovers).
+        {
+            let mut fc = FontCache::new();
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(&file, &page_res)
+                .with_fonts(&mut fc)
+                .with_limits(&limits);
+            interp.do_form_xobject(None, &ownerless_stream, &file);
+            assert_eq!(
+                count_green_and_red(&interp.display_list.commands),
+                (0, 0),
+                "owner-less oversized font must not paint before a reloadable source is seen"
+            );
+            interp.do_form_xobject(Some(ObjectId(4, 0)), &container_stream, &file);
+            // Subsequent draw of the owner-less form now also reuses the recovered source.
+            interp.do_form_xobject(None, &ownerless_stream, &file);
+            assert_eq!(
+                count_green_and_red(&interp.display_list.commands),
+                (2, 0),
+                "indirect Form container must upgrade Unavailable so both subsequent draws paint green /Stamp"
+            );
+            assert!(
+                fc.bytes_used() <= limits.max_font_cache_bytes,
+                "recovered container source must stay within budget"
+            );
+        }
+
+        // Order 2: indirect Form container first -> owner-less second (both paint green).
+        {
+            let mut fc = FontCache::new();
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(&file, &page_res)
+                .with_fonts(&mut fc)
+                .with_limits(&limits);
+            interp.do_form_xobject(Some(ObjectId(4, 0)), &container_stream, &file);
+            interp.do_form_xobject(None, &ownerless_stream, &file);
+            assert_eq!(
+                count_green_and_red(&interp.display_list.commands),
+                (2, 0),
+                "container-first encounter order must paint green /Stamp in both forms"
+            );
+            assert!(
+                fc.bytes_used() <= limits.max_font_cache_bytes,
+                "container-first source must stay within budget"
+            );
+        }
+
+        // Order 3: owner-less first (Unavailable) -> indirect /Resources dict second (recovers).
+        {
+            let mut fc = FontCache::new();
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(&file, &page_res)
+                .with_fonts(&mut fc)
+                .with_limits(&limits);
+            interp.do_form_xobject(None, &ownerless_stream, &file);
+            assert_eq!(count_green_and_red(&interp.display_list.commands), (0, 0));
+            interp.do_form_xobject(None, &indirect_res_stream, &file);
+            assert_eq!(
+                count_green_and_red(&interp.display_list.commands),
+                (1, 0),
+                "indirect /Resources dict must upgrade Unavailable and paint green /Stamp"
+            );
+            assert!(
+                fc.bytes_used() <= limits.max_font_cache_bytes,
+                "recovered /Resources source must stay within budget"
+            );
+        }
     }
 }

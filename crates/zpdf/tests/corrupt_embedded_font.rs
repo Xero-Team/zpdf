@@ -7597,3 +7597,180 @@ fn type1_custom_encoding_ignores_standard_encoding_in_fontinfo_notice() {
         );
     }
 }
+
+#[test]
+fn type3_shared_indirect_resources_inline_font_reloads_deferred_companion_after_standby_eviction() {
+    // A Type 3 CharProc points to an indirect `/Resources 9 0 R` dictionary
+    // containing an INLINE partially-corrupt Type 0 font `/FInline` whose
+    // surviving glyph is CID 3 (`gid_c`, not covered by BOLD_TTF substitute).
+    // Under a budget that admits the primary substitute + a sibling font (or
+    // drops the standby copy) while still having room to reload the companion
+    // on demand, `CompanionSource::ResourcesInlineFont` must reload `/FInline`
+    // directly from object 9's `/Font` subdictionary and draw CID 3.
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+    let gid_c = probe.unicode_glyph('C' as u32).unwrap().0;
+    let maxp = sfnt_table_range(PRIMARY_TTF, b"maxp");
+    let num_glyphs = u16::from_be_bytes([PRIMARY_TTF[maxp.start + 4], PRIMARY_TTF[maxp.start + 5]]);
+    let corrupt_gids: Vec<u16> = (1..num_glyphs).filter(|&g| g != gid_c).collect();
+    let partial_ttf = corrupt_selected_gids(PRIMARY_TTF, &corrupt_gids);
+    let cid_to_gid_bytes: Vec<u8> = [0u16, gid_a, gid_b, gid_c]
+        .into_iter()
+        .flat_map(|g| g.to_be_bytes())
+        .collect();
+    let partial_tounicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        1 beginbfchar <0001> <0041> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+
+    // Object 9: indirect `/Resources` dict with inline `/FInline` (Type 0
+    // partially-corrupt font) plus `/FEvict` (valid embedded font admitted
+    // right after to ensure standby eviction if budget is tight, or we drop
+    // standby via tight initial admission budget and then re-interpret with
+    // enough room to reload deferred companion).
+    // Here we use a single page where:
+    // - Glyph `A` (obj 8) references `/Resources 9 0 R` and shows `<0003>` in
+    //   `/FInline`.
+    // - We set `max_font_cache_bytes` just large enough to hold the Type 3 font,
+    //   `/FInline` substitute, and `/FInline`'s reloaded companion (when
+    //   admitted), while first loading a sibling font `/FPage` in the page
+    //   resources? Even cleaner: load with `FontCache`, verify `FInline` gets
+    //   `CompanionSource::ResourcesInlineFont`, evict its standby copy by
+    //   admitting `/FInline` under a budget that holds the substitute +
+    //   companion once promoted, or call `load_embedded_companion_resources_inline`
+    //   AND run end-to-end rendering with `max_font_cache_bytes` sized so
+    //   standby is reclaimed by `/FEvict` before `<0003>` is shown!
+    let shared_resources = b"<< /Font << \
+        /FInline << /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+IndirectResCompanion \
+          /Encoding /Identity-H /DescendantFonts [10 0 R] /ToUnicode 13 0 R >> \
+        /FEvict << /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+EvictStandby \
+          /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 67 /Widths [620 780 540] \
+          /FontDescriptor 15 0 R >> \
+      >> >>"
+        .to_vec();
+    let glyph_a = stream(
+        "/Resources 9 0 R",
+        b"1000 0 d0 0 0 0 rg BT /FInline 800 Tf 100 100 Td <0003> Tj ET",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /FT3 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(), // 3
+        stream("", b"0 0 0 rg BT /FT3 60 Tf 20 20 Td (A) Tj ET"), // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                    // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        glyph_a,                                       // 8
+        shared_resources,                              // 9
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+IndirectResCompanion \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /CIDToGIDMap 14 0 R /FontDescriptor 11 0 R /DW 1000 /W [1 [620 780 540]] >>"
+            .to_vec(), // 10
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+IndirectResCompanion /Flags 32 /FontFile2 12 0 R >>"
+            .to_vec(), // 11
+        stream("", &partial_ttf),                      // 12
+        stream("", partial_tounicode),                 // 13
+        stream("", &cid_to_gid_bytes),                 // 14
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+EvictStandby /Flags 32 /FontFile2 16 0 R >>"
+            .to_vec(), // 15
+        stream("", BOLD_TTF),                          // 16
+    ]);
+
+    // 1. Direct loader check: indirect `/Resources` dict object 9 holds `/Font`
+    //    directly (no `/Resources` wrapper) and reloads the companion cleanly.
+    let doc_probe = PdfDocument::open(pdf.clone())
+        .unwrap()
+        .with_font_provider(provider_with_alias("IndirectResCompanion"));
+    assert!(
+        zpdf_document::font_loader::load_embedded_companion_resources_inline(
+            doc_probe.file(),
+            zpdf_core::ObjectId(9, 0),
+            "FInline",
+            u64::MAX,
+        )
+        .is_some(),
+        "load_embedded_companion_resources_inline must resolve /Font directly on object 9"
+    );
+
+    // 2. End-to-end check: run under a tight budget where `/FInline`'s standby
+    //    copy is evicted (not retained at admission), then raise the limit and
+    //    re-interpret reusing the `FontCache` so surviving CID 3 (`gid_c`) MUST
+    //    reload from indirect `/Resources` object 9 via
+    //    `CompanionSource::ResourcesInlineFont` and draw ink.
+    let page = doc_probe.page(0).unwrap();
+    let mut images = zpdf::ImageCache::new();
+    let mut fonts_evicted = doc_probe.load_page_fonts(&page);
+    let evict_budget = fonts_evicted.bytes_used() + (BOLD_TTF.len() as u64) * 2 + 32_768;
+    let evict_limits = zpdf::ParseLimits {
+        max_font_cache_bytes: evict_budget,
+        ..Default::default()
+    };
+    let _ = zpdf::ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts_evicted)
+        .with_document(doc_probe.file(), &page.resources)
+        .with_images(&mut images)
+        .with_limits(&evict_limits)
+        .interpret(b"0 0 0 rg BT /FT3 60 Tf 20 20 Td (A) Tj ET");
+    // Find `/FInline`'s admitted FontId in `fonts_evicted`.
+    let finline_id = (0..fonts_evicted.len() as u32)
+        .find(|&id| {
+            fonts_evicted
+                .get(id)
+                .is_some_and(|f| f.base_font == "ABCDEF+IndirectResCompanion")
+        })
+        .expect("FInline admitted into FontCache");
+    assert!(
+        fonts_evicted.has_embedded_companion(finline_id),
+        "FInline must have a paired EmbeddedOriginal companion"
+    );
+    assert!(
+        !fonts_evicted.has_retained_embedded_companion(finline_id),
+        "tight budget must have evicted FInline's standby copy so reload is deferred"
+    );
+
+    // Phase B: raise the limit and render the page stream reusing
+    // `fonts_evicted`; surviving CID 3 (`gid_c`) MUST now reload via
+    // `CompanionSource::ResourcesInlineFont` from object 9 and draw ink!
+    let generous_limits = zpdf::ParseLimits {
+        max_font_cache_bytes: evict_budget + (PRIMARY_TTF.len() as u64) * 4,
+        ..Default::default()
+    };
+    let dl = zpdf::ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts_evicted)
+        .with_document(doc_probe.file(), &page.resources)
+        .with_images(&mut images)
+        .with_limits(&generous_limits)
+        .interpret(b"0 0 0 rg BT /FT3 60 Tf 20 20 Td (A) Tj ET");
+    assert!(
+        fonts_evicted.has_admitted_embedded_companion(finline_id),
+        "deferred companion must reload from indirect /Resources object 9 and admit"
+    );
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts_evicted)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    assert!(
+        dark_pixels_in_rect(
+            &cpu.data,
+            cpu.width as usize,
+            cpu.height as usize,
+            15,
+            90,
+            15,
+            85
+        ) > 20,
+        "reloaded embedded companion glyph CID 3 must render visible ink"
+    );
+}

@@ -1466,7 +1466,8 @@ impl FontCache {
         // against the budget available to a glyph that actually needs its
         // companion: `admit_drawing_font` reclaims unused standby if needed.
         let miss_key = (code, raw_code, length);
-        let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
+        let font_limit = self.font_budget_limit(max_bytes);
+        let remaining = max_bytes.saturating_sub(self.permanent_bytes());
         let program_count = self.budget.programs.len();
         let current_gen = self.provider.as_ref().map(|p| p.generation());
         if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
@@ -1502,7 +1503,7 @@ impl FontCache {
                         match build_descriptor_substitute(primary, spec, self.provider.as_deref()) {
                             Some(sub) => {
                                 let loaded = Arc::new(sub);
-                                if self.budget.admission_total(&loaded, max_bytes).is_none() {
+                                if self.budget.admission_total(&loaded, font_limit).is_none() {
                                     if let Some(entry) =
                                         self.embedded_companions.get_mut(&original.font_id)
                                     {
@@ -1529,7 +1530,8 @@ impl FontCache {
                     match &entry.source {
                         crate::CompanionSource::None => return None,
                         deferred @ (crate::CompanionSource::Object(_)
-                        | crate::CompanionSource::FormInlineFont { .. }) => {
+                        | crate::CompanionSource::FormInlineFont { .. }
+                        | crate::CompanionSource::ResourcesInlineFont { .. }) => {
                             if let Some(cached) =
                                 run_candidate.as_deref().and_then(|slot| slot.as_ref())
                             {
@@ -1542,7 +1544,10 @@ impl FontCache {
                                 }
                                 match load_deferred(deferred, remaining) {
                                     crate::DeferredCompanionLoad::Loaded(loaded) => {
-                                        if self.budget.admission_total(&loaded, max_bytes).is_none()
+                                        if self
+                                            .budget
+                                            .admission_total(&loaded, font_limit)
+                                            .is_none()
                                         {
                                             // The loaded companion's full cache footprint
                                             // exceeds `remaining` even before checking
@@ -1621,7 +1626,8 @@ impl FontCache {
             Some(id) => id,
             None => {
                 if from_standby {
-                    self.budget.admission_total(&companion, max_bytes)?;
+                    self.budget
+                        .admission_total(&companion, self.font_budget_limit(max_bytes))?;
                     if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
                         entry.standby = None;
                     }
@@ -1689,7 +1695,9 @@ impl FontCache {
     ) -> Option<FontId> {
         // Drawing faces have no PDF resource name, so hostile resource names
         // cannot collide with an internal alias or redirect an existing run.
-        let total = self.budget.admission_total(&font, max_bytes)?;
+        let total = self
+            .budget
+            .admission_total(&font, self.font_budget_limit(max_bytes))?;
         let id = self.next_free_id()?;
         self.budget.record(&font, total);
         self.fonts.insert(id, font);
@@ -1699,7 +1707,7 @@ impl FontCache {
             .copied()
             .unwrap_or(original_font_id);
         self.drawing_font_originals.insert(id, root_id);
-        self.reclaim_standby_for(total, max_bytes);
+        self.reclaim_standby_for(self.permanent_bytes(), max_bytes);
         Some(id)
     }
 }

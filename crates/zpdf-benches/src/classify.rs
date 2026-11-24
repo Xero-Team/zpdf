@@ -114,6 +114,10 @@ impl Composition {
                     c.images += 1;
                     c.image_device_px += matrix_area_device(&draw.transform, s2);
                 }
+                RenderCommand::DrawInlineImage(draw) => {
+                    c.images += 1;
+                    c.image_device_px += matrix_area_device(&draw.transform, s2);
+                }
                 RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
                     c.clips += 1;
                 }

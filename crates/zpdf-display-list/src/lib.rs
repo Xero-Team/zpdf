@@ -5,7 +5,20 @@ mod path;
 #[derive(Debug, Clone)]
 pub struct DisplayList {
     pub page_rect: Rect,
+    /// Visual commands executed in order by render backends.
+    ///
+    /// Callers that retain [`Self::expanded_glyph_runs`],
+    /// [`Self::pattern_ranges`], or [`Self::type3_glyph_ranges`] must treat
+    /// `commands` as append-only while those ranges are live (do not insert,
+    /// remove, or reorder entries before a recorded range). Call
+    /// [`Self::clear_command_ranges`] (or all three of
+    /// [`Self::clear_expanded_glyph_runs`], [`Self::clear_pattern_ranges`],
+    /// and [`Self::clear_type3_glyph_ranges`]) before mutating `commands`
+    /// in-place so recorded ranges cannot silently refer to different commands.
     pub commands: Vec<RenderCommand>,
+    expanded_glyph_runs: Vec<ExpandedGlyphRun>,
+    pattern_ranges: Vec<(usize, usize)>,
+    type3_glyph_ranges: Vec<(usize, usize)>,
 }
 
 impl DisplayList {
@@ -13,12 +26,187 @@ impl DisplayList {
         Self {
             page_rect,
             commands: Vec::new(),
+            expanded_glyph_runs: Vec::new(),
+            pattern_ranges: Vec::new(),
+            type3_glyph_ranges: Vec::new(),
         }
     }
 
     pub fn push(&mut self, cmd: RenderCommand) {
         self.commands.push(cmd);
     }
+
+    /// Truncate `self.commands` to `len`, dropping incomplete expanded glyph
+    /// runs and clipping pattern and Type 3 glyph ranges to the surviving
+    /// command prefix.
+    pub fn truncate_commands(&mut self, len: usize) {
+        self.commands.truncate(len);
+        self.expanded_glyph_runs.retain(|e| e.cmd_end <= len);
+        for ranges in [&mut self.pattern_ranges, &mut self.type3_glyph_ranges] {
+            ranges.retain_mut(|(start, end)| {
+                if *start >= len {
+                    return false;
+                }
+                *end = (*end).min(len);
+                *start < *end
+            });
+        }
+    }
+
+    /// Record a semantic glyph run whose visual marks have already been
+    /// expanded into `commands[cmd_start..cmd_end]` (for example, Type 3
+    /// CharProcs interpreted directly into `RenderCommand`s).
+    ///
+    /// Visual backends execute `commands` directly so each glyph paints once;
+    /// text-preserving exporters such as `zpdf-pptx-export` can decode the
+    /// semantic run and skip its expanded geometry range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cmd_start > cmd_end`, `cmd_end > self.commands.len()`, or
+    /// `cmd_start` overlaps a previously recorded range (`cmd_start <
+    /// previous.cmd_end`).
+    pub fn push_expanded_glyph_run(&mut self, cmd_start: usize, cmd_end: usize, run: GlyphRun) {
+        assert!(
+            cmd_start <= cmd_end && cmd_end <= self.commands.len(),
+            "expanded glyph run range {cmd_start}..{cmd_end} out of bounds for {} commands",
+            self.commands.len()
+        );
+        if let Some(prev) = self.expanded_glyph_runs.last() {
+            assert!(
+                cmd_start >= prev.cmd_end,
+                "expanded glyph run range {cmd_start}..{cmd_end} overlaps previous range {}..{}",
+                prev.cmd_start,
+                prev.cmd_end
+            );
+        }
+        self.expanded_glyph_runs.push(ExpandedGlyphRun {
+            cmd_start,
+            cmd_end,
+            run,
+        });
+    }
+
+    /// Discard all command-index-keyed ranges (`expanded_glyph_runs`,
+    /// `pattern_ranges`, and `type3_glyph_ranges`). Call before removing,
+    /// inserting, or reordering entries in `self.commands` in-place so
+    /// recorded ranges cannot silently refer to different commands.
+    pub fn clear_command_ranges(&mut self) {
+        self.expanded_glyph_runs.clear();
+        self.pattern_ranges.clear();
+        self.type3_glyph_ranges.clear();
+    }
+
+    /// Discard all recorded expanded glyph runs. When mutating `self.commands`
+    /// in-place, prefer [`Self::clear_command_ranges`] so pattern and Type 3
+    /// glyph ranges are invalidated as well.
+    pub fn clear_expanded_glyph_runs(&mut self) {
+        self.expanded_glyph_runs.clear();
+    }
+
+    /// Semantic glyph runs already expanded into `commands`, ordered by
+    /// `cmd_start` with non-overlapping `[cmd_start, cmd_end)` ranges.
+    pub fn expanded_glyph_runs(&self) -> &[ExpandedGlyphRun] {
+        &self.expanded_glyph_runs
+    }
+
+    /// Record a command range `[cmd_start, cmd_end)` emitted while painting a
+    /// tiling pattern cell. Glyphs inside a pattern cell are decorative paint
+    /// artwork rather than logical page text.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cmd_start > cmd_end`, `cmd_end > self.commands.len()`, or
+    /// `cmd_start` overlaps a previously recorded range.
+    pub fn push_pattern_range(&mut self, cmd_start: usize, cmd_end: usize) {
+        assert!(
+            cmd_start <= cmd_end && cmd_end <= self.commands.len(),
+            "pattern command range {cmd_start}..{cmd_end} out of bounds for {} commands",
+            self.commands.len()
+        );
+        if let Some(&(_, prev_end)) = self.pattern_ranges.last() {
+            assert!(
+                cmd_start >= prev_end,
+                "pattern command range {cmd_start}..{cmd_end} overlaps previous range ending at {prev_end}",
+            );
+        }
+        if cmd_start < cmd_end {
+            self.pattern_ranges.push((cmd_start, cmd_end));
+        }
+    }
+
+    /// Discard all recorded pattern command ranges.
+    pub fn clear_pattern_ranges(&mut self) {
+        self.pattern_ranges.clear();
+    }
+
+    /// Non-overlapping `[cmd_start, cmd_end)` ranges of commands emitted while
+    /// painting tiling pattern cells.
+    pub fn pattern_ranges(&self) -> &[(usize, usize)] {
+        &self.pattern_ranges
+    }
+
+    /// Whether `commands[cmd_idx]` originated inside a tiling pattern cell.
+    pub fn is_in_pattern_range(&self, cmd_idx: usize) -> bool {
+        let pos = self
+            .pattern_ranges
+            .partition_point(|&(start, _)| start <= cmd_idx);
+        pos > 0 && cmd_idx < self.pattern_ranges[pos - 1].1
+    }
+
+    /// Record a command range `[cmd_start, cmd_end)` emitted while interpreting
+    /// an outermost Type 3 CharProc. Commands inside this range are glyph
+    /// artwork (not independent page-level text runs) when not substituted by
+    /// an [`ExpandedGlyphRun`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cmd_start > cmd_end`, `cmd_end > self.commands.len()`, or
+    /// `cmd_start` overlaps a previously recorded range.
+    pub fn push_type3_glyph_range(&mut self, cmd_start: usize, cmd_end: usize) {
+        assert!(
+            cmd_start <= cmd_end && cmd_end <= self.commands.len(),
+            "type3 glyph command range {cmd_start}..{cmd_end} out of bounds for {} commands",
+            self.commands.len()
+        );
+        if let Some(&(_, prev_end)) = self.type3_glyph_ranges.last() {
+            assert!(
+                cmd_start >= prev_end,
+                "type3 glyph command range {cmd_start}..{cmd_end} overlaps previous range ending at {prev_end}",
+            );
+        }
+        if cmd_start < cmd_end {
+            self.type3_glyph_ranges.push((cmd_start, cmd_end));
+        }
+    }
+
+    /// Discard all recorded Type 3 glyph command ranges.
+    pub fn clear_type3_glyph_ranges(&mut self) {
+        self.type3_glyph_ranges.clear();
+    }
+
+    /// Non-overlapping `[cmd_start, cmd_end)` ranges of commands emitted while
+    /// interpreting outermost Type 3 CharProcs.
+    pub fn type3_glyph_ranges(&self) -> &[(usize, usize)] {
+        &self.type3_glyph_ranges
+    }
+
+    /// Whether `commands[cmd_idx]` originated inside a Type 3 CharProc.
+    pub fn is_in_type3_glyph_range(&self, cmd_idx: usize) -> bool {
+        let pos = self
+            .type3_glyph_ranges
+            .partition_point(|&(start, _)| start <= cmd_idx);
+        pos > 0 && cmd_idx < self.type3_glyph_ranges[pos - 1].1
+    }
+}
+
+/// Semantic glyph run whose visual output has already been expanded into
+/// `DisplayList::commands[cmd_start..cmd_end]`.
+#[derive(Debug, Clone)]
+pub struct ExpandedGlyphRun {
+    pub cmd_start: usize,
+    pub cmd_end: usize,
+    pub run: GlyphRun,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +229,9 @@ pub enum RenderCommand {
     },
     DrawGlyphRun(GlyphRun),
     DrawImage(ImageDraw),
+    /// Self-contained inline bitmap draw (for example, a Type 3 CharProc
+    /// inline image expanded without an external `ImageCache`).
+    DrawInlineImage(InlineImageDraw),
     PushClip {
         path: Path,
         rule: FillRule,
@@ -252,6 +443,147 @@ mod tests {
         assert_eq!(glyph.code_len, 0);
         assert_eq!(std::mem::size_of::<PositionedGlyph>(), 20);
     }
+
+    fn sample_glyph_run(font_id: FontId) -> GlyphRun {
+        GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 65,
+                code_len: 1,
+                code: 65,
+                x: 0.0,
+                y: 0.0,
+                advance: 6.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn expanded_glyph_runs_preserve_command_range() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert!(dl.expanded_glyph_runs().is_empty());
+        for _ in 0..4 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_expanded_glyph_run(1, 4, sample_glyph_run(2));
+        let runs = dl.expanded_glyph_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].cmd_start, runs[0].cmd_end), (1, 4));
+        assert_eq!(runs[0].run.font_id, 2);
+
+        dl.clear_expanded_glyph_runs();
+        assert!(dl.expanded_glyph_runs().is_empty());
+    }
+
+    #[test]
+    fn clear_command_ranges_invalidates_all_indexed_ranges_for_in_place_edits() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for _ in 0..4 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_expanded_glyph_run(0, 1, sample_glyph_run(1));
+        dl.push_type3_glyph_range(0, 1);
+        dl.push_pattern_range(2, 4);
+
+        dl.clear_command_ranges();
+        dl.commands.remove(0);
+
+        assert!(dl.expanded_glyph_runs().is_empty());
+        assert!(dl.type3_glyph_ranges().is_empty());
+        assert!(dl.pattern_ranges().is_empty());
+        assert!(!dl.is_in_type3_glyph_range(0));
+        assert!(!dl.is_in_pattern_range(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn expanded_glyph_run_rejects_end_past_commands_len() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::PopClip);
+        dl.push_expanded_glyph_run(0, 2, sample_glyph_run(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn expanded_glyph_run_rejects_inverted_range() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::PopClip);
+        dl.push(RenderCommand::PopClip);
+        dl.push_expanded_glyph_run(2, 1, sample_glyph_run(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn expanded_glyph_run_rejects_overlapping_range() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for _ in 0..4 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_expanded_glyph_run(0, 3, sample_glyph_run(1));
+        dl.push_expanded_glyph_run(2, 4, sample_glyph_run(2));
+    }
+
+    #[test]
+    fn pattern_ranges_track_membership_and_truncate_cleanly() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for _ in 0..6 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_pattern_range(1, 3);
+        dl.push_pattern_range(4, 6);
+        assert!(!dl.is_in_pattern_range(0));
+        assert!(dl.is_in_pattern_range(1));
+        assert!(dl.is_in_pattern_range(2));
+        assert!(!dl.is_in_pattern_range(3));
+        assert!(dl.is_in_pattern_range(4));
+        assert!(dl.is_in_pattern_range(5));
+        assert!(!dl.is_in_pattern_range(6));
+
+        dl.truncate_commands(4);
+        assert_eq!(dl.commands.len(), 4);
+        assert_eq!(dl.pattern_ranges(), &[(1, 3)]);
+        assert!(!dl.is_in_pattern_range(4));
+
+        // Partial truncation inside `[1, 3)` preserves the surviving `[1, 2)` prefix.
+        dl.truncate_commands(2);
+        assert_eq!(dl.commands.len(), 2);
+        assert_eq!(dl.pattern_ranges(), &[(1, 2)]);
+        assert!(dl.is_in_pattern_range(1));
+        assert!(!dl.is_in_pattern_range(2));
+
+        // Truncating to the start of the range drops it completely.
+        dl.truncate_commands(1);
+        assert_eq!(dl.commands.len(), 1);
+        assert!(dl.pattern_ranges().is_empty());
+        assert!(!dl.is_in_pattern_range(1));
+    }
+
+    #[test]
+    fn type3_glyph_ranges_track_membership_and_truncate_cleanly() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for _ in 0..5 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_type3_glyph_range(1, 3);
+        dl.push_type3_glyph_range(3, 5);
+        assert!(!dl.is_in_type3_glyph_range(0));
+        assert!(dl.is_in_type3_glyph_range(1));
+        assert!(dl.is_in_type3_glyph_range(2));
+        assert!(dl.is_in_type3_glyph_range(3));
+        assert!(dl.is_in_type3_glyph_range(4));
+        assert!(!dl.is_in_type3_glyph_range(5));
+
+        dl.truncate_commands(2);
+        assert_eq!(dl.type3_glyph_ranges(), &[(1, 2)]);
+        assert!(dl.is_in_type3_glyph_range(1));
+        assert!(!dl.is_in_type3_glyph_range(2));
+    }
 }
 
 // -- Text --
@@ -303,6 +635,26 @@ pub struct ImageDraw {
     pub alpha: f32,
     /// True only when the source image is a PDF `/ImageMask` stencil.
     pub is_image_mask: bool,
+}
+
+/// Self-contained decoded RGBA8 bitmap carried directly on a
+/// [`RenderCommand::DrawInlineImage`].
+#[derive(Debug, Clone)]
+pub struct InlineImage {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+    pub has_alpha: bool,
+    /// True only when the source image is a PDF `/ImageMask` stencil.
+    pub is_image_mask: bool,
+    pub premultiplied: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineImageDraw {
+    pub image: std::sync::Arc<InlineImage>,
+    pub transform: Matrix,
+    pub alpha: f32,
 }
 
 // -- Blend --

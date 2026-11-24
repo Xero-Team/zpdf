@@ -320,6 +320,29 @@ pub fn load_embedded_companion_form_inline(
     load_embedded_companion_dict(file, font_dict, max_bytes)
 }
 
+/// Reload only the parseable embedded companion font for an inline font
+/// dictionary stored directly under `/Font /<name>` of an indirect
+/// `/Resources` dictionary object when its decoded font stream fits within
+/// `max_bytes`.
+#[doc(hidden)]
+pub fn load_embedded_companion_resources_inline(
+    file: &PdfFile,
+    resources_id: ObjectId,
+    font_name: &str,
+    max_bytes: u64,
+) -> Option<LoadedFont> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let res_obj = file.resolve(resources_id).ok()?;
+    let res_dict = res_obj.as_dict().ok()?;
+    let fonts = resolve_dict(file, res_dict, "Font")?;
+    let PdfObject::Dict(font_dict) = fonts.get(font_name)? else {
+        return None;
+    };
+    load_embedded_companion_dict(file, font_dict, max_bytes)
+}
+
 /// Reload only the parseable embedded companion font for a font dictionary
 /// when its decoded font stream fits within `max_bytes`.
 #[doc(hidden)]
@@ -695,13 +718,17 @@ fn parse_encoding(
     match enc_obj {
         Some(PdfObject::Name(n)) => base_encoding_by_name(n.as_str()).map(Encoding::from_base),
         Some(PdfObject::Dict(enc_dict)) => {
-            let base = enc_dict
-                .get_name("BaseEncoding")
-                .ok()
-                .and_then(base_encoding_by_name)
-                .unwrap_or_else(|| default_simple_base(subtype));
+            let base_obj = match enc_dict.get("BaseEncoding") {
+                Some(PdfObject::Ref(r)) => file.resolve(*r).ok(),
+                other => other.cloned(),
+            };
+            let base = match base_obj {
+                Some(PdfObject::Name(n)) => base_encoding_by_name(n.as_str()),
+                _ => None,
+            }
+            .unwrap_or_else(|| default_simple_base(subtype));
             let mut encoding = Encoding::from_base(base);
-            apply_differences(&enc_dict, &mut encoding);
+            apply_differences(Some(file), &enc_dict, &mut encoding);
             Some(encoding)
         }
         // No /Encoding: symbolic fonts use their built-in cmap; others get a default.
@@ -717,10 +744,18 @@ fn default_simple_base(subtype: &str) -> &'static zpdf_font::encoding::EncodingT
     }
 }
 
-fn apply_differences(enc_dict: &zpdf_core::PdfDict, encoding: &mut zpdf_font::encoding::Encoding) {
-    if let Ok(diffs) = enc_dict.get_array("Differences") {
+fn apply_differences(
+    file: Option<&PdfFile>,
+    enc_dict: &zpdf_core::PdfDict,
+    encoding: &mut zpdf_font::encoding::Encoding,
+) {
+    let diffs_obj = match enc_dict.get("Differences") {
+        Some(PdfObject::Ref(r)) => file.and_then(|f| f.resolve(*r).ok()),
+        other => other.cloned(),
+    };
+    if let Some(PdfObject::Array(diffs)) = diffs_obj {
         let mut code = Some(0u16);
-        for obj in diffs {
+        for obj in &diffs {
             match obj {
                 PdfObject::Integer(n) => code = u8::try_from(*n).ok().map(u16::from),
                 PdfObject::Name(name) => {
@@ -1198,8 +1233,23 @@ fn load_simple_font(
     }
 }
 
-fn type3_differences(diffs: &[PdfObject]) -> Vec<String> {
-    let mut encoding = Vec::new();
+fn type3_base_encoding(name: &str) -> Vec<String> {
+    let Some(table) = zpdf_font::encoding::base_encoding_by_name(name) else {
+        return Vec::new();
+    };
+    let mut encoding = vec![String::new(); 256];
+    let mut last_non_empty = 0usize;
+    for (code, slot) in encoding.iter_mut().enumerate() {
+        if let Some(glyph_name) = table[code] {
+            *slot = glyph_name.to_string();
+            last_non_empty = code + 1;
+        }
+    }
+    encoding.truncate(last_non_empty);
+    encoding
+}
+
+fn apply_type3_differences(encoding: &mut Vec<String>, diffs: &[PdfObject]) {
     let mut current = Some(0usize);
     for obj in diffs {
         match obj {
@@ -1218,6 +1268,12 @@ fn type3_differences(diffs: &[PdfObject]) -> Vec<String> {
             _ => {}
         }
     }
+}
+
+#[cfg(test)]
+fn type3_differences(diffs: &[PdfObject]) -> Vec<String> {
+    let mut encoding = Vec::new();
+    apply_type3_differences(&mut encoding, diffs);
     encoding
 }
 
@@ -1244,11 +1300,30 @@ fn load_type3_font(
         m
     };
 
-    // Encoding/Differences → glyph name list
+    // Encoding: name or dict (/BaseEncoding + /Differences) → glyph name list.
     let mut encoding = Vec::new();
-    if let Some(enc_dict) = resolve_dict(file, dict, "Encoding") {
-        if let Some(diffs) = resolve_array(file, &enc_dict, "Differences") {
-            encoding = type3_differences(&diffs);
+    if let Some(enc_obj) = dict.get("Encoding") {
+        let resolved = match enc_obj {
+            PdfObject::Ref(r) => file.resolve(*r).ok(),
+            other => Some(other.clone()),
+        };
+        match resolved {
+            Some(PdfObject::Name(name)) => {
+                encoding = type3_base_encoding(name.as_str());
+            }
+            Some(PdfObject::Dict(enc_dict)) => {
+                let base = match enc_dict.get("BaseEncoding") {
+                    Some(PdfObject::Ref(r)) => file.resolve(*r).ok(),
+                    other => other.cloned(),
+                };
+                if let Some(PdfObject::Name(base_name)) = base {
+                    encoding = type3_base_encoding(base_name.as_str());
+                }
+                if let Some(diffs) = resolve_array(file, &enc_dict, "Differences") {
+                    apply_type3_differences(&mut encoding, &diffs);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1801,7 +1876,28 @@ mod tests {
         );
         let mut encoding =
             zpdf_font::encoding::Encoding::from_base(&zpdf_font::encoding::STANDARD_ENCODING);
-        apply_differences(&dict, &mut encoding);
+        apply_differences(None, &dict, &mut encoding);
+    }
+
+    #[test]
+    fn indirect_differences_updates_extraction_encoding() {
+        let file = PdfFile::parse(crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            "<< /Type /Font /Subtype /Type3 /FontMatrix [0.001 0 0 0.001 0 0] \
+             /FontBBox [0 0 1000 1000] /CharProcs << /B 5 0 R >> \
+             /Encoding 3 0 R /FirstChar 65 /LastChar 65 /Widths [600] >>",
+            "<< /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences 4 0 R >>",
+            "[65 /B]",
+            "<< /Length 2 >>\nstream\nd0\nendstream",
+        ]))
+        .expect("parse");
+        let font = load_single_font_with_provider(&file, ObjectId(2, 0), None).expect("font");
+        let mut decoded = String::new();
+        font.append_decoded_source_code(65, 1, &mut decoded);
+        assert_eq!(
+            decoded, "B",
+            "indirect /Differences array must remap extraction encoding from WinAnsi /A to /B"
+        );
     }
 
     /// Type 3 codes outside /Widths advance by /MissingWidth (0 by default),
@@ -1892,5 +1988,30 @@ mod tests {
         let d3 = file.resolve(ObjectId(4, 0)).unwrap();
         let h3 = descriptor_hints(&file, Some(d3.as_dict().unwrap()));
         assert!(h3.bold, "indirect /FontWeight 600 should set bold hint");
+    }
+
+    #[test]
+    fn type3_indirect_base_encoding_is_resolved() {
+        let file = PdfFile::parse(crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+               /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /A 4 0 R >> \
+               /Encoding << /Type /Encoding /BaseEncoding 3 0 R >> \
+               /FirstChar 65 /LastChar 65 /Widths [1000] >>",
+            "/WinAnsiEncoding",
+            "<< /Length 26 >>\nstream\n1000 0 d0 0 0 100 100 re f\nendstream",
+        ]))
+        .expect("parse");
+
+        let font_dict = file.resolve(ObjectId(2, 0)).unwrap();
+        let font = load_single_font_dict(&file, font_dict.as_dict().unwrap()).expect("load type3");
+        let (glyph_name, bytes, _) = font
+            .type3_glyph_entry(65)
+            .expect("code 65 must resolve via indirect /BaseEncoding /WinAnsiEncoding");
+        assert_eq!(glyph_name, "A");
+        assert!(!bytes.is_empty());
+        let mut decoded = String::new();
+        assert!(font.append_verified_type3_unicode(65, 1, &mut decoded));
+        assert_eq!(decoded, "A");
     }
 }

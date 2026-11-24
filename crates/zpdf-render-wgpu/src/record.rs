@@ -53,6 +53,14 @@ pub struct ClipStamp {
     pub ref_value: u32,
 }
 
+/// Texture lookup key for an image op: either an ID in the caller's external
+/// `ImageCache`, or an index into `PageRecorder::inline_images`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageKey {
+    Cache(u32),
+    Inline(u32),
+}
+
 /// One recorded operation, replayed in order into the page pass(es).
 pub enum PageOp {
     /// Draw solid geometry, testing `stencil == clip_ref`.
@@ -64,7 +72,7 @@ pub enum PageOp {
     /// Draw an image quad (from the textured arena), testing `stencil == clip_ref`.
     Image {
         range: MeshRange,
-        image_id: u32,
+        image_id: ImageKey,
         clip_ref: u32,
     },
     /// Draw a rasterized-glyph quad (from the glyph arena, sampling the
@@ -137,6 +145,10 @@ pub struct PageRecorder {
     pub glyph_vertices: Vec<TexturedVertex>,
     pub glyph_indices: Vec<u32>,
     pub glyph_atlas: GlyphAtlas,
+    /// Inline bitmaps retained for the duration of this page, deduplicated by
+    /// `Arc` identity (`inline_image_ids`).
+    pub inline_images: Vec<std::sync::Arc<zpdf_display_list::InlineImage>>,
+    inline_image_ids: std::collections::HashMap<usize, u32>,
     pub ops: Vec<PageOp>,
     clip_stack: Vec<ClipEntry>,
     clip_depth: u32,
@@ -316,6 +328,34 @@ impl PageRecorder {
 
     /// Record an image quad (4 textured vertices) at the current clip depth.
     pub fn add_image(&mut self, quad: [TexturedVertex; 4], image_id: u32) {
+        self.add_image_with_key(quad, ImageKey::Cache(image_id));
+    }
+
+    /// Record an inline image quad, deduplicating textures by `Arc` identity.
+    pub fn add_inline_image(
+        &mut self,
+        quad: [TexturedVertex; 4],
+        image: std::sync::Arc<zpdf_display_list::InlineImage>,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        let ptr = std::sync::Arc::as_ptr(&image) as usize;
+        let idx = if let Some(&existing) = self.inline_image_ids.get(&ptr) {
+            existing
+        } else {
+            let Ok(idx) = u32::try_from(self.inline_images.len()) else {
+                self.recording_error = Some("GPU inline image count exceeds u32 indexing");
+                return;
+            };
+            self.inline_images.push(image);
+            self.inline_image_ids.insert(ptr, idx);
+            idx
+        };
+        self.add_image_with_key(quad, ImageKey::Inline(idx));
+    }
+
+    fn add_image_with_key(&mut self, quad: [TexturedVertex; 4], image_id: ImageKey) {
         if !self.reserve_geometry::<TexturedVertex>(
             self.tex_vertices.len(),
             self.tex_indices.len(),
