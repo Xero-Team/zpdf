@@ -600,6 +600,10 @@ struct Type3Glyph {
     list: DisplayList,
     /// Images the procedure draws (stencil glyphs), by the ids in `list`.
     images: ImageCache,
+    /// Shared `Arc<InlineImage>` wrappers for glyph-local `ImageId`s referenced
+    /// inside soft masks so repeated placements reuse one decoded image and one
+    /// SVG `<image>` def.
+    inline_images: HashMap<ImageId, std::sync::Arc<zpdf_display_list::InlineImage>>,
     font_matrix: [f64; 6],
 }
 
@@ -4661,8 +4665,12 @@ impl<'a> SvgWriter<'a> {
     where
         F: Fn(ImageId) -> Option<std::sync::Arc<zpdf_display_list::InlineImage>>,
     {
+        let stroke_scale = (self.scale as f32).max(4.0);
+        let transform_stroke = |path: &Path, style: &StrokeStyle, m: &zpdf_core::Matrix| {
+            zpdf_render_cpu::transform_stroke_to_page(path, style, m, stroke_scale)
+        };
         self.emit_soft_mask_def_inner(source, Some(matrix_key_bits(placement)), depth, || {
-            Some(source.transform_with_images(placement, resolve_image))
+            Some(source.transform_with_images(placement, resolve_image, &transform_stroke))
         })
     }
 
@@ -5210,6 +5218,174 @@ impl<'a> SvgWriter<'a> {
                 body: String,
                 bounds: Option<SvgRect>,
             },
+            BlendGroup {
+                blend_mode: BlendMode,
+                isolated: bool,
+                alpha: f32,
+                mask_id: Option<u32>,
+                children: Vec<Type3TilingPart>,
+                bounds: Option<SvgRect>,
+            },
+        }
+
+        fn part_bounds(part: &Type3TilingPart) -> Option<SvgRect> {
+            match part {
+                Type3TilingPart::InheritedShape { bounds, .. }
+                | Type3TilingPart::ColoredImage { bounds, .. }
+                | Type3TilingPart::ColoredVector { bounds, .. }
+                | Type3TilingPart::BlendGroup { bounds, .. } => *bounds,
+            }
+        }
+
+        fn union_part_bounds(parts: &[Type3TilingPart]) -> Option<SvgRect> {
+            let mut acc: Option<SvgRect> = None;
+            for part in parts {
+                if let Some(r) = part_bounds(part) {
+                    acc = Some(match acc {
+                        Some(cur) => cur.union(r),
+                        None => r,
+                    });
+                }
+            }
+            acc
+        }
+
+        fn parts_have_inherited(parts: &[Type3TilingPart]) -> bool {
+            parts.iter().any(|p| match p {
+                Type3TilingPart::InheritedShape { .. } => true,
+                Type3TilingPart::BlendGroup { children, .. } => parts_have_inherited(children),
+                Type3TilingPart::ColoredImage { .. } | Type3TilingPart::ColoredVector { .. } => {
+                    false
+                }
+            })
+        }
+
+        fn count_inherited_shapes(parts: &[Type3TilingPart]) -> usize {
+            parts
+                .iter()
+                .map(|p| match p {
+                    Type3TilingPart::InheritedShape { .. } => 1,
+                    Type3TilingPart::BlendGroup { children, .. } => {
+                        count_inherited_shapes(children)
+                    }
+                    Type3TilingPart::ColoredImage { .. }
+                    | Type3TilingPart::ColoredVector { .. } => 0,
+                })
+                .sum()
+        }
+
+        fn parts_have_non_isolated_backdrop_group(
+            parts: &[Type3TilingPart],
+            plan_is_backdrop: bool,
+            in_non_isolated: bool,
+        ) -> bool {
+            for part in parts {
+                match part {
+                    Type3TilingPart::InheritedShape { .. } => {
+                        if in_non_isolated && plan_is_backdrop {
+                            return true;
+                        }
+                    }
+                    Type3TilingPart::BlendGroup {
+                        blend_mode,
+                        isolated,
+                        children,
+                        ..
+                    } => {
+                        if in_non_isolated && *blend_mode != BlendMode::Normal {
+                            return true;
+                        }
+                        if parts_have_non_isolated_backdrop_group(
+                            children,
+                            plan_is_backdrop,
+                            !*isolated,
+                        ) {
+                            return true;
+                        }
+                    }
+                    Type3TilingPart::ColoredImage { .. }
+                    | Type3TilingPart::ColoredVector { .. } => {}
+                }
+            }
+            false
+        }
+
+        fn push_blend_group_part(
+            parts: &mut Vec<Type3TilingPart>,
+            blend_mode: BlendMode,
+            isolated: bool,
+            alpha: f32,
+            mask_id: Option<u32>,
+            children: Vec<Type3TilingPart>,
+        ) {
+            if children.is_empty() {
+                return;
+            }
+            if blend_mode == BlendMode::Normal && !isolated && alpha >= 1.0 && mask_id.is_none() {
+                parts.extend(children);
+                return;
+            }
+            let bounds = union_part_bounds(&children);
+            parts.push(Type3TilingPart::BlendGroup {
+                blend_mode,
+                isolated,
+                alpha,
+                mask_id,
+                children,
+                bounds,
+            });
+        }
+
+        fn emit_colored_parts(writer: &mut SvgWriter<'_>, parts: &[Type3TilingPart], opacity: f32) {
+            for part in parts {
+                match part {
+                    Type3TilingPart::ColoredImage {
+                        key,
+                        program,
+                        image_id,
+                        transform,
+                        alpha,
+                        clip,
+                        stroke_mask,
+                        ..
+                    } => {
+                        if let Some(image) = program.images.get(*image_id) {
+                            let prev_clip = writer.clip;
+                            let prev_mask = writer.stroke_mask;
+                            writer.clip = *clip;
+                            writer.stroke_mask = *stroke_mask;
+                            writer.place_image(*key, image, None, transform, *alpha * opacity);
+                            writer.clip = prev_clip;
+                            writer.stroke_mask = prev_mask;
+                        }
+                    }
+                    Type3TilingPart::ColoredVector { body, .. } => {
+                        writer.out.push_str(body);
+                    }
+                    Type3TilingPart::BlendGroup {
+                        blend_mode,
+                        isolated,
+                        alpha,
+                        mask_id,
+                        children,
+                        ..
+                    } => {
+                        writer.flush_pending_backdrop();
+                        writer.flush_disjoint_backdrop();
+                        let prev_out = std::mem::take(&mut writer.out);
+                        emit_colored_parts(writer, children, opacity);
+                        let inner_body = std::mem::replace(&mut writer.out, prev_out);
+                        writer.write_blend_group_tag(
+                            *blend_mode,
+                            *isolated,
+                            *alpha,
+                            *mask_id,
+                            &inner_body,
+                        );
+                    }
+                    Type3TilingPart::InheritedShape { .. } => {}
+                }
+            }
         }
 
         let mut parts: Vec<Type3TilingPart> = Vec::new();
@@ -5274,21 +5450,16 @@ impl<'a> SvgWriter<'a> {
                 let (sx, sy) = ((p.x - x0) * scale, (y1 - p.y) * scale);
                 (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
             };
+            struct Type3BlendFrame {
+                blend_mode: BlendMode,
+                isolated: bool,
+                alpha: f32,
+                mask_id: Option<u32>,
+                prev_parts: Vec<Type3TilingPart>,
+            }
             let mut glyph_clips: Vec<(Option<u32>, Option<u32>, Option<SvgRect>)> = Vec::new();
-            let mut glyph_blends: Vec<(BlendMode, bool, f32, Option<u32>, String, usize)> =
-                Vec::new();
-            let resolve_glyph_img = |id: ImageId| {
-                program.images.get(id).map(|img| {
-                    std::sync::Arc::new(zpdf_display_list::InlineImage {
-                        width: img.width,
-                        height: img.height,
-                        data: img.data.clone(),
-                        has_alpha: img.has_alpha,
-                        is_image_mask: img.is_image_mask,
-                        premultiplied: img.premultiplied,
-                    })
-                })
-            };
+            let mut glyph_blends: Vec<Type3BlendFrame> = Vec::new();
+            let resolve_glyph_img = |id: ImageId| program.inline_images.get(&id).cloned();
 
             for cmd in &program.list.commands {
                 if self.check_over_budget() {
@@ -5326,6 +5497,16 @@ impl<'a> SvgWriter<'a> {
                         mask,
                         ..
                     } => {
+                        flush_shape(
+                            self,
+                            &mut parts,
+                            &mut cur_body,
+                            &mut min_x,
+                            &mut min_y,
+                            &mut max_x,
+                            &mut max_y,
+                            &mut cur_pad,
+                        );
                         let eff_alpha = if alpha.is_finite() {
                             alpha.clamp(0.0, 1.0)
                         } else {
@@ -5339,49 +5520,36 @@ impl<'a> SvgWriter<'a> {
                                 depth,
                             )
                         });
-                        let prev_out = std::mem::take(&mut self.out);
-                        glyph_blends.push((
-                            *blend_mode,
-                            *isolated,
-                            eff_alpha,
+                        let prev_parts = std::mem::take(&mut parts);
+                        glyph_blends.push(Type3BlendFrame {
+                            blend_mode: *blend_mode,
+                            isolated: *isolated,
+                            alpha: eff_alpha,
                             mask_id,
-                            prev_out,
-                            parts.len(),
-                        ));
+                            prev_parts,
+                        });
                     }
                     RenderCommand::PopBlendGroup => {
-                        if let Some((
-                            blend_mode,
-                            isolated,
-                            group_alpha,
-                            mask_id,
-                            prev_out,
-                            parts_start,
-                        )) = glyph_blends.pop()
-                        {
-                            let inner_inherited = std::mem::replace(&mut self.out, prev_out);
-                            if !inner_inherited.is_empty() {
-                                self.write_blend_group_tag(
-                                    BlendMode::Normal,
-                                    true,
-                                    group_alpha,
-                                    mask_id,
-                                    &inner_inherited,
-                                );
-                            }
-                            for part in &mut parts[parts_start..] {
-                                if let Type3TilingPart::ColoredVector { body, .. } = part {
-                                    let saved = std::mem::take(&mut self.out);
-                                    self.write_blend_group_tag(
-                                        blend_mode,
-                                        isolated,
-                                        group_alpha,
-                                        mask_id,
-                                        body,
-                                    );
-                                    *body = std::mem::replace(&mut self.out, saved);
-                                }
-                            }
+                        if let Some(frame) = glyph_blends.pop() {
+                            flush_shape(
+                                self,
+                                &mut parts,
+                                &mut cur_body,
+                                &mut min_x,
+                                &mut min_y,
+                                &mut max_x,
+                                &mut max_y,
+                                &mut cur_pad,
+                            );
+                            let children = std::mem::replace(&mut parts, frame.prev_parts);
+                            push_blend_group_part(
+                                &mut parts,
+                                frame.blend_mode,
+                                frame.isolated,
+                                frame.alpha,
+                                frame.mask_id,
+                                children,
+                            );
                         }
                     }
                     RenderCommand::FillPath {
@@ -5622,54 +5790,41 @@ impl<'a> SvgWriter<'a> {
                                 self.page_width,
                                 self.page_height,
                             );
-                            if !glyph_blends.is_empty() {
-                                let saved = std::mem::take(&mut self.out);
-                                self.place_image(key, image, None, &transform, alpha * opacity);
-                                let body = std::mem::replace(&mut self.out, saved);
-                                parts.push(Type3TilingPart::ColoredVector { body, bounds });
-                            } else {
-                                parts.push(Type3TilingPart::ColoredImage {
-                                    key,
-                                    program: Rc::clone(&program),
-                                    image_id: draw.image_id,
-                                    transform,
-                                    alpha,
-                                    clip: self.clip,
-                                    stroke_mask: self.stroke_mask,
-                                    bounds,
-                                });
-                            }
+                            parts.push(Type3TilingPart::ColoredImage {
+                                key,
+                                program: Rc::clone(&program),
+                                image_id: draw.image_id,
+                                transform,
+                                alpha,
+                                clip: self.clip,
+                                stroke_mask: self.stroke_mask,
+                                bounds,
+                            });
                         }
                     }
                     _ => {}
                 }
             }
-            while let Some((blend_mode, isolated, group_alpha, mask_id, prev_out, parts_start)) =
-                glyph_blends.pop()
-            {
-                let inner_inherited = std::mem::replace(&mut self.out, prev_out);
-                if !inner_inherited.is_empty() {
-                    self.write_blend_group_tag(
-                        BlendMode::Normal,
-                        true,
-                        group_alpha,
-                        mask_id,
-                        &inner_inherited,
-                    );
-                }
-                for part in &mut parts[parts_start..] {
-                    if let Type3TilingPart::ColoredVector { body, .. } = part {
-                        let saved = std::mem::take(&mut self.out);
-                        self.write_blend_group_tag(
-                            blend_mode,
-                            isolated,
-                            group_alpha,
-                            mask_id,
-                            body,
-                        );
-                        *body = std::mem::replace(&mut self.out, saved);
-                    }
-                }
+            while let Some(frame) = glyph_blends.pop() {
+                flush_shape(
+                    self,
+                    &mut parts,
+                    &mut cur_body,
+                    &mut min_x,
+                    &mut min_y,
+                    &mut max_x,
+                    &mut max_y,
+                    &mut cur_pad,
+                );
+                let children = std::mem::replace(&mut parts, frame.prev_parts);
+                push_blend_group_part(
+                    &mut parts,
+                    frame.blend_mode,
+                    frame.isolated,
+                    frame.alpha,
+                    frame.mask_id,
+                    children,
+                );
             }
             while let Some((clip, stroke_mask, clip_bounds)) = glyph_clips.pop() {
                 self.clip = clip;
@@ -5696,62 +5851,41 @@ impl<'a> SvgWriter<'a> {
         if parts.is_empty() {
             return;
         }
-        let has_inherited = parts
-            .iter()
-            .any(|p| matches!(p, Type3TilingPart::InheritedShape { .. }));
-        if !has_inherited {
-            for part in &parts {
-                match part {
-                    Type3TilingPart::ColoredImage {
-                        key,
-                        program,
-                        image_id,
-                        transform,
-                        alpha,
-                        clip,
-                        stroke_mask,
-                        ..
-                    } => {
-                        if let Some(image) = program.images.get(*image_id) {
-                            let prev_clip = self.clip;
-                            let prev_mask = self.stroke_mask;
-                            self.clip = *clip;
-                            self.stroke_mask = *stroke_mask;
-                            self.place_image(*key, image, None, transform, *alpha * opacity);
-                            self.clip = prev_clip;
-                            self.stroke_mask = prev_mask;
-                        }
-                    }
-                    Type3TilingPart::ColoredVector { body, .. } => {
-                        self.out.push_str(body);
-                    }
-                    Type3TilingPart::InheritedShape { .. } => {}
-                }
-            }
-            return;
-        }
-        let mut run_union: Option<SvgRect> = None;
-        for part in &parts {
-            let b = match part {
-                Type3TilingPart::InheritedShape { bounds, .. }
-                | Type3TilingPart::ColoredImage { bounds, .. }
-                | Type3TilingPart::ColoredVector { bounds, .. } => *bounds,
-            };
-            if let Some(r) = b {
-                run_union = Some(match run_union {
-                    Some(acc) => acc.union(r),
-                    None => r,
-                });
-            }
-        }
+        let run_union = union_part_bounds(&parts);
         let run_affected = match (run_union, self.clip_bounds) {
             (Some(gb), Some(cb)) => gb.intersect(cb).unwrap_or(gb),
             (Some(gb), None) => gb,
             (None, Some(cb)) => cb,
             (None, None) => self.full_page_rect(),
         };
+        if !parts_have_inherited(&parts) {
+            if depth.is_top_level()
+                && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                && parts_have_non_isolated_backdrop_group(&parts, false, false)
+                && self.emit_raster_backdrop_tiling_fallback(run_affected)
+            {
+                return;
+            }
+            emit_colored_parts(self, &parts, opacity);
+            return;
+        }
 
         let plan = self.emit_tiling_plan(tiling, depth);
+        let plan_is_backdrop = match &plan {
+            TilingPassPlan::Affine { .. } => true,
+            TilingPassPlan::Ops(ops) => match ops.as_slice() {
+                [] => false,
+                [TilingPlanOp::Pattern { blend_mode, .. }] => *blend_mode != BlendMode::Normal,
+                _ => true,
+            },
+        };
+        if depth.is_top_level()
+            && (self.pending_backdrop.is_some() || !self.out.is_empty())
+            && parts_have_non_isolated_backdrop_group(&parts, plan_is_backdrop, false)
+            && self.emit_raster_backdrop_tiling_fallback(run_affected)
+        {
+            return;
+        }
         let plan_can_fallback = depth.is_top_level()
             && match &plan {
                 TilingPassPlan::Affine { .. } => true,
@@ -5759,60 +5893,39 @@ impl<'a> SvgWriter<'a> {
                     !ops.is_empty() && !matches!(ops.as_slice(), [TilingPlanOp::Pattern { .. }])
                 }
             };
-        let last_inherited_idx = parts
-            .iter()
-            .rposition(|p| matches!(p, Type3TilingPart::InheritedShape { .. }));
-        // Only plans that can fall back AND emit at least one part before an
-        // `InheritedShape` need rollback staging. Ordinary single-pass patterns
-        // and single-shape runs incur zero staging or checkpoint overhead.
-        let mut can_rollback = plan_can_fallback && last_inherited_idx.is_some_and(|idx| idx > 0);
+        let total_inherited = count_inherited_shapes(&parts);
+        let first_is_only_inherited = parts.len() == 1
+            && matches!(parts.first(), Some(Type3TilingPart::InheritedShape { .. }));
+        // Only plans that can fall back AND emit parts around or nested inside
+        // groups need rollback staging. Ordinary single-pass patterns and
+        // single-shape runs incur zero staging or checkpoint overhead.
+        let mut can_rollback = plan_can_fallback && !first_is_only_inherited;
         let mut fallback_allowed = plan_can_fallback;
 
-        'emit_parts: loop {
-            // Stage only this run's work in `self.out` by moving the accumulated
-            // page prefix out (O(1), zero copy). When an `InheritedShape` must
-            // actually inspect the prior prefix, either commit directly (when no
-            // later failure is possible) or wrap the prefix once in `<defs>` so
-            // rollback restores a tiny `<use href="#r..."/>` without cloning the
-            // growing page SVG.
-            let mut staged_prior_out: Option<String> = None;
-            let mut prior_def_id: Option<u32> = None;
-            let mut saved_meta = None;
-            if can_rollback {
-                staged_prior_out = Some(std::mem::take(&mut self.out));
-                saved_meta = Some((
-                    self.pending_backdrop.clone(),
-                    self.disjoint_backdrop.clone(),
-                    self.backdrop_fanout,
-                    self.backdrop_snapshots,
-                ));
-            }
-            let rollback_and_fallback = |writer: &mut Self,
-                                         staged_prior_out: &mut Option<String>,
-                                         prior_def_id: &mut Option<u32>,
-                                         saved_meta: &mut Option<(
-                Option<PendingBackdrop>,
-                Option<DisjointBackdropBase>,
-                usize,
-                usize,
-            )>|
-             -> bool {
-                if let Some((pending, disjoint, fanout, snaps)) = saved_meta.take() {
-                    writer.pending_backdrop = pending;
-                    writer.disjoint_backdrop = disjoint;
-                    writer.backdrop_fanout = fanout;
-                    writer.backdrop_snapshots = snaps;
-                }
-                if let Some(prior) = staged_prior_out.take() {
-                    writer.out = prior;
-                } else if let Some(rid) = prior_def_id.take() {
-                    writer.out.clear();
-                    let _ = writeln!(writer.out, "<use href=\"#r{rid}\"/>");
-                }
-                writer.emit_raster_backdrop_tiling_fallback(run_affected)
-            };
+        enum EmitPartsOutcome {
+            Done,
+            NeedFallback,
+        }
 
-            for (part_idx, part) in parts.iter().enumerate() {
+        struct TilingEmitState {
+            staged_prior_out: Option<String>,
+            prior_def_id: Option<u32>,
+            can_rollback: bool,
+            fallback_allowed: bool,
+            inherited_remaining: usize,
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn emit_tiling_parts(
+            writer: &mut SvgWriter<'_>,
+            parts: &[Type3TilingPart],
+            plan: &TilingPassPlan,
+            opacity: f32,
+            depth: EmitDepth,
+            in_blend_group: bool,
+            state: &mut TilingEmitState,
+        ) -> EmitPartsOutcome {
+            for part in parts {
                 match part {
                     Type3TilingPart::ColoredImage {
                         key,
@@ -5825,89 +5938,139 @@ impl<'a> SvgWriter<'a> {
                         ..
                     } => {
                         if let Some(image) = program.images.get(*image_id) {
-                            let prev_clip = self.clip;
-                            let prev_mask = self.stroke_mask;
-                            self.clip = *clip;
-                            self.stroke_mask = *stroke_mask;
-                            self.place_image(*key, image, None, transform, *alpha * opacity);
-                            self.clip = prev_clip;
-                            self.stroke_mask = prev_mask;
+                            let prev_clip = writer.clip;
+                            let prev_mask = writer.stroke_mask;
+                            writer.clip = *clip;
+                            writer.stroke_mask = *stroke_mask;
+                            writer.place_image(*key, image, None, transform, *alpha * opacity);
+                            writer.clip = prev_clip;
+                            writer.stroke_mask = prev_mask;
                         }
                     }
                     Type3TilingPart::ColoredVector { body, .. } => {
-                        self.out.push_str(body);
+                        writer.out.push_str(body);
+                    }
+                    Type3TilingPart::BlendGroup {
+                        blend_mode,
+                        isolated,
+                        alpha,
+                        mask_id,
+                        children,
+                        ..
+                    } => {
+                        writer.flush_pending_backdrop();
+                        writer.flush_disjoint_backdrop();
+                        let prev_out = std::mem::take(&mut writer.out);
+                        let prev_pending = writer.pending_backdrop.take();
+                        let prev_disjoint = writer.disjoint_backdrop.take();
+                        let prev_non_isolated =
+                            std::mem::replace(&mut writer.non_isolated_filter_depth, 0);
+                        let prev_non_isolated_ga =
+                            std::mem::replace(&mut writer.non_isolated_ga_depth, 0);
+                        let prev_blend_depth = writer.blend_depth;
+                        let prev_isolated_depth = writer.isolated_depth;
+                        writer.blend_depth += 1;
+                        writer.isolated_depth += 1;
+                        let outcome =
+                            emit_tiling_parts(writer, children, plan, opacity, depth, true, state);
+                        match outcome {
+                            EmitPartsOutcome::Done => {
+                                writer.flush_pending_backdrop();
+                                writer.flush_disjoint_backdrop();
+                                let inner_body = std::mem::replace(&mut writer.out, prev_out);
+                                writer.pending_backdrop = prev_pending;
+                                writer.disjoint_backdrop = prev_disjoint;
+                                writer.non_isolated_filter_depth = prev_non_isolated;
+                                writer.non_isolated_ga_depth = prev_non_isolated_ga;
+                                writer.blend_depth = prev_blend_depth;
+                                writer.isolated_depth = prev_isolated_depth;
+                                writer.write_blend_group_tag(
+                                    *blend_mode,
+                                    *isolated,
+                                    *alpha,
+                                    *mask_id,
+                                    &inner_body,
+                                );
+                            }
+                            EmitPartsOutcome::NeedFallback => {
+                                writer.out = prev_out;
+                                writer.pending_backdrop = prev_pending;
+                                writer.disjoint_backdrop = prev_disjoint;
+                                writer.non_isolated_filter_depth = prev_non_isolated;
+                                writer.non_isolated_ga_depth = prev_non_isolated_ga;
+                                writer.blend_depth = prev_blend_depth;
+                                writer.isolated_depth = prev_isolated_depth;
+                                return EmitPartsOutcome::NeedFallback;
+                            }
+                        }
                     }
                     Type3TilingPart::InheritedShape {
                         body: shape_body,
                         bounds,
                     } => {
-                        let affected = match (*bounds, self.clip_bounds) {
+                        state.inherited_remaining = state.inherited_remaining.saturating_sub(1);
+                        let is_last_inherited = state.inherited_remaining == 0;
+                        let affected = match (*bounds, writer.clip_bounds) {
                             (Some(gb), Some(cb)) => gb.intersect(cb).unwrap_or(gb),
                             (Some(gb), None) => gb,
                             (None, Some(cb)) => cb,
-                            (None, None) => self.full_page_rect(),
+                            (None, None) => writer.full_page_rect(),
                         };
-                        let is_last_inherited = Some(part_idx) == last_inherited_idx;
-                        let prior_has_content =
-                            staged_prior_out.as_ref().is_some_and(|p| !p.is_empty());
-                        let has_any_backdrop = self.pending_backdrop.is_some()
+                        let prior_has_content = !in_blend_group
+                            && state
+                                .staged_prior_out
+                                .as_ref()
+                                .is_some_and(|p| !p.is_empty());
+                        let has_any_backdrop = writer.pending_backdrop.is_some()
                             || prior_has_content
-                            || !self.out.is_empty();
-                        match &plan {
+                            || !writer.out.is_empty();
+                        match plan {
                             TilingPassPlan::Affine { t_id, k_id, mk_id } => {
                                 let (t_id, k_id, mk_id) = (*t_id, *k_id, *mk_id);
                                 if depth.is_top_level() {
-                                    let affine_prims = if self.non_isolated_ga_depth > 0 {
+                                    let affine_prims = if writer.non_isolated_ga_depth > 0 {
                                         18
                                     } else {
                                         14
                                     };
-                                    if can_rollback {
-                                        let will_fit = self.can_enqueue_backdrop_step(
+                                    if state.can_rollback && !in_blend_group {
+                                        let will_fit = writer.can_enqueue_backdrop_step(
                                             affine_prims,
                                             Some(affected),
                                             true,
-                                            prior_has_content || !self.out.is_empty(),
+                                            prior_has_content || !writer.out.is_empty(),
                                         );
                                         if !will_fit {
-                                            if fallback_allowed && has_any_backdrop {
-                                                fallback_allowed = false;
-                                                can_rollback = false;
-                                                if rollback_and_fallback(
-                                                    self,
-                                                    &mut staged_prior_out,
-                                                    &mut prior_def_id,
-                                                    &mut saved_meta,
-                                                ) {
-                                                    return;
-                                                }
-                                                continue 'emit_parts;
+                                            if state.fallback_allowed && has_any_backdrop {
+                                                return EmitPartsOutcome::NeedFallback;
                                             }
-                                        } else if let Some(mut prior) = staged_prior_out.take() {
+                                        } else if let Some(mut prior) =
+                                            state.staged_prior_out.take()
+                                        {
                                             if is_last_inherited || prior.is_empty() {
-                                                prior.push_str(&self.out);
-                                                self.out = prior;
+                                                prior.push_str(&writer.out);
+                                                writer.out = prior;
                                             } else {
-                                                let rid = self.fresh_id();
+                                                let rid = writer.fresh_id();
                                                 let _ = write!(
-                                                    self.defs,
+                                                    writer.defs,
                                                     "<g id=\"r{rid}\">\n{prior}</g>\n"
                                                 );
-                                                prior_def_id = Some(rid);
-                                                let run_tail = std::mem::take(&mut self.out);
+                                                state.prior_def_id = Some(rid);
+                                                let run_tail = std::mem::take(&mut writer.out);
                                                 let _ =
-                                                    writeln!(self.out, "<use href=\"#r{rid}\"/>");
-                                                self.out.push_str(&run_tail);
+                                                    writeln!(writer.out, "<use href=\"#r{rid}\"/>");
+                                                writer.out.push_str(&run_tail);
                                             }
                                         }
                                     }
-                                    let shape_id = self.fresh_id();
-                                    let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
-                                    push_opacity(&mut self.defs, "opacity", opacity);
-                                    self.defs.push_str(">\n");
-                                    self.defs.push_str(shape_body);
-                                    self.defs.push_str("</g>\n");
-                                    if self.enqueue_backdrop_step(
+                                    let shape_id = writer.fresh_id();
+                                    let _ = write!(writer.defs, "<g id=\"s{shape_id}\"");
+                                    push_opacity(&mut writer.defs, "opacity", opacity);
+                                    writer.defs.push_str(">\n");
+                                    writer.defs.push_str(shape_body);
+                                    writer.defs.push_str("</g>\n");
+                                    if writer.enqueue_backdrop_step(
                                         BackdropStep::Affine {
                                             t_id,
                                             k_id,
@@ -5920,50 +6083,33 @@ impl<'a> SvgWriter<'a> {
                                     ) {
                                         continue;
                                     }
-                                    if fallback_allowed
-                                        && (self.pending_backdrop.is_some()
-                                            || staged_prior_out
-                                                .as_ref()
-                                                .is_some_and(|p| !p.is_empty())
-                                            || !self.out.is_empty())
-                                    {
-                                        fallback_allowed = false;
-                                        let retry = can_rollback;
-                                        can_rollback = false;
-                                        if rollback_and_fallback(
-                                            self,
-                                            &mut staged_prior_out,
-                                            &mut prior_def_id,
-                                            &mut saved_meta,
-                                        ) {
-                                            return;
-                                        }
-                                        if retry {
-                                            continue 'emit_parts;
+                                    if state.fallback_allowed && has_any_backdrop {
+                                        return EmitPartsOutcome::NeedFallback;
+                                    }
+                                    if !in_blend_group {
+                                        if let Some(mut prior) = state.staged_prior_out.take() {
+                                            prior.push_str(&writer.out);
+                                            writer.out = prior;
+                                            state.can_rollback = false;
                                         }
                                     }
-                                    if let Some(mut prior) = staged_prior_out.take() {
-                                        prior.push_str(&self.out);
-                                        self.out = prior;
-                                        can_rollback = false;
-                                    }
-                                    self.flush_pending_backdrop();
+                                    writer.flush_pending_backdrop();
                                 }
-                                let mask_id = self.fresh_id();
+                                let mask_id = writer.fresh_id();
                                 let _ = write!(
-                                    self.defs,
+                                    writer.defs,
                                     "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
                                 );
-                                self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                                push_num(&mut self.out, self.page_width);
-                                self.out.push_str("\" height=\"");
-                                push_num(&mut self.out, self.page_height);
+                                writer.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                                push_num(&mut writer.out, writer.page_width);
+                                writer.out.push_str("\" height=\"");
+                                push_num(&mut writer.out, writer.page_height);
                                 let _ = write!(
-                                    self.out,
+                                    writer.out,
                                     "\" fill=\"url(#p{t_id})\" mask=\"url(#m{mask_id})\""
                                 );
-                                push_opacity(&mut self.out, "fill-opacity", opacity);
-                                self.out.push_str("/>\n");
+                                push_opacity(&mut writer.out, "fill-opacity", opacity);
+                                writer.out.push_str("/>\n");
                             }
                             TilingPassPlan::Ops(ops) => {
                                 if ops.is_empty() {
@@ -5977,25 +6123,23 @@ impl<'a> SvgWriter<'a> {
                                 };
                                 if depth.is_top_level()
                                     && (single_pattern.is_none()
-                                        || (self.pending_backdrop.is_some()
+                                        || (writer.pending_backdrop.is_some()
                                             && single_pattern
                                                 .is_some_and(|(_, m)| m != BlendMode::Normal)))
                                 {
-                                    if can_rollback {
-                                        if let Some(prior) = staged_prior_out.take() {
-                                            if prior.is_empty() {
-                                                // Nothing to preserve in `prior`.
-                                            } else {
-                                                let rid = self.fresh_id();
+                                    if state.can_rollback && !in_blend_group {
+                                        if let Some(prior) = state.staged_prior_out.take() {
+                                            if !prior.is_empty() {
+                                                let rid = writer.fresh_id();
                                                 let _ = write!(
-                                                    self.defs,
+                                                    writer.defs,
                                                     "<g id=\"r{rid}\">\n{prior}</g>\n"
                                                 );
-                                                prior_def_id = Some(rid);
-                                                let run_tail = std::mem::take(&mut self.out);
+                                                state.prior_def_id = Some(rid);
+                                                let run_tail = std::mem::take(&mut writer.out);
                                                 let _ =
-                                                    writeln!(self.out, "<use href=\"#r{rid}\"/>");
-                                                self.out.push_str(&run_tail);
+                                                    writeln!(writer.out, "<use href=\"#r{rid}\"/>");
+                                                writer.out.push_str(&run_tail);
                                             }
                                         }
                                     }
@@ -6006,7 +6150,7 @@ impl<'a> SvgWriter<'a> {
                                     wrapped_shape.push_str(">\n");
                                     wrapped_shape.push_str(shape_body);
                                     wrapped_shape.push_str("</g>\n");
-                                    if self.emit_tiling_multi_pass_backdrop(
+                                    if writer.emit_tiling_multi_pass_backdrop(
                                         ops,
                                         &wrapped_shape,
                                         affected,
@@ -6015,66 +6159,104 @@ impl<'a> SvgWriter<'a> {
                                         continue;
                                     }
                                     if single_pattern.is_none()
-                                        && fallback_allowed
-                                        && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                        && state.fallback_allowed
+                                        && (writer.pending_backdrop.is_some()
+                                            || !writer.out.is_empty()
+                                            || prior_has_content)
                                     {
-                                        fallback_allowed = false;
-                                        let retry = can_rollback;
-                                        can_rollback = false;
-                                        if rollback_and_fallback(
-                                            self,
-                                            &mut staged_prior_out,
-                                            &mut prior_def_id,
-                                            &mut saved_meta,
-                                        ) {
-                                            return;
-                                        }
-                                        if retry {
-                                            continue 'emit_parts;
-                                        }
+                                        return EmitPartsOutcome::NeedFallback;
                                     }
-                                    self.flush_pending_backdrop();
+                                    writer.flush_pending_backdrop();
                                 }
-                                let mask_id = self.fresh_id();
+                                let mask_id = writer.fresh_id();
                                 let _ = write!(
-                                    self.defs,
+                                    writer.defs,
                                     "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
                                 );
                                 if let Some((id, blend_mode)) = single_pattern {
-                                    self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                                    push_num(&mut self.out, self.page_width);
-                                    self.out.push_str("\" height=\"");
-                                    push_num(&mut self.out, self.page_height);
+                                    writer.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                                    push_num(&mut writer.out, writer.page_width);
+                                    writer.out.push_str("\" height=\"");
+                                    push_num(&mut writer.out, writer.page_height);
                                     let _ = write!(
-                                        self.out,
+                                        writer.out,
                                         "\" fill=\"url(#p{id})\" mask=\"url(#m{mask_id})\""
                                     );
-                                    push_opacity(&mut self.out, "fill-opacity", opacity);
+                                    push_opacity(&mut writer.out, "fill-opacity", opacity);
                                     if let Some(name) = blend_css(blend_mode) {
                                         let _ =
-                                            write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                                            write!(writer.out, " style=\"mix-blend-mode:{name};\"");
                                     }
-                                    self.out.push_str("/>\n");
+                                    writer.out.push_str("/>\n");
                                 } else {
-                                    self.out.push_str("<g");
-                                    push_opacity(&mut self.out, "opacity", opacity);
+                                    writer.out.push_str("<g");
+                                    push_opacity(&mut writer.out, "opacity", opacity);
                                     let _ = writeln!(
-                                        self.out,
+                                        writer.out,
                                         " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
                                     );
-                                    self.emit_isolated_tiling_ops(ops);
-                                    self.out.push_str("</g>\n");
+                                    writer.emit_isolated_tiling_ops(ops);
+                                    writer.out.push_str("</g>\n");
                                 }
                             }
                         }
                     }
                 }
             }
-            if let Some(mut prior) = staged_prior_out.take() {
-                prior.push_str(&self.out);
-                self.out = prior;
+            EmitPartsOutcome::Done
+        }
+
+        'emit_parts: loop {
+            let mut saved_meta = None;
+            let mut state = TilingEmitState {
+                staged_prior_out: None,
+                prior_def_id: None,
+                can_rollback,
+                fallback_allowed,
+                inherited_remaining: total_inherited,
+            };
+            if can_rollback {
+                state.staged_prior_out = Some(std::mem::take(&mut self.out));
+                saved_meta = Some((
+                    self.pending_backdrop.clone(),
+                    self.disjoint_backdrop.clone(),
+                    self.backdrop_fanout,
+                    self.backdrop_snapshots,
+                ));
             }
-            break;
+            match emit_tiling_parts(self, &parts, &plan, opacity, depth, false, &mut state) {
+                EmitPartsOutcome::Done => {
+                    if let Some(mut prior) = state.staged_prior_out.take() {
+                        prior.push_str(&self.out);
+                        self.out = prior;
+                    }
+                    break;
+                }
+                EmitPartsOutcome::NeedFallback => {
+                    fallback_allowed = false;
+                    let retry = can_rollback;
+                    can_rollback = false;
+                    if let Some((pending, disjoint, fanout, snaps)) = saved_meta.take() {
+                        self.pending_backdrop = pending;
+                        self.disjoint_backdrop = disjoint;
+                        self.backdrop_fanout = fanout;
+                        self.backdrop_snapshots = snaps;
+                    }
+                    if let Some(prior) = state.staged_prior_out.take() {
+                        self.out = prior;
+                    } else if let Some(rid) = state.prior_def_id.take() {
+                        self.out.clear();
+                        let _ = writeln!(self.out, "<use href=\"#r{rid}\"/>");
+                    }
+                    if self.emit_raster_backdrop_tiling_fallback(run_affected) {
+                        return;
+                    }
+                    if retry {
+                        continue 'emit_parts;
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -6157,14 +6339,25 @@ impl<'a> SvgWriter<'a> {
                     interp = interp.with_deadline(deadline);
                 }
                 let list = interp.interpret(stream);
+                let inline_images =
+                    zpdf_render_cpu::collect_type3_mask_inline_images(&list, &images);
                 Rc::new(Type3Glyph {
                     list,
                     images,
+                    inline_images,
                     font_matrix,
                 })
             });
         let (commands, image_bytes) = glyph.as_ref().map_or((1, 0), |g| {
-            (g.list.commands.len().max(1), g.images.bytes_used())
+            let inline_bytes: u64 = g
+                .inline_images
+                .values()
+                .map(|img| img.data.len() as u64)
+                .sum();
+            (
+                g.list.commands.len().max(1),
+                g.images.bytes_used().saturating_add(inline_bytes),
+            )
         });
         let total_commands = self.type3_glyph_commands.saturating_add(commands);
         let total_image_bytes = self.type3_glyph_image_bytes.saturating_add(image_bytes);
@@ -6200,18 +6393,7 @@ impl<'a> SvgWriter<'a> {
             let glyph_to_page = Self::type3_glyph_to_page(run, glyph, &font_matrix);
             let mut glyph_clips: Vec<(Option<u32>, Option<u32>, Option<SvgRect>)> = Vec::new();
             let mut glyph_blends: Vec<(BlendMode, bool, f32, Option<u32>, String)> = Vec::new();
-            let resolve_glyph_img = |id: ImageId| {
-                program.images.get(id).map(|img| {
-                    std::sync::Arc::new(zpdf_display_list::InlineImage {
-                        width: img.width,
-                        height: img.height,
-                        data: img.data.clone(),
-                        has_alpha: img.has_alpha,
-                        is_image_mask: img.is_image_mask,
-                        premultiplied: img.premultiplied,
-                    })
-                })
-            };
+            let resolve_glyph_img = |id: ImageId| program.inline_images.get(&id).cloned();
 
             for cmd in &program.list.commands {
                 if self.check_over_budget() {
@@ -7159,6 +7341,7 @@ mod tests {
                 Some(Rc::new(Type3Glyph {
                     list,
                     images: ImageCache::new(),
+                    inline_images: HashMap::new(),
                     font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
                 })),
             );
@@ -12481,5 +12664,247 @@ mod tests {
                 [right.red(), right.green(), right.blue()]
             );
         }
+    }
+
+    #[test]
+    fn svg_tiling_type3_transparency_group_composites_overlap_once_matching_cpu() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3FormXObject, Type3Resources, Type3XObject};
+
+        let make_form = |data: &[u8]| {
+            let mut form_dict = zpdf_core::PdfDict::new();
+            form_dict.insert(
+                zpdf_core::PdfName::new("BBox"),
+                zpdf_core::PdfObject::Array(vec![
+                    zpdf_core::PdfObject::Real(0.0),
+                    zpdf_core::PdfObject::Real(0.0),
+                    zpdf_core::PdfObject::Real(30.0),
+                    zpdf_core::PdfObject::Real(20.0),
+                ]),
+            );
+            let mut grp = zpdf_core::PdfDict::new();
+            grp.insert(
+                zpdf_core::PdfName::new("S"),
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Transparency")),
+            );
+            grp.insert(
+                zpdf_core::PdfName::new("I"),
+                zpdf_core::PdfObject::Bool(true),
+            );
+            form_dict.insert(
+                zpdf_core::PdfName::new("Group"),
+                zpdf_core::PdfObject::Dict(grp),
+            );
+            Arc::new(Type3FormXObject {
+                dict: form_dict,
+                data: Arc::from(data),
+                resources: None,
+            })
+        };
+        let mut gs_half = zpdf_core::PdfDict::new();
+        gs_half.insert(
+            zpdf_core::PdfName::new("ca"),
+            zpdf_core::PdfObject::Real(0.5),
+        );
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_states.insert("GSHalf".into(), gs_half);
+        // Form A: two overlapping opaque colored fills (red [0..20], green [10..30]).
+        t3_res.xobjects.insert(
+            "FmColored".into(),
+            Type3XObject::Form(make_form(
+                b"1 0 0 rg 0 0 20 20 re f 0 1 0 rg 10 0 20 20 re f",
+            )),
+        );
+        // Form B: overlapping opaque colored fill (red [0..20]) + inherited pattern fill ([10..30]).
+        t3_res.xobjects.insert(
+            "FmMixed".into(),
+            Type3XObject::Form(make_form(b"q 1 0 0 rg 0 0 20 20 re f Q 10 0 20 20 re f")),
+        );
+
+        let proc_colored = b"30 0 d0 /GSHalf gs /FmColored Do";
+        let proc_mixed = b"30 0 d0 /GSHalf gs /FmMixed Do";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), Arc::<[u8]>::from(&proc_colored[..])),
+                    ("B".into(), Arc::<[u8]>::from(&proc_mixed[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![30.0, 30.0],
+                first_char: 0,
+            },
+            "Type3TilingGroupOverlap".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(30.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut tile_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        tile_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(zpdf_display_list::TilingPattern {
+            commands: Arc::new(tile_dl),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        for (label, glyph_id, code) in [
+            ("colored+colored", 0u16, b'A'),
+            ("colored+inherited", 1, b'B'),
+        ] {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 30.0, 20.0));
+            dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+                font_id,
+                font_size: 1.0,
+                glyphs: vec![PositionedGlyph {
+                    glyph_id,
+                    code_len: 1,
+                    code: code as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 30.0,
+                }],
+                paint: Paint::Tiling(Arc::clone(&tiling)),
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::identity(),
+                h_scale: 1.0,
+            }));
+
+            let cpu = CpuRenderer::new()
+                .with_fonts(&fonts)
+                .render_display_list(&dl, 1.0)
+                .expect("cpu render");
+            let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+            let tree =
+                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+                    .expect("valid SVG");
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(30, 20).expect("pixmap");
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(
+                    30.0 / tree.size().width(),
+                    20.0 / tree.size().height(),
+                ),
+                &mut pixmap.as_mut(),
+            );
+
+            for &(region, x) in &[
+                ("left-only", 5u32),
+                ("overlap", 15u32),
+                ("right-only", 25u32),
+            ] {
+                let s = pixmap.pixel(x, 10).expect("svg pixel");
+                let svg_rgb = [s.red(), s.green(), s.blue()];
+                let idx = ((10 * cpu.width + x) * 4) as usize;
+                let cpu_rgb = [cpu.data[idx], cpu.data[idx + 1], cpu.data[idx + 2]];
+                for ch in 0..3 {
+                    assert!(
+                        svg_rgb[ch].abs_diff(cpu_rgb[ch]) <= 2,
+                        "{label} {region} (x={x}): SVG {svg_rgb:?} must match CPU {cpu_rgb:?} (group opacity 0.5 applied once, not 0.75): {svg}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn svg_type3_soft_mask_nonuniform_scale_preserves_directional_stroke() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3FormXObject, Type3Resources, Type3SoftMask};
+
+        let mask_stream = b"1 G 12 w 40 10 m 40 70 l S 10 40 m 70 40 l S";
+        let mut form_dict = zpdf_core::PdfDict::new();
+        form_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(80.0),
+                zpdf_core::PdfObject::Real(80.0),
+            ]),
+        );
+        let group = Arc::new(Type3FormXObject {
+            dict: form_dict,
+            data: Arc::from(&mask_stream[..]),
+            resources: None,
+        });
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_state_smasks.insert(
+            "GSStroke".into(),
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group,
+                backdrop_luma: 0.0,
+                transfer: None,
+            },
+        );
+        let charproc = b"80 0 d0 /GSStroke gs 1 0 0 rg 0 0 80 80 re f";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![80.0],
+                first_char: 0,
+            },
+            "Type3NonUniformMaskSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(80.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 80.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 80.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 0.5,
+        }));
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(60, 80).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(
+                60.0 / tree.size().width(),
+                80.0 / tree.size().height(),
+            ),
+            &mut pixmap.as_mut(),
+        );
+        let px = |x: u32, pdf_y: u32| -> [u8; 3] {
+            let p = pixmap.pixel(x, 79 - pdf_y).expect("in bounds");
+            [p.red(), p.green(), p.blue()]
+        };
+        assert!(px(22, 60)[0] > 240 && px(22, 60)[1] < 15, "{svg}");
+        assert!(px(24, 60)[0] > 240 && px(24, 60)[1] > 240, "{svg}");
+        assert!(px(10, 45)[0] > 240 && px(10, 45)[1] < 15, "{svg}");
+        assert!(px(10, 47)[0] > 240 && px(10, 47)[1] > 240, "{svg}");
     }
 }

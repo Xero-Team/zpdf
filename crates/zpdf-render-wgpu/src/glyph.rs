@@ -462,7 +462,11 @@ fn render_type3(
                                 m,
                                 &glyph_to_page,
                                 Some(fonts),
-                                Some(&glyph_images),
+                                Some(crate::RecordImages::Type3 {
+                                    font_id: run.font_id,
+                                    glyph_id: g.glyph_id,
+                                    images: &glyph_images,
+                                }),
                                 map,
                                 0,
                             )
@@ -789,7 +793,11 @@ pub fn render_type3_tiling_transformed(
                                 m,
                                 &glyph_to_page,
                                 Some(fonts),
-                                Some(&glyph_images),
+                                Some(crate::RecordImages::Type3 {
+                                    font_id: run.font_id,
+                                    glyph_id: g.glyph_id,
+                                    images: &glyph_images,
+                                }),
                                 map,
                                 0,
                             )

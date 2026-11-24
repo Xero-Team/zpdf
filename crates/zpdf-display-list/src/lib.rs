@@ -279,21 +279,51 @@ pub struct SoftMask {
     pub transfer: Option<std::sync::Arc<[u8; 256]>>,
 }
 
+/// Result of mapping a local-space stroke (`StrokePath` or `PushClipStroke`)
+/// through an affine transform into destination coordinates.
+#[derive(Debug, Clone)]
+pub enum TransformedStroke {
+    /// Positive-width stroke expanded into a filled outline in destination
+    /// coordinates (emitted as `FillPath` / `PushClip` with `FillRule::NonZero`)
+    /// so anisotropic scales and shears preserve directional stroke widths,
+    /// elliptical caps/joins, and directional dash lengths.
+    Filled(Path),
+    /// Centerline path and adjusted stroke style in destination coordinates
+    /// (used for uniform similarity transforms or 0-width PDF hairlines).
+    Stroked(Path, StrokeStyle),
+    /// Degenerate or empty stroke producing no geometry.
+    Empty,
+}
+
 impl SoftMask {
     /// Map a soft mask's commands, bounds, and offset by `matrix` (e.g. from
     /// Type 3 glyph coordinates into page space), embedding any referenced
-    /// `ImageId` via `resolve_image` so the transformed mask is self-contained
-    /// across backends without depending on the glyph's private `ImageCache`.
-    pub fn transform_with_images<F>(&self, matrix: &Matrix, resolve_image: &F) -> Self
+    /// `ImageId` via `resolve_image` and mapping stroked paths / stroke clips
+    /// via `transform_stroke` so directional stroke widths and dashes are
+    /// preserved under nonuniform transforms.
+    pub fn transform_with_images<F, S>(
+        &self,
+        matrix: &Matrix,
+        resolve_image: &F,
+        transform_stroke: &S,
+    ) -> Self
     where
         F: Fn(ImageId) -> Option<std::sync::Arc<InlineImage>>,
+        S: Fn(&Path, &StrokeStyle, &Matrix) -> TransformedStroke,
     {
-        self.transform_with_images_depth(matrix, resolve_image, 0)
+        self.transform_with_images_depth(matrix, resolve_image, transform_stroke, 0)
     }
 
-    fn transform_with_images_depth<F>(&self, matrix: &Matrix, resolve_image: &F, depth: u8) -> Self
+    fn transform_with_images_depth<F, S>(
+        &self,
+        matrix: &Matrix,
+        resolve_image: &F,
+        transform_stroke: &S,
+        depth: u8,
+    ) -> Self
     where
         F: Fn(ImageId) -> Option<std::sync::Arc<InlineImage>>,
+        S: Fn(&Path, &StrokeStyle, &Matrix) -> TransformedStroke,
     {
         fn transform_rect(r: Rect, m: &Matrix) -> Rect {
             let corners = [
@@ -315,28 +345,6 @@ impl SoftMask {
             } else {
                 r
             }
-        }
-        fn scale_stroke(style: &StrokeStyle, m: &Matrix) -> StrokeStyle {
-            let sx = m.a.hypot(m.b);
-            let sy = m.c.hypot(m.d);
-            let s = if sx.is_finite() && sy.is_finite() {
-                (0.5 * (sx + sy)) as f32
-            } else {
-                1.0
-            };
-            let mut out = style.clone();
-            if out.width > 0.0 && s.is_finite() && s > 0.0 {
-                out.width *= s;
-            }
-            if let Some(ref mut d) = out.dash {
-                if s.is_finite() && s > 0.0 {
-                    for v in &mut d.array {
-                        *v *= s;
-                    }
-                    d.phase *= s;
-                }
-            }
-            out
         }
         fn transform_paint(paint: &Paint, m: &Matrix) -> Paint {
             match paint {
@@ -375,22 +383,48 @@ impl SoftMask {
                         paint,
                         alpha,
                         overprint,
-                    } => dl.push(RenderCommand::StrokePath {
-                        path: path.map_points(|p| p.transform(matrix)),
-                        style: scale_stroke(style, matrix),
-                        paint: transform_paint(paint, matrix),
-                        alpha: *alpha,
-                        overprint: *overprint,
-                    }),
+                    } => match transform_stroke(path, style, matrix) {
+                        TransformedStroke::Filled(outline) => dl.push(RenderCommand::FillPath {
+                            path: outline,
+                            rule: FillRule::NonZero,
+                            paint: transform_paint(paint, matrix),
+                            alpha: *alpha,
+                            overprint: *overprint,
+                        }),
+                        TransformedStroke::Stroked(mapped_path, mapped_style) => {
+                            dl.push(RenderCommand::StrokePath {
+                                path: mapped_path,
+                                style: mapped_style,
+                                paint: transform_paint(paint, matrix),
+                                alpha: *alpha,
+                                overprint: *overprint,
+                            })
+                        }
+                        TransformedStroke::Empty => {}
+                    },
                     RenderCommand::PushClip { path, rule } => dl.push(RenderCommand::PushClip {
                         path: path.map_points(|p| p.transform(matrix)),
                         rule: *rule,
                     }),
                     RenderCommand::PushClipStroke { path, style } => {
-                        dl.push(RenderCommand::PushClipStroke {
-                            path: path.map_points(|p| p.transform(matrix)),
-                            style: scale_stroke(style, matrix),
-                        })
+                        match transform_stroke(path, style, matrix) {
+                            TransformedStroke::Filled(outline) => {
+                                dl.push(RenderCommand::PushClip {
+                                    path: outline,
+                                    rule: FillRule::NonZero,
+                                })
+                            }
+                            TransformedStroke::Stroked(mapped_path, mapped_style) => {
+                                dl.push(RenderCommand::PushClipStroke {
+                                    path: mapped_path,
+                                    style: mapped_style,
+                                })
+                            }
+                            TransformedStroke::Empty => dl.push(RenderCommand::PushClip {
+                                path: Path::new(),
+                                rule: FillRule::NonZero,
+                            }),
+                        }
                     }
                     RenderCommand::PopClip => dl.push(RenderCommand::PopClip),
                     RenderCommand::DrawImage(draw) => {
@@ -436,7 +470,12 @@ impl SoftMask {
                         bounds: transform_rect(*bounds, matrix),
                         alpha: *alpha,
                         mask: mask.as_ref().map(|sub| {
-                            sub.transform_with_images_depth(matrix, resolve_image, depth + 1)
+                            sub.transform_with_images_depth(
+                                matrix,
+                                resolve_image,
+                                transform_stroke,
+                                depth + 1,
+                            )
                         }),
                     }),
                     RenderCommand::PopBlendGroup => dl.push(RenderCommand::PopBlendGroup),

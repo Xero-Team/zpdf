@@ -4430,3 +4430,226 @@ fn type3_ext_gstate_smask_matches_between_live_and_standalone_replay() {
         Err(e) => panic!("GPU Type 3 /ExtGState /SMask test failed: {e}"),
     }
 }
+
+#[test]
+fn gpu_type3_image_mask_remaps_private_image_id_without_page_collision() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use zpdf::display_list::{
+        Color, DisplayList, FillRule, GlyphRun, ImageDraw, Paint, Path, PositionedGlyph,
+        RenderCommand, TilingPattern,
+    };
+    use zpdf_core::{Matrix, PdfDict, PdfName, PdfObject, Rect};
+    use zpdf_font::{
+        CidWidths, FontCache, LoadedFont, PdfFontType, Type3FormXObject, Type3Resources,
+        Type3SoftMask,
+    };
+    use zpdf_image::{DecodedImage, ImageCache};
+
+    // Mask image (ImageId 0 in glyph's private cache): left white, right black.
+    let mask_stream = b"q 20 0 0 20 0 0 cm BI /W 2 /H 1 /BPC 8 /CS /G ID \xff\x00 EI Q";
+    let mut form_dict = PdfDict::new();
+    form_dict.insert(
+        PdfName::new("BBox"),
+        PdfObject::Array(vec![
+            PdfObject::Real(0.0),
+            PdfObject::Real(0.0),
+            PdfObject::Real(20.0),
+            PdfObject::Real(20.0),
+        ]),
+    );
+    let group = Arc::new(Type3FormXObject {
+        dict: form_dict,
+        data: Arc::from(&mask_stream[..]),
+        resources: None,
+    });
+    let mut t3_res = Type3Resources::default();
+    t3_res.ext_g_state_smasks.insert(
+        "GSImg".into(),
+        Type3SoftMask::Dict {
+            is_alpha: false,
+            group,
+            backdrop_luma: 0.0,
+            transfer: None,
+        },
+    );
+    let d0_proc = b"20 0 d0 /GSImg gs 1 0 0 rg 0 0 20 20 re f";
+    let d1_proc = b"20 0 0 0 20 20 d1 /GSImg gs 0 0 20 20 re f";
+    let font = LoadedFont::new_with_data(
+        PdfFontType::Type3 {
+            font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            char_procs: HashMap::from([
+                ("A".into(), Arc::<[u8]>::from(&d0_proc[..])),
+                ("B".into(), Arc::<[u8]>::from(&d1_proc[..])),
+            ]),
+            encoding: vec!["A".into(), "B".into()],
+            widths: vec![20.0, 20.0],
+            first_char: 0,
+        },
+        "Type3ImgMaskIdCollision".into(),
+        Vec::new(),
+        CidWidths::new(20.0),
+    )
+    .with_type3_resources(Arc::new(t3_res));
+    let mut fonts = FontCache::new();
+    let font_id = fonts.insert("F1".into(), font);
+
+    // Page image also gets ImageId(0), with INVERTED pixels (left black, right white)
+    // tinted green so any page/glyph ID collision immediately flips the mask halves.
+    let mut page_images = ImageCache::new();
+    let page_img_id = page_images.insert(DecodedImage {
+        width: 2,
+        height: 1,
+        data: vec![0, 0, 0, 255, 0, 255, 0, 255],
+        has_alpha: false,
+        is_image_mask: false,
+        premultiplied: true,
+    });
+    assert_eq!(page_img_id, 0);
+
+    let mut tile_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+    let mut tile_rect = Path::new();
+    tile_rect.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+    tile_dl.push(RenderCommand::FillPath {
+        path: tile_rect,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    let tiling = Arc::new(TilingPattern {
+        commands: Arc::new(tile_dl),
+        bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+        x_step: 10.0,
+        y_step: 10.0,
+        matrix: Matrix::identity(),
+        tiling_type: 1,
+    });
+
+    // Layout across 80x20:
+    //   x=[0..20]: solid Type 3 glyph 'A' (red left [0..10], white right [10..20])
+    //   x=[25..45]: tiling Type 3 glyph 'B' (blue left [25..35], white right [35..45])
+    //   x=[55..75]: page image ID 0 (black left [55..65], green right [65..75])
+    let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 80.0, 20.0));
+    dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 0,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 20.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 1,
+            code_len: 1,
+            code: b'B' as u32,
+            x: 25.0,
+            y: 0.0,
+            advance: 20.0,
+        }],
+        paint: Paint::Tiling(tiling),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    dl.push(RenderCommand::DrawImage(ImageDraw {
+        image_id: page_img_id,
+        transform: Matrix::new(20.0, 0.0, 0.0, 20.0, 55.0, 0.0),
+        alpha: 1.0,
+        is_image_mask: false,
+    }));
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let assert_layout = |label: &str, data: &[u8], w: u32, expect_page_img: bool| {
+        let solid_l = px(data, w, 5, 10);
+        let solid_r = px(data, w, 15, 10);
+        assert!(
+            solid_l[0] > 240 && solid_l[1] < 15 && solid_l[2] < 15,
+            "{label}: solid glyph left half must be red, got {solid_l:?}"
+        );
+        assert!(
+            solid_r[0] > 240 && solid_r[1] > 240 && solid_r[2] > 240,
+            "{label}: solid glyph right half must be white, got {solid_r:?}"
+        );
+        let tile_l = px(data, w, 30, 10);
+        let tile_r = px(data, w, 40, 10);
+        assert!(
+            tile_l[0] < 15 && tile_l[1] < 15 && tile_l[2] > 240,
+            "{label}: tiling glyph left half must be blue, got {tile_l:?}"
+        );
+        assert!(
+            tile_r[0] > 240 && tile_r[1] > 240 && tile_r[2] > 240,
+            "{label}: tiling glyph right half must be white, got {tile_r:?}"
+        );
+        if expect_page_img {
+            let pg_l = px(data, w, 60, 10);
+            let pg_r = px(data, w, 70, 10);
+            assert!(
+                pg_l[0] < 15 && pg_l[1] < 15 && pg_l[2] < 15,
+                "{label}: page image left half must be black, got {pg_l:?}"
+            );
+            assert!(
+                pg_r[0] < 15 && pg_r[1] > 240 && pg_r[2] < 15,
+                "{label}: page image right half must be green, got {pg_r:?}"
+            );
+        }
+    };
+
+    let cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&page_images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    assert_layout("CPU", &cpu.data, cpu.width, true);
+
+    // Check GPU both with colliding page ImageId(0) AND with an empty page ImageCache.
+    match render_gpu_shared(&dl, Some(&fonts), Some(&page_images), 1.0) {
+        Ok(gpu_with_page_img) => {
+            assert_layout(
+                "GPU with colliding page ImageId(0)",
+                &gpu_with_page_img.data,
+                gpu_with_page_img.width,
+                true,
+            );
+            let max_diff = gpu_with_page_img
+                .data
+                .iter()
+                .zip(cpu.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_diff <= 1,
+                "GPU with colliding page ImageId(0) must match CPU within 1 LSB, max_diff={max_diff}"
+            );
+            let gpu_empty_page_cache =
+                render_gpu_shared(&dl, Some(&fonts), None, 1.0).expect("gpu empty page cache");
+            assert_layout(
+                "GPU with empty page ImageCache",
+                &gpu_empty_page_cache.data,
+                gpu_empty_page_cache.width,
+                false,
+            );
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU Type 3 mask image ID test (no adapter)");
+        }
+        Err(e) => panic!("GPU Type 3 mask image ID test failed: {e}"),
+    }
+}

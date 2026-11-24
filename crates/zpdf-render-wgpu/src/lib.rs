@@ -642,8 +642,17 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 let map = page.map;
                 let id = zpdf_core::Matrix::identity();
                 let mask_ops = if page.recorder.can_push_blend() {
-                    mask.as_ref()
-                        .map(|m| build_mask_ops(&mut page.recorder, m, &id, fonts, images, &map, 0))
+                    mask.as_ref().map(|m| {
+                        build_mask_ops(
+                            &mut page.recorder,
+                            m,
+                            &id,
+                            fonts,
+                            images.map(RecordImages::Page),
+                            &map,
+                            0,
+                        )
+                    })
                 } else {
                     None
                 };
@@ -1310,6 +1319,30 @@ fn replay_ops(pass: &mut wgpu::RenderPass, ops: &[PageOp], res: &ReplayRes) {
     }
 }
 
+/// Image cache source passed into [`record_dl_commands_at`] / [`build_mask_ops`].
+/// Page-level masks and tiling cells resolve `DrawImage` against the page's
+/// `ImageCache`, whereas Type 3 glyph masks resolve against the glyph's private
+/// `ImageCache` and register textures under [`record::Type3ImageKey`] so they
+/// never disappear or collide with page `ImageId`s.
+#[derive(Clone, Copy)]
+pub(crate) enum RecordImages<'a> {
+    Page(&'a zpdf_image::ImageCache),
+    Type3 {
+        font_id: zpdf_font::FontId,
+        glyph_id: u16,
+        images: &'a zpdf_image::ImageCache,
+    },
+}
+
+impl<'a> RecordImages<'a> {
+    fn page_cache(self) -> Option<&'a zpdf_image::ImageCache> {
+        match self {
+            Self::Page(cache) => Some(cache),
+            Self::Type3 { .. } => None,
+        }
+    }
+}
+
 /// Record a [`zpdf_display_list::DisplayList`] directly into `rec` under an
 /// arbitrary affine `ctm` (identity for top-level soft masks; pattern-to-page
 /// or pattern-to-tile for tiling cells). Commands — including shared soft-mask
@@ -1323,11 +1356,12 @@ fn record_dl_commands_at(
     dl: &zpdf_display_list::DisplayList,
     ctm: &zpdf_core::Matrix,
     fonts: Option<&zpdf_font::FontCache>,
-    images: Option<&zpdf_image::ImageCache>,
+    images: Option<RecordImages<'_>>,
     map: &PageMap,
     depth: u8,
 ) {
     use zpdf_display_list::Paint;
+    let page_images = images.and_then(RecordImages::page_cache);
     for cmd in &dl.commands {
         if !rec.can_record() {
             return;
@@ -1372,7 +1406,7 @@ fn record_dl_commands_at(
             RenderCommand::DrawGlyphRun(run) => {
                 if let Some(f) = fonts {
                     if let Paint::Tiling(tiling) = &run.paint {
-                        record_tiling_glyph_run(rec, run, tiling, ctm, f, images, map, depth);
+                        record_tiling_glyph_run(rec, run, tiling, ctm, f, page_images, map, depth);
                     } else {
                         match run.overprint {
                             Some(op) if op.active != 0 => {
@@ -1387,10 +1421,24 @@ fn record_dl_commands_at(
                 }
             }
             RenderCommand::DrawImage(draw) => {
-                if let Some(img) = images
-                    .and_then(|c| c.get(draw.image_id))
-                    .filter(|img| image::is_valid_decoded_image(img))
-                {
+                let (img, type3_key) = match images {
+                    Some(RecordImages::Page(cache)) => (cache.get(draw.image_id), None),
+                    Some(RecordImages::Type3 {
+                        font_id,
+                        glyph_id,
+                        images: cache,
+                    }) => (
+                        cache.get(draw.image_id),
+                        Some(record::Type3ImageKey {
+                            font_id,
+                            glyph_id,
+                            image_id: draw.image_id,
+                            stencil_tint: None,
+                        }),
+                    ),
+                    None => (None, None),
+                };
+                if let Some(img) = img.filter(|img| image::is_valid_decoded_image(img)) {
                     let transform = if *ctm == zpdf_core::Matrix::identity() {
                         draw.transform
                     } else {
@@ -1404,7 +1452,11 @@ fn record_dl_commands_at(
                         draw.alpha,
                     );
                     if image::is_safe_quad(&quad) {
-                        rec.add_image(quad, draw.image_id);
+                        if let Some(key) = type3_key {
+                            rec.add_type3_image_cached(key, quad, || img.clone());
+                        } else {
+                            rec.add_image(quad, draw.image_id);
+                        }
                     }
                 }
             }
@@ -1443,7 +1495,17 @@ fn record_dl_commands_at(
                 overprint,
             } => {
                 record_tiling_fill(
-                    rec, path, *rule, tiling, ctm, *alpha, *overprint, fonts, images, map, depth,
+                    rec,
+                    path,
+                    *rule,
+                    tiling,
+                    ctm,
+                    *alpha,
+                    *overprint,
+                    fonts,
+                    page_images,
+                    map,
+                    depth,
                 );
             }
             RenderCommand::StrokePath {
@@ -1454,7 +1516,17 @@ fn record_dl_commands_at(
                 overprint,
             } => {
                 record_tiling_stroke(
-                    rec, path, style, tiling, ctm, *alpha, *overprint, fonts, images, map, depth,
+                    rec,
+                    path,
+                    style,
+                    tiling,
+                    ctm,
+                    *alpha,
+                    *overprint,
+                    fonts,
+                    page_images,
+                    map,
+                    depth,
                 );
             }
             // Non-solid paints other than tiling are rasterized upstream.
@@ -1703,7 +1775,7 @@ fn record_tiling_pattern(
                 &tiling.commands,
                 &tile_ctm,
                 fonts,
-                images,
+                images.map(RecordImages::Page),
                 map,
                 depth + 1,
             );
@@ -1938,7 +2010,7 @@ fn record_tiling_pattern_rasterized(
                         commands,
                         &copy_ctm,
                         fonts,
-                        images,
+                        images.map(RecordImages::Page),
                         &tile_map,
                         depth + 1,
                     );
@@ -2219,7 +2291,7 @@ fn record_tiling_pattern_rasterized(
                                             &seg.commands,
                                             copy_ctm,
                                             fonts,
-                                            images,
+                                            images.map(RecordImages::Page),
                                             tile_map,
                                             depth + 1,
                                         );
@@ -2253,7 +2325,7 @@ fn record_tiling_pattern_rasterized(
                                                     &m_seg.commands,
                                                     copy_ctm,
                                                     fonts,
-                                                    images,
+                                                    images.map(RecordImages::Page),
                                                     tile_map,
                                                     depth + 1,
                                                 );
@@ -2712,7 +2784,7 @@ pub(crate) fn build_mask_ops(
     mask: &zpdf_display_list::SoftMask,
     ctm: &zpdf_core::Matrix,
     fonts: Option<&zpdf_font::FontCache>,
-    images: Option<&zpdf_image::ImageCache>,
+    images: Option<RecordImages<'_>>,
     map: &PageMap,
     depth: u8,
 ) -> record::MaskOps {

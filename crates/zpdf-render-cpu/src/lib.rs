@@ -502,6 +502,9 @@ struct Type3Glyph {
     list: DisplayList,
     /// Images its `DrawImage` commands reference.
     images: ImageCache,
+    /// Shared `Arc<InlineImage>` wrappers for glyph-local `ImageId`s referenced
+    /// inside soft masks so repeated glyph placements reuse one pixel buffer.
+    inline_images: HashMap<ImageId, Arc<zpdf_display_list::InlineImage>>,
     font_matrix: [f64; 6],
 }
 
@@ -6554,19 +6557,12 @@ impl<'a> CpuRenderer<'a> {
                 run.h_scale,
                 &program.font_matrix,
             );
-            let glyph_images = &program.images;
-            let resolve_glyph_img = |id: ImageId| {
-                glyph_images.get(id).map(|img| {
-                    Arc::new(zpdf_display_list::InlineImage {
-                        width: img.width,
-                        height: img.height,
-                        data: img.data.clone(),
-                        has_alpha: img.has_alpha,
-                        is_image_mask: img.is_image_mask,
-                        premultiplied: img.premultiplied,
-                    })
-                })
-            };
+            let resolve_glyph_img = |id: ImageId| program.inline_images.get(&id).cloned();
+            let device_scale = self.scale.max(self.scale_y);
+            let transform_mask_stroke =
+                |path: &Path, style: &StrokeStyle, m: &zpdf_core::Matrix| {
+                    transform_stroke_to_page(path, style, m, device_scale)
+                };
             let mut seg_start = 0usize;
             let mut glyph_clip_depth = 0usize;
             let mut glyph_blend_depth = 0usize;
@@ -6624,9 +6620,13 @@ impl<'a> CpuRenderer<'a> {
                         ..
                     } => {
                         flush_inherited(self, seg_start, i);
-                        let page_mask = mask
-                            .as_ref()
-                            .map(|m| m.transform_with_images(&glyph_to_page, &resolve_glyph_img));
+                        let page_mask = mask.as_ref().map(|m| {
+                            m.transform_with_images(
+                                &glyph_to_page,
+                                &resolve_glyph_img,
+                                &transform_mask_stroke,
+                            )
+                        });
                         self.push_blend_group(
                             *blend_mode,
                             *isolated,
@@ -6688,17 +6688,10 @@ impl<'a> CpuRenderer<'a> {
         let h_scale = run.h_scale;
         let font_matrix = program.font_matrix;
         let glyph_images = &program.images;
-        let resolve_glyph_img = |id: ImageId| {
-            glyph_images.get(id).map(|img| {
-                Arc::new(zpdf_display_list::InlineImage {
-                    width: img.width,
-                    height: img.height,
-                    data: img.data.clone(),
-                    has_alpha: img.has_alpha,
-                    is_image_mask: img.is_image_mask,
-                    premultiplied: img.premultiplied,
-                })
-            })
+        let resolve_glyph_img = |id: ImageId| program.inline_images.get(&id).cloned();
+        let device_scale = self.scale.max(self.scale_y);
+        let transform_mask_stroke = |path: &Path, style: &StrokeStyle, m: &zpdf_core::Matrix| {
+            transform_stroke_to_page(path, style, m, device_scale)
         };
         let glyph_to_page = Self::type3_glyph_to_page(tm, glyph, font_size, h_scale, &font_matrix);
         let mut glyph_clip_depth = 0usize;
@@ -6729,9 +6722,13 @@ impl<'a> CpuRenderer<'a> {
                     mask,
                     ..
                 } => {
-                    let page_mask = mask
-                        .as_ref()
-                        .map(|m| m.transform_with_images(&glyph_to_page, &resolve_glyph_img));
+                    let page_mask = mask.as_ref().map(|m| {
+                        m.transform_with_images(
+                            &glyph_to_page,
+                            &resolve_glyph_img,
+                            &transform_mask_stroke,
+                        )
+                    });
                     self.push_blend_group(
                         *blend_mode,
                         *isolated,
@@ -6957,14 +6954,24 @@ impl<'a> CpuRenderer<'a> {
                     interp = interp.with_deadline(deadline);
                 }
                 let list = interp.interpret(stream);
+                let inline_images = collect_type3_mask_inline_images(&list, &images);
                 Arc::new(Type3Glyph {
                     list,
                     images,
+                    inline_images,
                     font_matrix,
                 })
             });
         let (commands, image_bytes) = glyph.as_ref().map_or((1, 0), |g| {
-            (g.list.commands.len().max(1), g.images.bytes_used())
+            let inline_bytes: u64 = g
+                .inline_images
+                .values()
+                .map(|img| img.data.len() as u64)
+                .sum();
+            (
+                g.list.commands.len().max(1),
+                g.images.bytes_used().saturating_add(inline_bytes),
+            )
         });
         let total_commands = self.type3_glyph_commands.saturating_add(commands);
         let total_image_bytes = self.type3_glyph_image_bytes.saturating_add(image_bytes);
@@ -7394,6 +7401,238 @@ impl<'a> CpuRenderer<'a> {
 impl<'a> Default for CpuRenderer<'a> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Build shared `Arc<InlineImage>` wrappers once per Type 3 glyph program for
+/// every glyph-local `ImageId` referenced inside its soft masks so repeated
+/// glyph placements share one decoded pixel buffer instead of cloning per draw.
+pub fn collect_type3_mask_inline_images(
+    list: &DisplayList,
+    images: &ImageCache,
+) -> HashMap<ImageId, Arc<zpdf_display_list::InlineImage>> {
+    fn visit(
+        commands: &[RenderCommand],
+        in_mask: bool,
+        depth: u8,
+        ids: &mut std::collections::HashSet<ImageId>,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        for cmd in commands {
+            match cmd {
+                RenderCommand::DrawImage(draw) if in_mask => {
+                    ids.insert(draw.image_id);
+                }
+                RenderCommand::PushBlendGroup { mask: Some(m), .. } => {
+                    visit(&m.commands.commands, true, depth + 1, ids);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut ids = std::collections::HashSet::new();
+    visit(&list.commands, false, 0, &mut ids);
+    let mut out = HashMap::with_capacity(ids.len());
+    for id in ids {
+        if let Some(img) = images.get(id) {
+            out.insert(
+                id,
+                Arc::new(zpdf_display_list::InlineImage {
+                    width: img.width,
+                    height: img.height,
+                    data: img.data.clone(),
+                    has_alpha: img.has_alpha,
+                    is_image_mask: img.is_image_mask,
+                    premultiplied: img.premultiplied,
+                }),
+            );
+        }
+    }
+    out
+}
+
+/// Map a local-space stroke (`StrokePath` or `PushClipStroke`) through `matrix`
+/// into destination coordinates while preserving directional stroke widths,
+/// elliptical caps/joins, and directional dash lengths under nonuniform scales
+/// and shears.
+pub fn transform_stroke_to_page(
+    path: &Path,
+    style: &StrokeStyle,
+    matrix: &zpdf_core::Matrix,
+    device_scale: f32,
+) -> zpdf_display_list::TransformedStroke {
+    let sx = matrix.a.hypot(matrix.b);
+    let sy = matrix.c.hypot(matrix.d);
+    let max_scale = CpuRenderer::max_linear_scale_2x2(matrix.a, matrix.b, matrix.c, matrix.d);
+    if !sx.is_finite() || !sy.is_finite() || !max_scale.is_finite() || max_scale <= 1e-9 {
+        return zpdf_display_list::TransformedStroke::Empty;
+    }
+    let dot = matrix.a * matrix.c + matrix.b * matrix.d;
+    let is_uniform = (sx - sy).abs() <= 1e-5 * sx.max(sy).max(1.0) && dot.abs() <= 1e-5 * sx * sy;
+    if is_uniform {
+        let s = sx as f32;
+        let scaled = StrokeStyle {
+            width: if style.width > 0.0 && style.width.is_finite() {
+                style.width * s
+            } else {
+                0.0
+            },
+            cap: style.cap,
+            join: style.join,
+            miter_limit: style.miter_limit,
+            dash: style.dash.as_ref().map(|d| zpdf_display_list::DashPattern {
+                array: d.array.iter().map(|v| v * s).collect(),
+                phase: d.phase * s,
+            }),
+        };
+        return zpdf_display_list::TransformedStroke::Stroked(
+            path.map_points(|p| p.transform(matrix)),
+            scaled,
+        );
+    }
+
+    // Normalize local geometry by `norm` to page-point magnitude so tiny
+    // glyph coordinates scaled up by a large matrix keep full stroking accuracy.
+    let mut max_coord = 0.0_f64;
+    for p in path.points() {
+        if !p.x.is_finite() || !p.y.is_finite() {
+            return zpdf_display_list::TransformedStroke::Empty;
+        }
+        max_coord = max_coord.max(p.x.abs()).max(p.y.abs());
+    }
+    let norm = if max_coord * max_scale <= 1e7 && (style.width as f64) * max_scale <= 1e7 {
+        max_scale
+    } else {
+        1.0
+    };
+    let norm_f32 = norm as f32;
+    let mut pb = tiny_skia::PathBuilder::new();
+    for elem in path {
+        match elem {
+            PathElement::MoveTo(p) => pb.move_to((p.x * norm) as f32, (p.y * norm) as f32),
+            PathElement::LineTo(p) => pb.line_to((p.x * norm) as f32, (p.y * norm) as f32),
+            PathElement::CurveTo(c1, c2, end) => pb.cubic_to(
+                (c1.x * norm) as f32,
+                (c1.y * norm) as f32,
+                (c2.x * norm) as f32,
+                (c2.y * norm) as f32,
+                (end.x * norm) as f32,
+                (end.y * norm) as f32,
+            ),
+            PathElement::Close => pb.close(),
+        }
+    }
+    let Some(norm_path) = pb.finish() else {
+        return zpdf_display_list::TransformedStroke::Empty;
+    };
+    let dev = if device_scale.is_finite() && device_scale > 0.0 {
+        device_scale
+    } else {
+        1.0
+    };
+    let res_scale = ((max_scale / norm) as f32 * dev).clamp(1.0, 1024.0);
+    let post_matrix = zpdf_core::Matrix {
+        a: matrix.a / norm,
+        b: matrix.b / norm,
+        c: matrix.c / norm,
+        d: matrix.d / norm,
+        e: matrix.e,
+        f: matrix.f,
+    };
+
+    let safe_dash = style.dash.as_ref().and_then(|d| {
+        let period: f64 = d
+            .array
+            .iter()
+            .filter(|v| v.is_finite() && **v >= 0.0)
+            .map(|&v| v as f64)
+            .sum();
+        if !period.is_finite() || period <= 0.0 {
+            return None;
+        }
+        let mut chord_len = 0.0_f64;
+        let mut start = zpdf_core::Point::new(0.0, 0.0);
+        let mut cur = start;
+        for elem in path {
+            match elem {
+                PathElement::MoveTo(p) => {
+                    start = p;
+                    cur = p;
+                }
+                PathElement::LineTo(p) => {
+                    chord_len += (p.x - cur.x).hypot(p.y - cur.y);
+                    cur = p;
+                }
+                PathElement::CurveTo(c1, c2, end) => {
+                    chord_len += (c1.x - cur.x).hypot(c1.y - cur.y)
+                        + (c2.x - c1.x).hypot(c2.y - c1.y)
+                        + (end.x - c2.x).hypot(end.y - c2.y);
+                    cur = end;
+                }
+                PathElement::Close => {
+                    chord_len += (start.x - cur.x).hypot(start.y - cur.y);
+                    cur = start;
+                }
+            }
+        }
+        let repeats = if d.array.len() % 2 == 1 {
+            chord_len / (2.0 * period)
+        } else {
+            chord_len / period
+        };
+        if !repeats.is_finite() || repeats > 100_000.0 {
+            return None;
+        }
+        CpuRenderer::stroke_dash(style, norm_f32)
+    });
+
+    if style.width.is_finite() && style.width > 0.0 {
+        let mut glyph_stroke = CpuRenderer::skia_stroke(style, norm_f32, 0.0);
+        glyph_stroke.dash = None;
+        let dashed;
+        let source = if let Some(ref dash) = safe_dash {
+            let Some(d) = norm_path.dash(dash, res_scale) else {
+                return zpdf_display_list::TransformedStroke::Empty;
+            };
+            dashed = d;
+            &dashed
+        } else {
+            &norm_path
+        };
+        let Some(stroked) = source.stroke(&glyph_stroke, res_scale) else {
+            return zpdf_display_list::TransformedStroke::Empty;
+        };
+        zpdf_display_list::TransformedStroke::Filled(skia_path_to_dl_transformed(
+            &stroked,
+            &post_matrix,
+        ))
+    } else {
+        // 0-width PDF hairline: always 1 device pixel wide, while dashes still
+        // follow glyph-space directional lengths under `matrix`.
+        let hairline_style = StrokeStyle {
+            width: 0.0,
+            cap: style.cap,
+            join: style.join,
+            miter_limit: style.miter_limit,
+            dash: None,
+        };
+        if let Some(ref dash) = safe_dash {
+            let Some(dashed) = norm_path.dash(dash, res_scale) else {
+                return zpdf_display_list::TransformedStroke::Empty;
+            };
+            zpdf_display_list::TransformedStroke::Stroked(
+                skia_path_to_dl_transformed(&dashed, &post_matrix),
+                hairline_style,
+            )
+        } else {
+            zpdf_display_list::TransformedStroke::Stroked(
+                path.map_points(|p| p.transform(matrix)),
+                hairline_style,
+            )
+        }
     }
 }
 
@@ -11553,5 +11792,344 @@ mod tests {
                 && straight[3] == 255,
             "expected ~[191, 127, 127, 255] on white, got {straight:?}"
         );
+    }
+
+    #[test]
+    fn type3_soft_mask_shares_decoded_inline_images_across_placements() {
+        use zpdf_font::{LoadedFont, PdfFontType, Type3FormXObject, Type3Resources, Type3SoftMask};
+
+        // 2x1 mask image: left pixel white (visible), right pixel black (masked).
+        let mask_img_stream = b"q 20 0 0 20 0 0 cm BI /W 2 /H 1 /BPC 8 /CS /G ID \xff\x00 EI Q";
+        let mut form_dict = zpdf_core::PdfDict::new();
+        form_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(20.0),
+                zpdf_core::PdfObject::Real(20.0),
+            ]),
+        );
+        let group = Arc::new(Type3FormXObject {
+            dict: form_dict,
+            data: Arc::from(&mask_img_stream[..]),
+            resources: None,
+        });
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_state_smasks.insert(
+            "GSImgMask".into(),
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group,
+                backdrop_luma: 0.0,
+                transfer: None,
+            },
+        );
+        // Include both an explicit colored fill and an inherited fill so
+        // `render_type3_backdrop_tiling` exercises its explicit-colored branch too.
+        let charproc = b"20 0 d0 /GSImgMask gs 0 0 20 20 re f 1 0 0 rg 0 0 20 20 re f";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![20.0],
+                first_char: 0,
+            },
+            "Type3SharedMaskImg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(20.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let glyph_at = |x: f32| PositionedGlyph {
+            glyph_id: 0,
+            code_len: 1,
+            code: b'A' as u32,
+            x,
+            y: 0.0,
+            advance: 20.0,
+        };
+        let extract_mask_inline_arcs = |renderer: &CpuRenderer<'_>| {
+            let mut arcs: Vec<Arc<zpdf_display_list::InlineImage>> = Vec::new();
+            for (dl, _, _) in renderer.soft_mask_planes.values() {
+                for cmd in &dl.commands {
+                    if let RenderCommand::DrawInlineImage(draw) = cmd {
+                        arcs.push(Arc::clone(&draw.image));
+                    }
+                }
+            }
+            arcs
+        };
+
+        // 1. Solid Type 3 path (`render_type3_glyph_commands`).
+        let mut solid_renderer = CpuRenderer::new().with_fonts(&fonts);
+        solid_renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 60.0, 20.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .expect("begin solid");
+        solid_renderer
+            .execute(&RenderCommand::DrawGlyphRun(GlyphRun {
+                font_id,
+                font_size: 1.0,
+                glyphs: vec![glyph_at(0.0), glyph_at(30.0)],
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::identity(),
+                h_scale: 1.0,
+            }))
+            .expect("execute solid");
+        let solid_arcs = extract_mask_inline_arcs(&solid_renderer);
+        assert_eq!(
+            solid_arcs.len(),
+            4,
+            "two separated placements × two masked fills should retain four mask entries"
+        );
+        assert!(
+            solid_arcs.iter().all(|a| Arc::ptr_eq(&solid_arcs[0], a)),
+            "solid Type 3 replay must share one Arc<InlineImage> across all placements"
+        );
+        let solid_page = solid_renderer.end_page().expect("end solid");
+        for bx in [0u32, 30] {
+            let left_idx = ((10 * solid_page.width + bx + 5) * 4) as usize;
+            let right_idx = ((10 * solid_page.width + bx + 15) * 4) as usize;
+            assert!(solid_page.data[left_idx] > 240 && solid_page.data[left_idx + 1] < 15);
+            assert!(solid_page.data[right_idx] > 240 && solid_page.data[right_idx + 1] > 240);
+        }
+
+        // 2. Backdrop-dependent tiling Type 3 path (`render_type3_backdrop_tiling`).
+        let mut tile_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        tile_dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        tile_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        tile_dl.push(RenderCommand::PopBlendGroup);
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(tile_dl),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut tiling_renderer = CpuRenderer::new().with_fonts(&fonts);
+        tiling_renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 60.0, 20.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .expect("begin tiling");
+        tiling_renderer
+            .execute(&RenderCommand::DrawGlyphRun(GlyphRun {
+                font_id,
+                font_size: 1.0,
+                glyphs: vec![glyph_at(0.0), glyph_at(30.0)],
+                paint: Paint::Tiling(tiling),
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::identity(),
+                h_scale: 1.0,
+            }))
+            .expect("execute tiling");
+        let tiling_arcs = extract_mask_inline_arcs(&tiling_renderer);
+        assert!(
+            tiling_arcs.len() >= 2,
+            "expected at least 2 retained mask entries across separated placements, got {}",
+            tiling_arcs.len()
+        );
+        assert!(
+            tiling_arcs.iter().all(|a| Arc::ptr_eq(&tiling_arcs[0], a)),
+            "tiling Type 3 replay must share one Arc<InlineImage> across all placements"
+        );
+        let _ = tiling_renderer.end_page().expect("end tiling");
+    }
+
+    #[test]
+    fn type3_soft_mask_nonuniform_text_scale_preserves_directional_stroke_and_clip_stroke() {
+        use zpdf_font::{LoadedFont, PdfFontType, Type3FormXObject, Type3Resources, Type3SoftMask};
+
+        // Mask draws a 12-unit-wide white cross centered at glyph (40, 40):
+        //   vertical bar x=40, y=[10..70] -> under 0.5x H-scale, becomes x=20 with width 6 (x=[17..23])
+        //   horizontal bar y=40, x=[10..70] -> under 1.0x V-scale, stays y=40 with thickness 12 (y=[34..46])
+        let mask_stream = b"1 G 12 w 40 10 m 40 70 l S 10 40 m 70 40 l S";
+        let mut form_dict = zpdf_core::PdfDict::new();
+        form_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(80.0),
+                zpdf_core::PdfObject::Real(80.0),
+            ]),
+        );
+        let group = Arc::new(Type3FormXObject {
+            dict: form_dict,
+            data: Arc::from(&mask_stream[..]),
+            resources: None,
+        });
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_state_smasks.insert(
+            "GSStroke".into(),
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group,
+                backdrop_luma: 0.0,
+                transfer: None,
+            },
+        );
+        let charproc = b"80 0 d0 /GSStroke gs 1 0 0 rg 0 0 80 80 re f";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![80.0],
+                first_char: 0,
+            },
+            "Type3NonUniformMask".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(80.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 80.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 80.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 0.5,
+        }));
+        let page = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .render_display_list(&dl, 1.0)
+            .expect("render");
+        let px = |x: u32, pdf_y: u32| -> [u8; 3] {
+            let py = page.height - 1 - pdf_y;
+            let idx = ((py * page.width + x) * 4) as usize;
+            [page.data[idx], page.data[idx + 1], page.data[idx + 2]]
+        };
+        // Vertical stroke at x=20, width 6 -> x=[17..23] at y=60:
+        // x=22 is inside (red), x=24 is outside (white; averaged 75% width=9 would reach 24.5!).
+        let v_in = px(22, 60);
+        let v_out = px(24, 60);
+        assert!(
+            v_in[0] > 240 && v_in[1] < 15 && v_in[2] < 15,
+            "vertical mask stroke at x=22 must be red (width=6), got {v_in:?}"
+        );
+        assert!(
+            v_out[0] > 240 && v_out[1] > 240 && v_out[2] > 240,
+            "vertical mask stroke at x=24 must be white (not averaged width=9), got {v_out:?}"
+        );
+        // Horizontal stroke at y=40, thickness 12 -> y=[34..46] at x=10:
+        // y=45 is inside (red; averaged 75% thickness=9 would stop at 44.5!), y=47 is outside (white).
+        let h_in = px(10, 45);
+        let h_out = px(10, 47);
+        assert!(
+            h_in[0] > 240 && h_in[1] < 15 && h_in[2] < 15,
+            "horizontal mask stroke at y=45 must be red (thickness=12), got {h_in:?}"
+        );
+        assert!(
+            h_out[0] > 240 && h_out[1] > 240 && h_out[2] > 240,
+            "horizontal mask stroke at y=47 must be white, got {h_out:?}"
+        );
+
+        // Also verify `PushClipStroke` preserves directional widths under 0.5x H-scale.
+        let mut cross = Path::new();
+        cross.move_to(Point::new(40.0, 10.0));
+        cross.line_to(Point::new(40.0, 70.0));
+        cross.move_to(Point::new(10.0, 40.0));
+        cross.line_to(Point::new(70.0, 40.0));
+        let mut clip_mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 80.0, 80.0));
+        clip_mask_dl.push(RenderCommand::PushClipStroke {
+            path: cross,
+            style: StrokeStyle {
+                width: 12.0,
+                ..StrokeStyle::default()
+            },
+        });
+        clip_mask_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 80.0, 80.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        clip_mask_dl.push(RenderCommand::PopClip);
+        let src_mask = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::new(clip_mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+        let mapped = src_mask.transform_with_images(
+            &zpdf_core::Matrix::scale(0.5, 1.0),
+            &|_| None,
+            &|p, s, m| transform_stroke_to_page(p, s, m, 1.0),
+        );
+        let mut clip_dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 80.0));
+        clip_dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 60.0, 80.0),
+            alpha: 1.0,
+            mask: Some(mapped),
+        });
+        clip_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 60.0, 80.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        clip_dl.push(RenderCommand::PopBlendGroup);
+        let clip_page = CpuRenderer::new()
+            .render_display_list(&clip_dl, 1.0)
+            .expect("render clip stroke mask");
+        let cpx = |x: u32, pdf_y: u32| -> [u8; 3] {
+            let py = clip_page.height - 1 - pdf_y;
+            let idx = ((py * clip_page.width + x) * 4) as usize;
+            [
+                clip_page.data[idx],
+                clip_page.data[idx + 1],
+                clip_page.data[idx + 2],
+            ]
+        };
+        assert!(cpx(22, 60)[0] > 240 && cpx(22, 60)[1] < 15);
+        assert!(cpx(24, 60)[0] > 240 && cpx(24, 60)[1] > 240);
+        assert!(cpx(10, 45)[0] > 240 && cpx(10, 45)[1] < 15);
+        assert!(cpx(10, 47)[0] > 240 && cpx(10, 47)[1] > 240);
     }
 }

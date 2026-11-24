@@ -7347,15 +7347,15 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
         if self.should_expand_anisotropic_stroke() {
-            if self.rules_active() {
-                let page_path = self.transform_path_to_page_space(&self.current_path);
-                self.capture_stroke_rules(&page_path);
-            }
             let remaining = self
                 .max_anisotropic_stroke_points
                 .saturating_sub(self.anisotropic_stroke_points);
             match self.expand_anisotropic_stroke(&self.current_path, remaining) {
                 AnisotropicStroke::Outline(outline) => {
+                    if self.rules_active() {
+                        let page_path = self.transform_path_to_page_space(&self.current_path);
+                        self.capture_stroke_rules(&page_path);
+                    }
                     self.anisotropic_stroke_points = self
                         .anisotropic_stroke_points
                         .saturating_add(outline.points().len());
@@ -17310,5 +17310,35 @@ mod tests {
             !glyph_first_page,
             "glyph-first order: page fill must NOT reuse Type 3 cell carrying DrawInlineImage"
         );
+    }
+
+    #[test]
+    fn anisotropic_stroke_fallback_captures_table_rule_once() {
+        let mut rules = Vec::new();
+        // 4x horizontal, 1x vertical nonuniform CTM triggers anisotropic stroke
+        // expansion; a zero point budget forces `AnisotropicStroke::Fallback`
+        // into `emit_stroke`. The horizontal rule (page x=[40..240], y=20)
+        // must be recorded exactly once.
+        let stream = b"4 0 0 1 0 0 cm 1 w 10 20 m 60 20 l S";
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 300.0, 100.0))
+            .with_rule_sink(&mut rules)
+            .with_anisotropic_stroke_point_limit(0)
+            .interpret(stream);
+
+        assert!(
+            dl.commands
+                .iter()
+                .any(|c| matches!(c, RenderCommand::StrokePath { .. })),
+            "zero point allowance must fall back to StrokePath"
+        );
+        assert_eq!(
+            rules.len(),
+            1,
+            "anisotropic stroke fallback must record the table rule exactly once, got {rules:?}"
+        );
+        assert!(!rules[0].vertical);
+        assert!((rules[0].pos - 20.0).abs() < 1e-6);
+        assert!((rules[0].start - 40.0).abs() < 1e-6);
+        assert!((rules[0].end - 240.0).abs() < 1e-6);
     }
 }
