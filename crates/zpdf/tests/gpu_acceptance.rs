@@ -14,6 +14,55 @@ const SCALE: f32 = 2.0;
 const THRESHOLD: u8 = 16;
 const MAX_DIFF_PCT: f64 = 1.0;
 
+/// Single shared headless [`zpdf::gpu::GpuContext`] for this integration test
+/// binary. Running ~20 independent software DX12 (WARP) devices concurrently on
+/// Windows CI exhausts D3D12 committed heap quota and triggers spurious
+/// `Buffer with '...' label is invalid` panics inside `create_buffer_init`.
+/// Sharing one context also serializes the `ZPDF_GPU_GLYPH_ATLAS` toggle test.
+static SHARED_GPU_CTX: std::sync::Mutex<Option<zpdf::gpu::GpuContext>> =
+    std::sync::Mutex::new(None);
+
+fn with_shared_gpu_renderer<R>(
+    f: impl FnOnce(&mut zpdf::gpu::WgpuRenderer<'_>) -> R,
+) -> Result<R, zpdf::gpu::WgpuRenderError> {
+    let mut guard = SHARED_GPU_CTX.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = match guard.take() {
+        Some(c) => c,
+        None => zpdf::gpu::GpuContext::new_headless()?,
+    };
+    let mut renderer = zpdf::gpu::WgpuRenderer::new().with_context(ctx);
+    let out = f(&mut renderer);
+    if let Some(c) = renderer.take_context() {
+        *guard = Some(c);
+    }
+    Ok(out)
+}
+
+fn render_gpu_shared(
+    dl: &zpdf::display_list::DisplayList,
+    fonts: Option<&zpdf::FontCache>,
+    images: Option<&ImageCache>,
+    scale: f32,
+) -> Result<zpdf::gpu::GpuTexture, zpdf::gpu::WgpuRenderError> {
+    let mut guard = SHARED_GPU_CTX.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = match guard.take() {
+        Some(c) => c,
+        None => zpdf::gpu::GpuContext::new_headless()?,
+    };
+    let mut renderer = zpdf::gpu::WgpuRenderer::new().with_context(ctx);
+    if let Some(f) = fonts {
+        renderer = renderer.with_fonts(f);
+    }
+    if let Some(i) = images {
+        renderer = renderer.with_images(i);
+    }
+    let res = renderer.render_display_list(dl, scale);
+    if let Some(c) = renderer.take_context() {
+        *guard = Some(c);
+    }
+    res
+}
+
 /// Real embedded TrueType font (not Type3) — its Unicode cmap maps 'A' (0x41)
 /// to GID 1, a filled-rectangle outline (see `crates/zpdf/tests/variable_font_pdf.rs`,
 /// which exercises the same fixture/GID via `glyph_outline(1)` directly).
@@ -241,11 +290,7 @@ fn compare_backends(pdf: Vec<u8>) -> Option<BackendDiff> {
         .interpret(&content);
 
     // GPU first: bail out (skip) if there's no adapter.
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, SCALE)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), SCALE) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU acceptance (no adapter?): {e}");
@@ -323,11 +368,7 @@ fn compare_backends_with_annots(pdf: Vec<u8>) -> Option<BackendDiff> {
         .with_annotations(&annots)
         .interpret(&content);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, SCALE)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), SCALE) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU markup acceptance (no adapter?): {e}");
@@ -367,96 +408,96 @@ fn gpu_clear_matches_cpu_and_matching_fill_exactly() {
     use zpdf::Rect;
     use zpdf_render::PageRenderInfo;
 
-    let mut renderer = zpdf::gpu::WgpuRenderer::new();
-    match renderer.adapter_identity() {
-        Ok(_) => {}
+    let res = with_shared_gpu_renderer(|renderer| {
+        for (color, expected) in [
+            (Color::gray(0.0), [0, 0, 0, 255]),
+            (Color::gray(0.25), [64, 64, 64, 255]),
+            (Color::gray(0.5), [128, 128, 128, 255]),
+            (Color::gray(0.75), [191, 191, 191, 255]),
+            (Color::gray(1.0), [255, 255, 255, 255]),
+            (Color::rgb(0.5, 0.25, 0.75), [128, 64, 191, 255]),
+        ] {
+            let info = PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 4.0, 2.0),
+                scale: 1.0,
+                background: color,
+            };
+            let mut path = Path::new();
+            path.rect(Rect::new(2.0, 0.0, 4.0, 2.0));
+            let fill = RenderCommand::FillPath {
+                path,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(color),
+                alpha: 1.0,
+                overprint: None,
+            };
+            let mut cpu = zpdf::cpu::CpuRenderer::new();
+            cpu.begin_page(&info).expect("CPU begin page");
+            cpu.execute(&fill).expect("CPU matching fill");
+            let cpu = cpu.end_page().expect("CPU end page");
+            renderer.begin_page(&info).expect("GPU begin page");
+            renderer.execute(&fill).expect("GPU matching fill");
+            let gpu = renderer.end_page().expect("GPU end page");
+            assert_eq!((cpu.width, cpu.height), (4, 2));
+            assert_eq!((gpu.width, gpu.height), (4, 2));
+            // x=0 samples the clear; x=3 samples the matching rectangle.
+            for x in [0, 3] {
+                let offset = x * 4;
+                assert_eq!(
+                    &cpu.data[offset..offset + 4],
+                    &expected,
+                    "CPU {color:?} x={x}"
+                );
+                assert_eq!(
+                    &gpu.data[offset..offset + 4],
+                    &expected,
+                    "GPU {color:?} x={x}"
+                );
+            }
+        }
+
+        // Blank-page translucent clears premultiply clamped RGB by clamped alpha
+        // in floating point before rounding once to bytes, matching CPU Pixmap::fill.
+        for (color, expected) in [
+            (Color::rgba(0.1, 0.0, 0.0, 254.0 / 255.0), [25, 0, 0, 254]),
+            (Color::rgba(1.0, 0.5, 0.0, 0.5), [128, 64, 0, 128]),
+            (Color::rgba(1.0, 0.5, 0.25, 0.0), [0, 0, 0, 0]),
+        ] {
+            let info = PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 4.0, 2.0),
+                scale: 1.0,
+                background: color,
+            };
+            let mut cpu = zpdf::cpu::CpuRenderer::new();
+            cpu.begin_page(&info).expect("CPU begin page");
+            let cpu = cpu.end_page().expect("CPU end page");
+            renderer.begin_page(&info).expect("GPU begin page");
+            let gpu = renderer.end_page().expect("GPU end page");
+            assert_eq!((cpu.width, cpu.height), (4, 2));
+            assert_eq!((gpu.width, gpu.height), (4, 2));
+            assert_eq!(cpu.data.len(), 4 * 2 * 4);
+            assert_eq!(gpu.data.len(), 4 * 2 * 4);
+            for px in 0..(4 * 2) {
+                let offset = px * 4;
+                assert_eq!(
+                    &cpu.data[offset..offset + 4],
+                    &expected,
+                    "CPU translucent clear {color:?} px={px}"
+                );
+                assert_eq!(
+                    &gpu.data[offset..offset + 4],
+                    &expected,
+                    "GPU translucent clear {color:?} px={px}"
+                );
+            }
+        }
+    });
+    match res {
+        Ok(()) => {}
         Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
             eprintln!("skipping GPU clear-colour acceptance (no adapter)");
-            return;
         }
         Err(e) => panic!("initialize GPU clear-colour acceptance: {e}"),
-    }
-    for (color, expected) in [
-        (Color::gray(0.0), [0, 0, 0, 255]),
-        (Color::gray(0.25), [64, 64, 64, 255]),
-        (Color::gray(0.5), [128, 128, 128, 255]),
-        (Color::gray(0.75), [191, 191, 191, 255]),
-        (Color::gray(1.0), [255, 255, 255, 255]),
-        (Color::rgb(0.5, 0.25, 0.75), [128, 64, 191, 255]),
-    ] {
-        let info = PageRenderInfo {
-            page_rect: Rect::new(0.0, 0.0, 4.0, 2.0),
-            scale: 1.0,
-            background: color,
-        };
-        let mut path = Path::new();
-        path.rect(Rect::new(2.0, 0.0, 4.0, 2.0));
-        let fill = RenderCommand::FillPath {
-            path,
-            rule: FillRule::NonZero,
-            paint: Paint::Solid(color),
-            alpha: 1.0,
-            overprint: None,
-        };
-        let mut cpu = zpdf::cpu::CpuRenderer::new();
-        cpu.begin_page(&info).expect("CPU begin page");
-        cpu.execute(&fill).expect("CPU matching fill");
-        let cpu = cpu.end_page().expect("CPU end page");
-        renderer.begin_page(&info).expect("GPU begin page");
-        renderer.execute(&fill).expect("GPU matching fill");
-        let gpu = renderer.end_page().expect("GPU end page");
-        assert_eq!((cpu.width, cpu.height), (4, 2));
-        assert_eq!((gpu.width, gpu.height), (4, 2));
-        // x=0 samples the clear; x=3 samples the matching rectangle.
-        for x in [0, 3] {
-            let offset = x * 4;
-            assert_eq!(
-                &cpu.data[offset..offset + 4],
-                &expected,
-                "CPU {color:?} x={x}"
-            );
-            assert_eq!(
-                &gpu.data[offset..offset + 4],
-                &expected,
-                "GPU {color:?} x={x}"
-            );
-        }
-    }
-
-    // Blank-page translucent clears premultiply clamped RGB by clamped alpha
-    // in floating point before rounding once to bytes, matching CPU Pixmap::fill.
-    for (color, expected) in [
-        (Color::rgba(0.1, 0.0, 0.0, 254.0 / 255.0), [25, 0, 0, 254]),
-        (Color::rgba(1.0, 0.5, 0.0, 0.5), [128, 64, 0, 128]),
-        (Color::rgba(1.0, 0.5, 0.25, 0.0), [0, 0, 0, 0]),
-    ] {
-        let info = PageRenderInfo {
-            page_rect: Rect::new(0.0, 0.0, 4.0, 2.0),
-            scale: 1.0,
-            background: color,
-        };
-        let mut cpu = zpdf::cpu::CpuRenderer::new();
-        cpu.begin_page(&info).expect("CPU begin page");
-        let cpu = cpu.end_page().expect("CPU end page");
-        renderer.begin_page(&info).expect("GPU begin page");
-        let gpu = renderer.end_page().expect("GPU end page");
-        assert_eq!((cpu.width, cpu.height), (4, 2));
-        assert_eq!((gpu.width, gpu.height), (4, 2));
-        assert_eq!(cpu.data.len(), 4 * 2 * 4);
-        assert_eq!(gpu.data.len(), 4 * 2 * 4);
-        for px in 0..(4 * 2) {
-            let offset = px * 4;
-            assert_eq!(
-                &cpu.data[offset..offset + 4],
-                &expected,
-                "CPU translucent clear {color:?} px={px}"
-            );
-            assert_eq!(
-                &gpu.data[offset..offset + 4],
-                &expected,
-                "GPU translucent clear {color:?} px={px}"
-            );
-        }
     }
 }
 
@@ -541,25 +582,33 @@ fn glyph_atlas_path_is_genuinely_exercised() {
          failed to resolve to real outlines; this test's premise is broken"
     );
 
-    // SAFETY-ISH: std::env::set_var in a test is racy against other tests
-    // touching this var if run in parallel; this is the only test that does,
-    // and it restores the var afterward.
-    let render = || {
-        zpdf::gpu::WgpuRenderer::new()
+    // Hold SHARED_GPU_CTX across the env-var toggle so no parallel GPU test
+    // observes `ZPDF_GPU_GLYPH_ATLAS=0`.
+    let pair = (|| -> Result<_, zpdf::gpu::WgpuRenderError> {
+        let mut guard = SHARED_GPU_CTX.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = match guard.take() {
+            Some(c) => c,
+            None => zpdf::gpu::GpuContext::new_headless()?,
+        };
+        let mut renderer = zpdf::gpu::WgpuRenderer::new()
+            .with_context(ctx)
             .with_fonts(&fonts)
-            .with_images(&images)
-            .render_display_list(&dl, SCALE)
-    };
-    unsafe {
-        std::env::set_var("ZPDF_GPU_GLYPH_ATLAS", "0");
-    }
-    let fallback = render();
-    unsafe {
-        std::env::remove_var("ZPDF_GPU_GLYPH_ATLAS");
-    }
-    let atlas = render();
+            .with_images(&images);
+        unsafe {
+            std::env::set_var("ZPDF_GPU_GLYPH_ATLAS", "0");
+        }
+        let fallback = renderer.render_display_list(&dl, SCALE);
+        unsafe {
+            std::env::remove_var("ZPDF_GPU_GLYPH_ATLAS");
+        }
+        let atlas = renderer.render_display_list(&dl, SCALE);
+        if let Some(c) = renderer.take_context() {
+            *guard = Some(c);
+        }
+        Ok((fallback?, atlas?))
+    })();
 
-    let (Ok(fallback), Ok(atlas)) = (fallback, atlas) else {
+    let Ok((fallback, atlas)) = pair else {
         eprintln!("glyph_atlas_path_is_genuinely_exercised skipped (no adapter).");
         return;
     };
@@ -619,11 +668,7 @@ fn gpu_dense_tiling_pattern_above_4096_tiles_matches_cpu() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, SCALE)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), SCALE) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU dense tiling acceptance (no adapter?): {e}");
@@ -748,11 +793,7 @@ fn gpu_anisotropic_tiling_stroke_and_clip_preserve_directional_widths() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, 1.0)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU anisotropic stroke test (no adapter?): {e}");
@@ -865,11 +906,7 @@ fn gpu_dense_tiling_multiply_preserves_backdrop_across_backgrounds() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, SCALE)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), SCALE) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU dense Multiply tiling test (no adapter?): {e}");
@@ -989,11 +1026,7 @@ fn gpu_translucent_overlapping_multiply_tiling_applies_outer_opacity_once() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, SCALE)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), SCALE) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU translucent overlapping Multiply test (no adapter?): {e}");
@@ -1108,11 +1141,7 @@ fn gpu_overlapping_multiply_cell_agrees_above_and_below_4096_tile_cap() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, 1.0)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU overlapping Multiply cap parity test (no adapter?): {e}");
@@ -1215,11 +1244,7 @@ fn gpu_dense_nested_multiply_tiling_preserves_backdrop() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, SCALE)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), SCALE) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU dense nested Multiply test (no adapter?): {e}");
@@ -1325,11 +1350,7 @@ fn gpu_masked_backdrop_dependent_tiling_preserves_page_backdrop() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, 1.0)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU masked tiling test (no adapter?): {e}");
@@ -1431,11 +1452,7 @@ fn gpu_dense_translucent_multi_segment_nested_tiling_preserves_backdrop() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, 1.0)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU translucent nested tiling test (no adapter?): {e}");
@@ -1525,11 +1542,7 @@ fn gpu_overlapping_multiply_above_64_passes_preserves_both_copies() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, 1.0)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU overlapping >64 passes test (no adapter?): {e}");
@@ -1627,10 +1640,7 @@ fn gpu_multi_segment_tiling_applies_outer_shape_coverage_once() {
             .with_document(doc.file(), &page.resources)
             .with_images(&mut images)
             .interpret(&content_bytes);
-        zpdf::gpu::WgpuRenderer::new()
-            .with_fonts(&fonts)
-            .with_images(&images)
-            .render_display_list(&dl, 1.0)
+        render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0)
     };
     let pat_gpu = match render_gpu(pat_pdf) {
         Ok(p) => p,
@@ -1731,11 +1741,7 @@ fn gpu_outer_screen_blend_mode_on_backdrop_dependent_tiling_evaluates_cell_first
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, 1.0)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU outer-Screen tiling test (no adapter?): {e}");
@@ -1842,11 +1848,7 @@ fn gpu_dense_nested_half_pixel_path_applies_inner_shape_coverage_once() {
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, 1.0)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU dense nested half-pixel test (no adapter?): {e}");
@@ -1942,11 +1944,7 @@ fn gpu_dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() 
         .with_images(&mut images)
         .interpret(&content_bytes);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&dl, 1.0)
-    {
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU dense pass-budget fallback test (no adapter?): {e}");
@@ -2058,22 +2056,15 @@ fn gpu_tiling_glyph_run_renders_page_and_cell_text() {
     }
     let cell_glyph_run = cell_glyph_run.expect("glyph run");
 
-    let solid_gpu = match zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&solid_dl, 1.0)
-    {
+    let solid_gpu = match render_gpu_shared(&solid_dl, Some(&fonts), Some(&images), 1.0) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("skipping GPU tiling DrawGlyphRun test (no adapter?): {e}");
             return;
         }
     };
-    let tiling_gpu = zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&tiling_dl, 1.0)
-        .expect("tiling glyph gpu");
+    let tiling_gpu =
+        render_gpu_shared(&tiling_dl, Some(&fonts), Some(&images), 1.0).expect("tiling glyph gpu");
     let mut dark_pixels = 0usize;
     let mut aa_pixels = 0usize;
     for y in 20..110u32 {
@@ -2140,15 +2131,9 @@ fn gpu_tiling_glyph_run_renders_page_and_cell_text() {
     };
     let cell_text_dl = build_cell_dl(outer_cell);
     let solid_cell_text_dl = build_cell_dl(solid_outer_cell);
-    let cell_gpu = zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&cell_text_dl, 1.0)
-        .expect("cell text gpu");
-    let solid_cell_gpu = zpdf::gpu::WgpuRenderer::new()
-        .with_fonts(&fonts)
-        .with_images(&images)
-        .render_display_list(&solid_cell_text_dl, 1.0)
+    let cell_gpu =
+        render_gpu_shared(&cell_text_dl, Some(&fonts), Some(&images), 1.0).expect("cell text gpu");
+    let solid_cell_gpu = render_gpu_shared(&solid_cell_text_dl, Some(&fonts), Some(&images), 1.0)
         .expect("solid cell text gpu");
     let cell_cpu = zpdf::cpu::CpuRenderer::new()
         .with_fonts(&fonts)
@@ -2330,7 +2315,7 @@ fn gpu_deeply_nested_non_isolated_groups_stay_linear_and_match_cpu() {
     dl.push(RenderCommand::PopBlendGroup);
     dl.push(RenderCommand::PopBlendGroup);
 
-    let gpu = match zpdf::gpu::WgpuRenderer::new().render_display_list(&dl, 1.0) {
+    let gpu = match render_gpu_shared(&dl, None, None, 1.0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skipping GPU nested non-isolated groups test (no adapter?): {e}");
