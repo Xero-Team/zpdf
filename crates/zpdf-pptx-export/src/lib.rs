@@ -203,7 +203,7 @@ impl<'a> SlideConverter<'a> {
             while exp_idx < expanded.len() && expanded[exp_idx].cmd_start <= cmd_idx {
                 let entry = &expanded[exp_idx];
                 exp_idx += 1;
-                if self.convert_glyph_run(&entry.run)? {
+                if self.convert_glyph_run(&entry.run, true)? {
                     let end = entry.cmd_end.min(commands.len());
                     if end > cmd_idx {
                         skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
@@ -226,7 +226,7 @@ impl<'a> SlideConverter<'a> {
     fn convert_command(&mut self, cmd: &RenderCommand) -> Result<()> {
         match cmd {
             RenderCommand::DrawGlyphRun(glyph_run) => {
-                self.convert_glyph_run(glyph_run)?;
+                self.convert_glyph_run(glyph_run, false)?;
             }
             RenderCommand::FillPath { path, paint, .. } => {
                 self.convert_fill_path(path, paint)?;
@@ -245,7 +245,11 @@ impl<'a> SlideConverter<'a> {
         Ok(())
     }
 
-    fn convert_glyph_run(&mut self, glyph_run: &zpdf_display_list::GlyphRun) -> Result<bool> {
+    fn convert_glyph_run(
+        &mut self,
+        glyph_run: &zpdf_display_list::GlyphRun,
+        require_verified_all: bool,
+    ) -> Result<bool> {
         use zpdf_display_list::Paint;
 
         // Extract text from glyphs using the logical PDF font (following any
@@ -256,6 +260,10 @@ impl<'a> SlideConverter<'a> {
             .logical_font(glyph_run.font_id)
             .ok_or_else(|| zpdf_core::Error::StreamDecode("Font not found".into()))?;
 
+        if glyph_run.glyphs.is_empty() {
+            return Ok(false);
+        }
+
         let mut text = String::new();
         let mut min_x = f32::INFINITY;
         let mut max_x = f32::NEG_INFINITY;
@@ -263,10 +271,28 @@ impl<'a> SlideConverter<'a> {
         let mut max_y = f32::NEG_INFINITY;
 
         for glyph in &glyph_run.glyphs {
-            // Decode each glyph's packed source bytes and byte width through
-            // the logical PDF font's own text decoder (`/ToUnicode`, then
-            // composite `/Encoding` CMap or simple encoding / glyph names).
-            font.append_decoded_source_code(glyph.code, glyph.code_len, &mut text);
+            if require_verified_all {
+                // When deciding whether to replace expanded CharProc geometry
+                // with an editable TextBox, every glyph in the range must have
+                // an explicit Unicode mapping (`/ToUnicode` or a recognized
+                // glyph name for Type 3 — never raw printable-ASCII fallback).
+                if font.is_type3() {
+                    if !font.append_verified_type3_unicode(glyph.code, glyph.code_len, &mut text) {
+                        return Ok(false);
+                    }
+                } else {
+                    let before = text.len();
+                    font.append_decoded_source_code(glyph.code, glyph.code_len, &mut text);
+                    if text.len() == before {
+                        return Ok(false);
+                    }
+                }
+            } else {
+                // Decode each glyph's packed source bytes and byte width through
+                // the logical PDF font's own text decoder (`/ToUnicode`, then
+                // composite `/Encoding` CMap or simple encoding / glyph names).
+                font.append_decoded_source_code(glyph.code, glyph.code_len, &mut text);
+            }
 
             // Track bounding box
             min_x = min_x.min(glyph.x);
@@ -1899,5 +1925,258 @@ mod export_tests {
 
         assert_eq!(slide.elements.len(), 1);
         assert!(matches!(slide.elements[0], SlideElement::Rectangle { .. }));
+    }
+
+    #[test]
+    fn type3_unmapped_logo_at_printable_ascii_code_exports_as_drawing_not_letter() {
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        // Code 65 (0x41) maps to custom glyph /logo with NO /ToUnicode.
+        // Printable-ASCII fallback must NOT turn it into an editable "A".
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(),
+            stream("", b"1 0 0 rg BT /F1 40 Tf 10 10 Td (A) Tj ET"),
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+                .to_vec(),
+            b"<< /logo 8 0 R >>".to_vec(),
+            b"<< /Type /Encoding /Differences [65 /logo] >>".to_vec(),
+            stream("", b"1000 0 d0 0 0 1000 1000 re f"),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images);
+        let (display_list, _) = interpreter.interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        assert_eq!(slide.elements.len(), 1);
+        assert!(
+            matches!(slide.elements[0], SlideElement::Rectangle { .. }),
+            "unmapped /logo at code 65 must export as drawing artwork, got {:?}",
+            slide.elements
+        );
+    }
+
+    #[test]
+    fn type3_mixed_mapped_and_unmapped_run_preserves_text_and_icon_in_order() {
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        // 0x41 -> /A (mapped), 0x42 -> /logo (unmapped custom glyph), 0x43 -> /C (mapped).
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 30 Tf 10 30 Td (ABC) Tj ET"),
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 67 /Widths [1000 1000 1000] /Resources << >> >>"
+                .to_vec(),
+            b"<< /A 8 0 R /logo 8 0 R /C 8 0 R >>".to_vec(),
+            b"<< /Type /Encoding /Differences [65 /A /logo /C] >>".to_vec(),
+            stream("", b"1000 0 d0 0 0 800 800 re f"),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images);
+        let (display_list, _) = interpreter.interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        assert_eq!(
+            slide.elements.len(),
+            3,
+            "expected [TextBox(\"A\"), Rectangle(logo), TextBox(\"C\")], got {:?}",
+            slide.elements
+        );
+        assert!(matches!(&slide.elements[0], SlideElement::TextBox { text, .. } if text == "A"));
+        assert!(matches!(&slide.elements[1], SlideElement::Rectangle { .. }));
+        assert!(matches!(&slide.elements[2], SlideElement::TextBox { text, .. } if text == "C"));
+    }
+
+    #[test]
+    fn synthetic_partially_mapped_expanded_run_falls_back_to_drawings() {
+        let mut char_procs = std::collections::HashMap::new();
+        char_procs.insert(
+            "A".to_string(),
+            std::sync::Arc::<[u8]>::from(b"1000 0 d0 0 0 10 10 re f".as_slice()),
+        );
+        char_procs.insert(
+            "logo".to_string(),
+            std::sync::Arc::<[u8]>::from(b"1000 0 d0 0 0 10 10 re f".as_slice()),
+        );
+        let mut encoding = vec![String::new(); 67];
+        encoding[65] = "A".to_string();
+        encoding[66] = "logo".to_string();
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0, 1000.0],
+                first_char: 65,
+            },
+            "MixedType3".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut rect = zpdf_display_list::Path::new();
+        rect.rect(Rect::new(10.0, 10.0, 20.0, 20.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect.clone(),
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push_expanded_glyph_run(
+            0,
+            2,
+            GlyphRun {
+                font_id,
+                font_size: 12.0,
+                glyphs: vec![
+                    PositionedGlyph {
+                        glyph_id: 65,
+                        code_len: 1,
+                        code: 65,
+                        x: 0.0,
+                        y: 0.0,
+                        advance: 12.0,
+                    },
+                    PositionedGlyph {
+                        glyph_id: 66,
+                        code_len: 1,
+                        code: 66,
+                        x: 12.0,
+                        y: 0.0,
+                        advance: 12.0,
+                    },
+                ],
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+                transform: Matrix::identity(),
+                h_scale: 1.0,
+            },
+        );
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "partially mapped synthetic expanded run must fall back to drawings: {:?}",
+            slide.elements
+        );
+        assert!(slide
+            .elements
+            .iter()
+            .all(|e| matches!(e, SlideElement::Rectangle { .. })));
     }
 }

@@ -695,11 +695,15 @@ fn parse_encoding(
     match enc_obj {
         Some(PdfObject::Name(n)) => base_encoding_by_name(n.as_str()).map(Encoding::from_base),
         Some(PdfObject::Dict(enc_dict)) => {
-            let base = enc_dict
-                .get_name("BaseEncoding")
-                .ok()
-                .and_then(base_encoding_by_name)
-                .unwrap_or_else(|| default_simple_base(subtype));
+            let base_obj = match enc_dict.get("BaseEncoding") {
+                Some(PdfObject::Ref(r)) => file.resolve(*r).ok(),
+                other => other.cloned(),
+            };
+            let base = match base_obj {
+                Some(PdfObject::Name(n)) => base_encoding_by_name(n.as_str()),
+                _ => None,
+            }
+            .unwrap_or_else(|| default_simple_base(subtype));
             let mut encoding = Encoding::from_base(base);
             apply_differences(&enc_dict, &mut encoding);
             Some(encoding)
@@ -1277,8 +1281,12 @@ fn load_type3_font(
                 encoding = type3_base_encoding(name.as_str());
             }
             Some(PdfObject::Dict(enc_dict)) => {
-                if let Ok(base_name) = enc_dict.get_name("BaseEncoding") {
-                    encoding = type3_base_encoding(base_name);
+                let base = match enc_dict.get("BaseEncoding") {
+                    Some(PdfObject::Ref(r)) => file.resolve(*r).ok(),
+                    other => other.cloned(),
+                };
+                if let Some(PdfObject::Name(base_name)) = base {
+                    encoding = type3_base_encoding(base_name.as_str());
                 }
                 if let Some(diffs) = resolve_array(file, &enc_dict, "Differences") {
                     apply_type3_differences(&mut encoding, &diffs);
@@ -1928,5 +1936,30 @@ mod tests {
         let d3 = file.resolve(ObjectId(4, 0)).unwrap();
         let h3 = descriptor_hints(&file, Some(d3.as_dict().unwrap()));
         assert!(h3.bold, "indirect /FontWeight 600 should set bold hint");
+    }
+
+    #[test]
+    fn type3_indirect_base_encoding_is_resolved() {
+        let file = PdfFile::parse(crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+               /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /A 4 0 R >> \
+               /Encoding << /Type /Encoding /BaseEncoding 3 0 R >> \
+               /FirstChar 65 /LastChar 65 /Widths [1000] >>",
+            "/WinAnsiEncoding",
+            "<< /Length 26 >>\nstream\n1000 0 d0 0 0 100 100 re f\nendstream",
+        ]))
+        .expect("parse");
+
+        let font_dict = file.resolve(ObjectId(2, 0)).unwrap();
+        let font = load_single_font_dict(&file, font_dict.as_dict().unwrap()).expect("load type3");
+        let (glyph_name, bytes, _) = font
+            .type3_glyph_entry(65)
+            .expect("code 65 must resolve via indirect /BaseEncoding /WinAnsiEncoding");
+        assert_eq!(glyph_name, "A");
+        assert!(!bytes.is_empty());
+        let mut decoded = String::new();
+        assert!(font.append_verified_type3_unicode(65, 1, &mut decoded));
+        assert_eq!(decoded, "A");
     }
 }

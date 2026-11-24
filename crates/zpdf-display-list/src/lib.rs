@@ -5,6 +5,13 @@ mod path;
 #[derive(Debug, Clone)]
 pub struct DisplayList {
     pub page_rect: Rect,
+    /// Visual commands executed in order by render backends.
+    ///
+    /// Callers that also retain [`Self::expanded_glyph_runs`] must treat
+    /// `commands` as append-only while those ranges are live (do not insert,
+    /// remove, or reorder entries before a recorded range). Call
+    /// [`Self::clear_expanded_glyph_runs`] before mutating `commands` in-place
+    /// so recorded ranges cannot silently refer to different commands.
     pub commands: Vec<RenderCommand>,
     expanded_glyph_runs: Vec<ExpandedGlyphRun>,
 }
@@ -29,12 +36,37 @@ impl DisplayList {
     /// Visual backends execute `commands` directly so each glyph paints once;
     /// text-preserving exporters such as `zpdf-pptx-export` can decode the
     /// semantic run and skip its expanded geometry range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cmd_start > cmd_end`, `cmd_end > self.commands.len()`, or
+    /// `cmd_start` overlaps a previously recorded range (`cmd_start <
+    /// previous.cmd_end`).
     pub fn push_expanded_glyph_run(&mut self, cmd_start: usize, cmd_end: usize, run: GlyphRun) {
+        assert!(
+            cmd_start <= cmd_end && cmd_end <= self.commands.len(),
+            "expanded glyph run range {cmd_start}..{cmd_end} out of bounds for {} commands",
+            self.commands.len()
+        );
+        if let Some(prev) = self.expanded_glyph_runs.last() {
+            assert!(
+                cmd_start >= prev.cmd_end,
+                "expanded glyph run range {cmd_start}..{cmd_end} overlaps previous range {}..{}",
+                prev.cmd_start,
+                prev.cmd_end
+            );
+        }
         self.expanded_glyph_runs.push(ExpandedGlyphRun {
             cmd_start,
             cmd_end,
             run,
         });
+    }
+
+    /// Discard all recorded expanded glyph runs. Call before removing,
+    /// inserting, or reordering entries in `self.commands` in-place.
+    pub fn clear_expanded_glyph_runs(&mut self) {
+        self.expanded_glyph_runs.clear();
     }
 
     /// Semantic glyph runs already expanded into `commands`, ordered by
@@ -285,35 +317,69 @@ mod tests {
         assert_eq!(std::mem::size_of::<PositionedGlyph>(), 20);
     }
 
+    fn sample_glyph_run(font_id: FontId) -> GlyphRun {
+        GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 65,
+                code_len: 1,
+                code: 65,
+                x: 0.0,
+                y: 0.0,
+                advance: 6.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }
+    }
+
     #[test]
     fn expanded_glyph_runs_preserve_command_range() {
         let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
         assert!(dl.expanded_glyph_runs().is_empty());
-        dl.push_expanded_glyph_run(
-            1,
-            4,
-            GlyphRun {
-                font_id: 2,
-                font_size: 12.0,
-                glyphs: vec![PositionedGlyph {
-                    glyph_id: 65,
-                    code_len: 1,
-                    code: 65,
-                    x: 0.0,
-                    y: 0.0,
-                    advance: 6.0,
-                }],
-                paint: Paint::Solid(Color::black()),
-                alpha: 1.0,
-                overprint: None,
-                transform: Matrix::identity(),
-                h_scale: 1.0,
-            },
-        );
+        for _ in 0..4 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_expanded_glyph_run(1, 4, sample_glyph_run(2));
         let runs = dl.expanded_glyph_runs();
         assert_eq!(runs.len(), 1);
         assert_eq!((runs[0].cmd_start, runs[0].cmd_end), (1, 4));
         assert_eq!(runs[0].run.font_id, 2);
+
+        dl.clear_expanded_glyph_runs();
+        assert!(dl.expanded_glyph_runs().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn expanded_glyph_run_rejects_end_past_commands_len() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::PopClip);
+        dl.push_expanded_glyph_run(0, 2, sample_glyph_run(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn expanded_glyph_run_rejects_inverted_range() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::PopClip);
+        dl.push(RenderCommand::PopClip);
+        dl.push_expanded_glyph_run(2, 1, sample_glyph_run(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn expanded_glyph_run_rejects_overlapping_range() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for _ in 0..4 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_expanded_glyph_run(0, 3, sample_glyph_run(1));
+        dl.push_expanded_glyph_run(2, 4, sample_glyph_run(2));
     }
 }
 

@@ -775,3 +775,279 @@ fn misplaced_d1_outside_charproc_does_not_lock_colours() {
         "misplaced d1 inside Form must not leak colour lock into enclosing d0 glyph"
     );
 }
+
+#[test]
+fn type3_inline_image_ordinal_advances_across_oc_hidden_images() {
+    // Glyph 'A' draws two 1x1 inline RGB images at identical footprint:
+    // - slot 0 (left half): red, wrapped in /OC /Layer BDC ... EMC
+    // - slot 1 (right half): blue, always visible
+    let mut glyph_bytes = b"1000 0 d0\n\
+        /OC /Layer BDC\n\
+        q 400 0 0 800 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /RGB ID "
+        .to_vec();
+    glyph_bytes.extend_from_slice(&[255, 0, 0]);
+    glyph_bytes.extend_from_slice(
+        b" EI Q\n\
+        EMC\n\
+        q 400 0 0 800 500 0 cm BI /W 1 /H 1 /BPC 8 /CS /RGB ID ",
+    );
+    glyph_bytes.extend_from_slice(&[0, 0, 255]);
+    glyph_bytes.extend_from_slice(b" EI Q");
+
+    // Form 1 binds /Layer -> OCG 11 (ON): paints red (slot 0) + blue (slot 1).
+    let form_visible = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /Font << /F1 5 0 R >> /Properties << /Layer 11 0 R >> >>",
+        b"BT /F1 80 Tf 10 10 Td (A) Tj ET",
+    );
+    // Form 2 binds /Layer -> OCG 12 (OFF): skips red (slot 0), paints blue (slot 1).
+    // Slot 1 MUST NOT shift into slot 0 and replay Form 1's cached red pixels.
+    let form_hidden = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /Font << /F1 5 0 R >> /Properties << /Layer 12 0 R >> >>",
+        b"BT /F1 80 Tf 10 10 Td (A) Tj ET",
+    );
+    let content = b"q /Fm1 Do Q q 1 0 0 1 100 0 cm /Fm2 Do Q";
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R \
+          /OCProperties << /OCGs [11 0 R 12 0 R] \
+                           /D << /BaseState /ON /OFF [12 0 R] >> >> >>"
+            .to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> \
+                        /XObject << /Fm1 9 0 R /Fm2 10 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", content),                               // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                            // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        stream_obj("", &glyph_bytes),                          // 8
+        form_visible,                                          // 9
+        form_hidden,                                           // 10
+        b"<< /Type /OCG /Name (Visible) >>".to_vec(),          // 11
+        b"<< /Type /OCG /Name (Hidden) >>".to_vec(),           // 12
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let oc = doc.oc_config().expect("oc config");
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .with_optional_content(&oc)
+        .interpret(&content_bytes);
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    assert_eq!(
+        px(&rendered, 25, 40),
+        [255, 0, 0],
+        "Form 1 slot 0 visible red"
+    );
+    assert_eq!(
+        px(&rendered, 65, 40),
+        [0, 0, 255],
+        "Form 1 slot 1 visible blue"
+    );
+    assert_eq!(
+        px(&rendered, 125, 40),
+        [255, 255, 255],
+        "Form 2 slot 0 hidden by OCG"
+    );
+    assert_eq!(
+        px(&rendered, 165, 40),
+        [0, 0, 255],
+        "Form 2 slot 1 must paint blue, not Form 1's cached slot 0 red"
+    );
+}
+
+#[test]
+fn type3_bitmap_stencil_renders_when_caller_supplies_only_fonts() {
+    // Bitmap Type 3 glyph (/IM true stencil). Callers that pass only
+    // `with_fonts` (omitting `with_images`) must still preserve the stencil
+    // via a DrawGlyphRun fallback so CpuRenderer's private cache paints it.
+    let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
+        800 0 0 800 0 0 cm\n\
+        BI /IM true /W 1 /H 1 /BPC 1 ID "
+        .to_vec();
+    glyph_bytes.push(0x00);
+    glyph_bytes.extend_from_slice(b"\nEI");
+
+    let content = b"1 0 0 rg BT /F1 50 Tf 15 15 Td (AA) Tj ET";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 80] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(),
+        b"<< /A 8 0 R >>".to_vec(),
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(),
+        stream_obj("", &glyph_bytes),
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+
+    // Deliberately omit `with_images` (and `with_document`).
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .interpret(&content_bytes);
+
+    assert!(
+        dl.commands
+            .iter()
+            .any(|c| matches!(c, zpdf::display_list::RenderCommand::DrawGlyphRun(_))),
+        "bitmap Type 3 glyph without image_cache must fall back to DrawGlyphRun"
+    );
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    assert_eq!(px(&rendered, 35, 35), [255, 0, 0], "first bitmap stencil");
+    assert_eq!(px(&rendered, 85, 35), [255, 0, 0], "second bitmap stencil");
+}
+
+#[test]
+fn type3_d1_glyph_preserves_colored_tiling_pattern_fill() {
+    // Colored (PaintType 1) tiling pattern: 40x40 cell, red left half [0..20],
+    // blue right half [20..40].
+    let pattern = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 40 40] /XStep 40 /YStep 40 /Resources << >>",
+        b"1 0 0 rg 0 0 20 40 re f\n0 0 1 rg 20 0 20 40 re f",
+    );
+    // d1 glyph tries to set green fill (must be ignored) and fills its square
+    // with the inherited colored tiling pattern.
+    let glyph_d1 = stream_obj("", b"1000 0 0 0 1000 1000 d1\n0 1 0 rg 0 0 1000 1000 re f");
+    let content = b"/Pattern cs /P1 scn\nBT /F1 80 Tf 0 0 Td (A) Tj ET";
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 80] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 9 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", content),                       // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                    // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        glyph_d1,                                      // 8
+        pattern,                                       // 9
+    ]);
+
+    let (rendered, _, _, _) = render_and_extract(pdf);
+    assert_eq!(
+        px(&rendered, 10, 20),
+        [255, 0, 0],
+        "colored tiling pattern red stripe must not be locked to black inside d1 glyph"
+    );
+    assert_eq!(
+        px(&rendered, 30, 20),
+        [0, 0, 255],
+        "colored tiling pattern blue stripe must not be locked to black inside d1 glyph"
+    );
+    assert_eq!(
+        px(&rendered, 50, 60),
+        [255, 0, 0],
+        "repeated red tile inside d1 glyph"
+    );
+    assert_eq!(
+        px(&rendered, 70, 60),
+        [0, 0, 255],
+        "repeated blue tile inside d1 glyph"
+    );
+}
+
+#[test]
+fn type3_inline_font_in_form_reloads_from_container_under_small_budget() {
+    // Indirect Form XObject contains an INLINE Type 3 font dictionary with a
+    // large padding entry and a `/Resources << /XObject << /FmInner 7 0 R >> >>`.
+    // Because the Form is an indirect container, `FontCache` stores only a
+    // lightweight `ContainerInlineFont` reference rather than cloning the huge
+    // dict, so interpretation succeeds and stays within a tight font cache budget.
+    let padding = "x".repeat(32_768);
+    let form_dict = format!(
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /Font << /FInline << /Type /Font /Subtype /Type3 \
+           /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] \
+           /CharProcs << /A 6 0 R >> /Encoding << /Differences [65 /A] >> \
+           /FirstChar 65 /LastChar 65 /Widths [1000] \
+           /Padding ({padding}) \
+           /Resources << /XObject << /FmInner 7 0 R >> >> >> >> >>"
+    );
+    let form_outer = stream_obj(&form_dict, b"BT /FInline 60 Tf 20 20 Td (A) Tj ET");
+    let glyph_a = stream_obj("", b"1000 0 d0 /FmInner Do");
+    let form_inner = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 1000 1000]",
+        b"0 1 0 rg 0 0 1000 1000 re f",
+    );
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+          /Resources << /XObject << /FmOuter 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", b"/FmOuter Do"),                // 4
+        form_outer,                                    // 5
+        glyph_a,                                       // 6
+        form_inner,                                    // 7
+    ]);
+
+    let limits = zpdf::ParseLimits {
+        max_font_cache_bytes: 16_384,
+        ..zpdf::ParseLimits::default()
+    };
+    let doc = PdfDocument::open_with_limits(pdf, limits.clone()).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .with_limits(&limits)
+        .interpret(&content_bytes);
+
+    assert!(
+        fonts.bytes_used() <= limits.max_font_cache_bytes,
+        "FontCache::bytes_used() ({}) must stay within tight budget ({})",
+        fonts.bytes_used(),
+        limits.max_font_cache_bytes
+    );
+
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    assert_eq!(
+        px(&rendered, 50, 50),
+        [0, 255, 0],
+        "inline Type 3 font in indirect Form must still resolve its /Resources /XObject"
+    );
+}

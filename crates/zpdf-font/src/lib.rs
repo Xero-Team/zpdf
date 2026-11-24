@@ -1903,6 +1903,58 @@ impl LoadedFont {
         matches!(self.font_type, PdfFontType::Type3 { .. })
     }
 
+    /// True when this is a Type 3 font that still retains at least one decoded
+    /// CharProc program (false for metrics-only Type 3 entries created by
+    /// [`Self::without_font_program`]).
+    #[doc(hidden)]
+    pub fn has_type3_programs(&self) -> bool {
+        matches!(
+            &self.font_type,
+            PdfFontType::Type3 { char_procs, .. } if !char_procs.is_empty()
+        )
+    }
+
+    /// Decode a Type 3 glyph's source code to Unicode ONLY when it has an
+    /// explicit mapping — `/ToUnicode` or a resolved glyph name recognized by
+    /// the Adobe Glyph List (never the raw-byte printable-ASCII fallback).
+    /// Returns `true` if a verified non-empty mapping was appended to `out`.
+    #[doc(hidden)]
+    pub fn append_verified_type3_unicode(
+        &self,
+        raw_code: u32,
+        code_len: u8,
+        out: &mut String,
+    ) -> bool {
+        let len = if (1..=4).contains(&code_len) {
+            code_len
+        } else {
+            1
+        };
+        if let Some(s) = self.lookup_to_unicode(raw_code, raw_code, len) {
+            if !s.is_empty() {
+                out.push_str(s);
+                return true;
+            }
+        }
+        if let Ok(byte) = u8::try_from(raw_code) {
+            let glyph_name = match &self.font_type {
+                PdfFontType::Type3 { encoding, .. } => encoding
+                    .get(byte as usize)
+                    .map(String::as_str)
+                    .filter(|name| !name.is_empty() && *name != ".notdef"),
+                _ => None,
+            }
+            .or_else(|| self.simple_glyph_name(byte));
+            if let Some(s) = glyph_name.and_then(glyph_list::glyph_name_to_string) {
+                if !s.is_empty() {
+                    out.push_str(&s);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// For Type3 fonts: get the content stream bytes for a given char code.
     pub fn type3_glyph_stream(&self, char_code: u16) -> Option<(&[u8], [f64; 6])> {
         match &self.font_type {
@@ -3579,6 +3631,41 @@ impl CompanionEntry {
     }
 }
 
+/// Estimate retained memory bytes for an inline PDF object tree (with a depth
+/// cap so adversarial nesting cannot overflow the stack).
+fn estimate_pdf_object_bytes(obj: &zpdf_core::PdfObject, depth: u8) -> u64 {
+    const MAX_DEPTH: u8 = 16;
+    if depth >= MAX_DEPTH {
+        return 64;
+    }
+    match obj {
+        zpdf_core::PdfObject::Null
+        | zpdf_core::PdfObject::Bool(_)
+        | zpdf_core::PdfObject::Integer(_)
+        | zpdf_core::PdfObject::Real(_)
+        | zpdf_core::PdfObject::Ref(_) => 24,
+        zpdf_core::PdfObject::Name(n) => 32u64.saturating_add(n.0.len() as u64),
+        zpdf_core::PdfObject::String(s) => 32u64.saturating_add(s.as_bytes().len() as u64),
+        zpdf_core::PdfObject::Array(items) => items.iter().fold(32u64, |acc, item| {
+            acc.saturating_add(estimate_pdf_object_bytes(item, depth + 1))
+        }),
+        zpdf_core::PdfObject::Dict(dict) => estimate_pdf_dict_bytes_depth(dict, depth + 1),
+        zpdf_core::PdfObject::Stream(stream) => {
+            estimate_pdf_dict_bytes_depth(&stream.dict, depth + 1)
+                .saturating_add(stream.data.len() as u64)
+                .saturating_add(64)
+        }
+    }
+}
+
+fn estimate_pdf_dict_bytes_depth(dict: &zpdf_core::PdfDict, depth: u8) -> u64 {
+    dict.0.iter().fold(64u64, |acc, (k, v)| {
+        acc.saturating_add(32)
+            .saturating_add(k.0.len() as u64)
+            .saturating_add(estimate_pdf_object_bytes(v, depth))
+    })
+}
+
 /// Source dictionary location for an admitted Type 3 font so the content
 /// interpreter can resolve font-level and per-CharProc `/Resources` in
 /// glyph → font → parent order without embedding uncharged PDF dictionaries
@@ -3588,7 +3675,17 @@ impl CompanionEntry {
 pub enum Type3Source {
     /// Indirect Type 3 font dictionary object in the PDF file.
     Object(zpdf_core::ObjectId),
-    /// Inline Type 3 font dictionary (e.g. inside a Form XObject `/Resources`).
+    /// Inline Type 3 font dictionary located under `/Resources /Font /<name>`
+    /// of an indirect container object (Form XObject, tiling pattern, enclosing
+    /// Type 3 font, or CharProc stream). Stores only a lightweight reload
+    /// reference without cloning the dictionary into `FontCache`.
+    ContainerInlineFont {
+        owner_id: zpdf_core::ObjectId,
+        font_name: String,
+    },
+    /// Inline Type 3 font dictionary without an indirect container object;
+    /// retained only when its estimated byte size fits in the font cache
+    /// budget and accounted for in [`FontCache::bytes_used`].
     Inline(Arc<zpdf_core::PdfDict>),
 }
 
@@ -3603,6 +3700,10 @@ pub struct FontCache {
     name_to_id: HashMap<String, FontId>,
     next_id: FontId,
     budget: FontCacheBudget,
+    /// Permanent bytes charged for owner-less inline Type 3 font dictionaries
+    /// retained in `type3_sources` (`Type3Source::Inline`). Included in
+    /// [`Self::bytes_used`].
+    type3_inline_bytes: u64,
     /// Bytes currently charged to reclaimable unadmitted `standby` companions
     /// and optional descriptor lookup-name overrides. Included in
     /// [`Self::bytes_used`], and reclaimed before rejecting any primary, Form,
@@ -3646,6 +3747,7 @@ impl FontCache {
             name_to_id: HashMap::with_capacity(capacity),
             next_id: 0,
             budget: FontCacheBudget::default(),
+            type3_inline_bytes: 0,
             standby_bytes: 0,
             standby_specs: HashSet::new(),
             has_standby_companions: false,
@@ -3658,10 +3760,70 @@ impl FontCache {
         }
     }
 
-    /// Record an inline Type 3 font dictionary for `id`.
+    fn permanent_bytes(&self) -> u64 {
+        self.budget
+            .bytes_used()
+            .saturating_add(self.type3_inline_bytes)
+    }
+
+    /// Record a lightweight reload reference for an inline Type 3 font located
+    /// in an indirect container object's `/Resources /Font`. Skips metrics-only
+    /// Type 3 entries and never overwrites an existing source binding for `id`.
     #[doc(hidden)]
-    pub fn record_type3_inline_source(&mut self, id: FontId, dict: Arc<zpdf_core::PdfDict>) {
+    pub fn record_type3_container_source(
+        &mut self,
+        id: FontId,
+        owner_id: zpdf_core::ObjectId,
+        font_name: String,
+    ) {
+        if self.type3_sources.contains_key(&id) {
+            return;
+        }
+        if !self.fonts.get(&id).is_some_and(|f| f.has_type3_programs()) {
+            return;
+        }
+        self.type3_sources.insert(
+            id,
+            Type3Source::ContainerInlineFont {
+                owner_id,
+                font_name,
+            },
+        );
+    }
+
+    /// Record an owner-less inline Type 3 font dictionary for `id`, charging
+    /// its estimated retained memory against `max_bytes` and [`Self::bytes_used`].
+    ///
+    /// Skips metrics-only Type 3 entries, never overwrites an existing source
+    /// binding for `id`, and returns `false` without retaining the dictionary
+    /// when it would exceed `max_bytes`.
+    #[doc(hidden)]
+    pub fn record_type3_inline_source_with_limit(
+        &mut self,
+        id: FontId,
+        dict: Arc<zpdf_core::PdfDict>,
+        max_bytes: u64,
+    ) -> bool {
+        if self.type3_sources.contains_key(&id) {
+            return true;
+        }
+        if !self.fonts.get(&id).is_some_and(|f| f.has_type3_programs()) {
+            return false;
+        }
+        let dict_bytes = estimate_pdf_dict_bytes_depth(&dict, 0);
+        let Some(new_permanent) = self
+            .permanent_bytes()
+            .checked_add(dict_bytes)
+            .filter(|&total| total <= max_bytes)
+        else {
+            return false;
+        };
+        self.type3_inline_bytes = self.type3_inline_bytes.saturating_add(dict_bytes);
         self.type3_sources.insert(id, Type3Source::Inline(dict));
+        if new_permanent.saturating_add(self.standby_bytes) > max_bytes {
+            self.reclaim_standby_for(new_permanent, max_bytes);
+        }
+        true
     }
 
     /// Look up the source PDF dictionary location for Type 3 font `id`.
@@ -3861,17 +4023,20 @@ impl FontCache {
             return existing.admitted.is_some() || existing.standby.is_some();
         }
         let retained_standby = match standby {
-            Some(comp) => match self
-                .standby_extra_bytes(Some(&comp), None)
-                .and_then(|sb| self.budget.bytes_used().checked_add(sb))
-            {
-                Some(total) if total <= max_bytes => {
-                    self.standby_bytes = total - self.budget.bytes_used();
-                    self.has_standby_companions = true;
-                    Some(comp)
+            Some(comp) => {
+                let permanent = self.permanent_bytes();
+                match self
+                    .standby_extra_bytes(Some(&comp), None)
+                    .and_then(|sb| permanent.checked_add(sb))
+                {
+                    Some(total) if total <= max_bytes => {
+                        self.standby_bytes = total - permanent;
+                        self.has_standby_companions = true;
+                        Some(comp)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
             None => None,
         };
         let retained = retained_standby.is_some();
@@ -4046,7 +4211,7 @@ impl FontCache {
         if entry.descriptor_spec.is_none() && matches!(entry.source, CompanionSource::None) {
             return false;
         }
-        let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
+        let remaining = max_bytes.saturating_sub(self.permanent_bytes());
         if entry.descriptor_spec.is_some() {
             let current_gen = self.provider.as_ref().map(|p| p.generation());
             if entry.provider_generation != current_gen {
@@ -4103,10 +4268,11 @@ impl FontCache {
         object_id: Option<zpdf_core::ObjectId>,
         max_bytes: u64,
     ) -> Result<FontId, zpdf_core::ProcessingDiagnostics> {
+        let existed = self.name_to_id.contains_key(&name);
         if let Some(fid) =
             self.try_insert_shared_with_limit(name.clone(), Arc::clone(&font), max_bytes)
         {
-            if font.is_type3() {
+            if !existed && font.has_type3_programs() {
                 if let Some(id) = object_id {
                     self.type3_sources.insert(fid, Type3Source::Object(id));
                 }
@@ -4266,16 +4432,18 @@ impl FontCache {
 
         let prev_total = self.budget.bytes_used();
         let prev_programs = self.budget.programs.len();
-        let new_total = self.budget.admission_total(&font, max_bytes)?;
+        let font_limit = max_bytes.saturating_sub(self.type3_inline_bytes);
+        let new_total = self.budget.admission_total(&font, font_limit)?;
         let id = self.next_free_id()?;
         self.budget.record(&font, new_total);
         self.name_to_id.insert(name, id);
         self.fonts.insert(id, font);
+        let new_permanent = new_total.saturating_add(self.type3_inline_bytes);
         if new_total != prev_total
             || self.budget.programs.len() != prev_programs
-            || new_total.saturating_add(self.standby_bytes) > max_bytes
+            || new_permanent.saturating_add(self.standby_bytes) > max_bytes
         {
-            self.reclaim_standby_for(new_total, max_bytes);
+            self.reclaim_standby_for(new_permanent, max_bytes);
         }
         Some(id)
     }
@@ -4302,10 +4470,11 @@ impl FontCache {
         self.fonts.is_empty()
     }
 
-    /// Estimated retained programs and mappings, accounting for shared ownership
-    /// and any retained reclaimable standby companions.
+    /// Estimated retained programs, inline Type 3 source metadata, and
+    /// mappings, accounting for shared ownership and any retained reclaimable
+    /// standby companions.
     pub fn bytes_used(&self) -> u64 {
-        self.budget.bytes_used().saturating_add(self.standby_bytes)
+        self.permanent_bytes().saturating_add(self.standby_bytes)
     }
 }
 
@@ -6333,5 +6502,148 @@ mod tests {
                 .is_some(),
             "F1 must admit at incremental `sub_owned_cost` after program-count watermark reset"
         );
+    }
+
+    fn sample_type3_font(glyph_name: &str, code: usize) -> LoadedFont {
+        let mut char_procs = HashMap::new();
+        char_procs.insert(
+            glyph_name.to_string(),
+            Arc::<[u8]>::from(b"1000 0 d0 0 0 10 10 re f".as_slice()),
+        );
+        let mut encoding = vec![String::new(); code + 1];
+        encoding[code] = glyph_name.to_string();
+        LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0],
+                first_char: code as u16,
+            },
+            "SampleType3".into(),
+            Vec::new(),
+            CidWidths::new(1000.0),
+        )
+    }
+
+    #[test]
+    fn repeated_type3_admission_preserves_original_source_object() {
+        let mut cache = FontCache::new();
+        let f1 = Arc::new(sample_type3_font("A", 65));
+        let f2 = Arc::new(sample_type3_font("B", 66));
+
+        let id1 = cache
+            .admit_with_diagnostics(
+                "F1".into(),
+                f1,
+                zpdf_core::ProcessingDiagnostics::default(),
+                Some(zpdf_core::ObjectId(10, 0)),
+                u64::MAX,
+            )
+            .expect("first admit");
+        let id2 = cache
+            .admit_with_diagnostics(
+                "F1".into(),
+                f2,
+                zpdf_core::ProcessingDiagnostics::default(),
+                Some(zpdf_core::ObjectId(20, 0)),
+                u64::MAX,
+            )
+            .expect("second admit reuses slot");
+
+        assert_eq!(id1, id2);
+        assert!(
+            matches!(
+                cache.type3_source(id1),
+                Some(Type3Source::Object(zpdf_core::ObjectId(10, 0)))
+            ),
+            "repeated admission must keep the first font's source object"
+        );
+    }
+
+    #[test]
+    fn type3_inline_source_respects_budget_and_skips_metrics_only_entries() {
+        // Build a large inline Type 3 dictionary (> 4 KiB).
+        let mut huge_dict = zpdf_core::PdfDict::new();
+        huge_dict.insert(
+            zpdf_core::PdfName::new("Payload"),
+            zpdf_core::PdfObject::String(zpdf_core::PdfString::new(vec![b'x'; 8192])),
+        );
+        let huge_arc = Arc::new(huge_dict);
+
+        // Small budget fits the tiny Type 3 font itself, but NOT the 8 KiB inline dict.
+        let mut cache = FontCache::new();
+        let font = Arc::new(sample_type3_font("A", 65));
+        let base_cost = font.estimated_cache_bytes();
+        let small_budget = base_cost + 512;
+        let fid = cache
+            .admit_with_diagnostics(
+                "FInline".into(),
+                font,
+                zpdf_core::ProcessingDiagnostics::default(),
+                None,
+                small_budget,
+            )
+            .expect("font fits small budget");
+        assert!(
+            !cache.record_type3_inline_source_with_limit(fid, Arc::clone(&huge_arc), small_budget),
+            "oversized inline dict must be rejected under small budget"
+        );
+        assert!(cache.type3_source(fid).is_none());
+        assert!(cache.bytes_used() <= small_budget);
+
+        // Large budget admits the inline dict and charges it to `bytes_used()`.
+        let before = cache.bytes_used();
+        assert!(cache.record_type3_inline_source_with_limit(
+            fid,
+            Arc::clone(&huge_arc),
+            before + 16_384,
+        ));
+        assert!(matches!(
+            cache.type3_source(fid),
+            Some(Type3Source::Inline(_))
+        ));
+        assert!(
+            cache.bytes_used() >= before + 8192,
+            "retained inline Type 3 dict must be charged in bytes_used()"
+        );
+
+        // Metrics-only Type 3 entry (from `without_font_program`) must not retain a source.
+        let metrics_only = Arc::new(sample_type3_font("A", 65).without_font_program());
+        assert!(!metrics_only.has_type3_programs());
+        let metrics_fid = cache
+            .try_insert_shared_with_limit("FMetrics".into(), metrics_only, u64::MAX)
+            .expect("metrics-only fits");
+        assert!(!cache.record_type3_inline_source_with_limit(metrics_fid, huge_arc, u64::MAX));
+        cache.record_type3_container_source(
+            metrics_fid,
+            zpdf_core::ObjectId(99, 0),
+            "FMetrics".into(),
+        );
+        assert!(cache.type3_source(metrics_fid).is_none());
+    }
+
+    #[test]
+    fn verified_type3_unicode_rejects_raw_byte_fallback_for_custom_glyph_names() {
+        let logo_at_65 = sample_type3_font("logo", 65);
+        let mut out = String::new();
+        assert!(
+            !logo_at_65.append_verified_type3_unicode(65, 1, &mut out),
+            "custom /logo at printable code 65 must not fall back to 'A'"
+        );
+        assert!(out.is_empty());
+
+        let letter_at_65 = sample_type3_font("A", 65);
+        assert!(letter_at_65.append_verified_type3_unicode(65, 1, &mut out));
+        assert_eq!(out, "A");
+
+        let mut mapped_logo = sample_type3_font("logo", 65);
+        mapped_logo.to_unicode = Some(cmap::ToUnicodeMap::parse(
+            b"begincmap 1 begincodespacerange <00> <FF> endcodespacerange \
+              1 beginbfchar <41> <0058> endbfchar endcmap",
+        ));
+        out.clear();
+        assert!(mapped_logo.append_verified_type3_unicode(65, 1, &mut out));
+        assert_eq!(out, "X");
     }
 }
