@@ -305,12 +305,14 @@ enum ImageDefKey {
         font: FontId,
         glyph: u16,
         image: ImageId,
+        placement_bounds: Option<[u64; 4]>,
     },
     Type3Stencil {
         font: FontId,
         glyph: u16,
         image: ImageId,
         tint: [u32; 4],
+        placement_bounds: Option<[u64; 4]>,
     },
 }
 
@@ -615,6 +617,10 @@ struct Type3Glyph {
     /// keyed by the ids in `list`.
     images: ImageCache,
     font_matrix: [f64; 6],
+    /// Canonical glyph-space destination bounds bits when this glyph's shading
+    /// extent depended on placement bounds, preventing distinct placements from
+    /// sharing one `<image>` def under local `image_id = 0`.
+    placement_bounds: Option<[u64; 4]>,
 }
 
 impl<'a> SvgWriter<'a> {
@@ -5836,6 +5842,7 @@ impl<'a> SvgWriter<'a> {
                                 glyph: glyph.glyph_id,
                                 image: draw.image_id,
                                 tint,
+                                placement_bounds: program.placement_bounds,
                             };
                             self.place_image(key, image, Some(&white), &transform, alpha);
                         } else {
@@ -5854,6 +5861,7 @@ impl<'a> SvgWriter<'a> {
                                 glyph: glyph.glyph_id,
                                 image: draw.image_id,
                                 tint: [u32::MAX; 4],
+                                placement_bounds: program.placement_bounds,
                             };
                             let bounds = SvgRect::from_bounds_clamped(
                                 ix0,
@@ -6457,10 +6465,20 @@ impl<'a> SvgWriter<'a> {
                 }
                 let (list, stats) = interp.interpret_with_stats(stream);
                 used_dest_bounds = stats.type3_used_dest_bounds;
+                let placement_bounds = used_dest_bounds.then(|| match dest_bounds {
+                    Some(r) => [
+                        canonical_f64_bits(r.x0),
+                        canonical_f64_bits(r.y0),
+                        canonical_f64_bits(r.x1),
+                        canonical_f64_bits(r.y1),
+                    ],
+                    None => [u64::MAX; 4],
+                });
                 Rc::new(Type3Glyph {
                     list,
                     images,
                     font_matrix,
+                    placement_bounds,
                 })
             });
         if used_dest_bounds {
@@ -6659,6 +6677,7 @@ impl<'a> SvgWriter<'a> {
                                 glyph: glyph.glyph_id,
                                 image: draw.image_id,
                                 tint,
+                                placement_bounds: program.placement_bounds,
                             };
                             self.place_image(key, image, Some(color), &transform, alpha * opacity);
                         } else {
@@ -6669,6 +6688,7 @@ impl<'a> SvgWriter<'a> {
                                 glyph: glyph.glyph_id,
                                 image: draw.image_id,
                                 tint: [u32::MAX; 4],
+                                placement_bounds: program.placement_bounds,
                             };
                             self.place_image(key, image, None, &transform, alpha * opacity);
                         }
@@ -6728,6 +6748,7 @@ impl<'a> SvgWriter<'a> {
                     font: font_id,
                     glyph: glyph_id,
                     image: draw.image_id,
+                    placement_bounds: program.placement_bounds,
                 },
                 image,
                 None,
@@ -7492,6 +7513,7 @@ mod tests {
                     list,
                     images: ImageCache::new(),
                     font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    placement_bounds: None,
                 })),
             );
             writer.budget_checks = 62;
@@ -14279,6 +14301,231 @@ mod tests {
         assert!(
             w_tight.mask_defs.is_empty(),
             "distinct-pattern mask exceeding 1x-pattern budget must be declined by SVG mask_defs"
+        );
+    }
+
+    #[test]
+    fn svg_type3_all_zero_bbox_axial_two_placements_and_zero_scale_prefix() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3Function, Type3Resources, Type3Shading};
+
+        let mut func_dict = zpdf_core::PdfDict::new();
+        func_dict.insert(
+            zpdf_core::PdfName::new("FunctionType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("Domain"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C0"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(1.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C1"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("N"),
+            zpdf_core::PdfObject::Real(1.0),
+        );
+        let mut sh_dict = zpdf_core::PdfDict::new();
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ShadingType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Coords"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(500.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Extend"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Bool(true),
+                zpdf_core::PdfObject::Bool(true),
+            ]),
+        );
+        let mut t3_res = Type3Resources::default();
+        t3_res.shadings.insert(
+            "Fade".into(),
+            Arc::new(Type3Shading {
+                dict: sh_dict,
+                stream_data: None,
+                functions: vec![Arc::new(Type3Function::Dict {
+                    dict: func_dict,
+                    children: Vec::new(),
+                })],
+            }),
+        );
+        let charproc = b"2500 0 d0 /Fade sh";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.04, 0.0, 0.0, 0.04, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![2500.0],
+                first_char: 0,
+            },
+            "AllZeroAxialTwoPlacementsSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(2500.0),
+        )
+        .with_type3_resources(Arc::new(t3_res))
+        .with_type3_font_bbox(Rect::new(0.0, 0.0, 0.0, 0.0));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let raster_svg = |dl: &DisplayList| -> resvg::tiny_skia::Pixmap {
+            let svg = display_list_to_svg(dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+            let tree =
+                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+                    .expect("valid SVG");
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(100, 20).expect("pixmap");
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(
+                    100.0 / tree.size().width(),
+                    20.0 / tree.size().height(),
+                ),
+                &mut pixmap.as_mut(),
+            );
+            pixmap
+        };
+
+        // Case 1: Same glyph placed at x = 10 (clipped to [0..40]) and x = 70
+        // (clipped to [50..100]). Each placement samples a distinct portion of
+        // the axial gradient and must NOT reuse the first PNG under image_id=0.
+        let mut dl_two = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        dl_two.push(RenderCommand::PushClip {
+            path: rect_path(0.0, 0.0, 40.0, 20.0),
+            rule: FillRule::NonZero,
+        });
+        dl_two.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 10.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        dl_two.push(RenderCommand::PopClip);
+        dl_two.push(RenderCommand::PushClip {
+            path: rect_path(50.0, 0.0, 100.0, 20.0),
+            rule: FillRule::NonZero,
+        });
+        dl_two.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 70.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        dl_two.push(RenderCommand::PopClip);
+
+        let pix_two = raster_svg(&dl_two);
+        let p1_red = pix_two.pixel(5, 10).expect("p1_red");
+        let p1_blue = pix_two.pixel(35, 10).expect("p1_blue");
+        let p2_red = pix_two.pixel(55, 10).expect("p2_red");
+        let p2_blue = pix_two.pixel(95, 10).expect("p2_blue");
+        assert!(
+            p1_red.red() > 240 && p1_red.blue() < 15,
+            "SVG placement 1 left (x=5) must be red, got {p1_red:?}"
+        );
+        assert!(
+            p1_blue.red() < 15 && p1_blue.blue() > 240,
+            "SVG placement 1 right (x=35) must be blue, got {p1_blue:?}"
+        );
+        assert!(
+            p2_red.red() > 240 && p2_red.blue() < 15,
+            "SVG placement 2 left (x=55) must be red (not reused placement 1 PNG), got {p2_red:?}"
+        );
+        assert!(
+            p2_blue.red() < 15 && p2_blue.blue() > 240,
+            "SVG placement 2 right (x=95) must be blue, got {p2_blue:?}"
+        );
+
+        // Case 2: Zero-scale singular occurrence BEFORE a visible occurrence
+        // must NOT poison the glyph-program cache with placeholder bounds.
+        let mut dl_zero = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        dl_zero.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 0.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 0.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        dl_zero.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        let pix_zero = raster_svg(&dl_zero);
+        let far_right = pix_zero.pixel(80, 10).expect("far_right");
+        assert!(
+            far_right.red() < 15 && far_right.green() < 15 && far_right.blue() > 240,
+            "SVG visible occurrence after zero-scale glyph must paint blue past x=1000, got {far_right:?}"
         );
     }
 }

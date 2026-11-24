@@ -83,10 +83,11 @@ pub struct InterpretStats {
     pub total_ns: u64,
     /// Shading rasters produced. Deterministic, therefore CI-gateable.
     pub shading_rasters: u64,
-    /// True when standalone Type 3 replay fell back to placement-dependent
-    /// destination bounds for an unclipped unbounded shading (all-zero
-    /// `/FontBBox`), signaling callers not to reuse the interpreted glyph
-    /// across different placements.
+    /// True when standalone Type 3 replay encountered an unclipped unbounded
+    /// shading without known glyph bounds (all-zero/omitted `/FontBBox`),
+    /// whether bounded via inverse-mapped destination bounds or a provisional
+    /// placeholder fallback. Signals callers not to cache the interpreted glyph
+    /// program across placements or treat its bounds as placement-independent.
     pub type3_used_dest_bounds: bool,
     /// Operators attributed, one counter per bucket. Deterministic: they say
     /// whether a page is dominated by *many cheap* operations or a few

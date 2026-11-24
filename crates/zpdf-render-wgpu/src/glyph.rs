@@ -379,6 +379,20 @@ fn type3_glyph_to_page(
     ))
 }
 
+fn type3_placement_bounds_key(r: Option<zpdf_core::Rect>) -> [u64; 4] {
+    let bits = |v: f64| {
+        if v == 0.0 {
+            0.0f64.to_bits()
+        } else {
+            v.to_bits()
+        }
+    };
+    match r {
+        Some(r) => [bits(r.x0), bits(r.y0), bits(r.x1), bits(r.y1)],
+        None => [u64::MAX; 4],
+    }
+}
+
 fn scale_premul_color(color: [f32; 4], alpha: f32) -> [f32; 4] {
     if alpha >= 1.0 {
         color
@@ -430,14 +444,18 @@ fn render_type3(
                 )
             })
             .flatten();
-        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream_with_bbox(
-            stream,
-            font.type3_resources(),
-            font_bbox,
-            fallback_bounds,
-        ) else {
+        let Some((glyph_dl, glyph_images, used_dest_bounds)) = rec
+            .interpret_type3_stream_with_bbox(
+                stream,
+                font.type3_resources(),
+                font_bbox,
+                fallback_bounds,
+            )
+        else {
             return;
         };
+        let placement_bounds =
+            used_dest_bounds.then(|| type3_placement_bounds_key(fallback_bounds));
         let mut glyph_clip_depth = 0usize;
         let mut glyph_blend_depth = 0usize;
 
@@ -479,6 +497,7 @@ fn render_type3(
                                     font_id: run.font_id,
                                     glyph_id: g.glyph_id,
                                     images: &glyph_images,
+                                    placement_bounds,
                                 }),
                                 map,
                                 0,
@@ -613,6 +632,7 @@ fn render_type3(
                                 glyph_id: g.glyph_id,
                                 image_id: draw.image_id,
                                 stencil_tint: Some([r_s.to_bits(), g_s.to_bits(), b_s.to_bits()]),
+                                placement_bounds,
                             };
                             rec.add_type3_image_cached(key, quad, || {
                                 let mut tinted = src_img.clone();
@@ -650,6 +670,7 @@ fn render_type3(
                                 glyph_id: g.glyph_id,
                                 image_id: draw.image_id,
                                 stencil_tint: None,
+                                placement_bounds,
                             };
                             rec.add_type3_image_cached(key, quad, || src_img.clone());
                         }
@@ -758,14 +779,18 @@ pub fn render_type3_tiling_transformed(
                 )
             })
             .flatten();
-        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream_with_bbox(
-            stream,
-            font.type3_resources(),
-            font_bbox,
-            fallback_bounds,
-        ) else {
+        let Some((glyph_dl, glyph_images, used_dest_bounds)) = rec
+            .interpret_type3_stream_with_bbox(
+                stream,
+                font.type3_resources(),
+                font_bbox,
+                fallback_bounds,
+            )
+        else {
             return;
         };
+        let placement_bounds =
+            used_dest_bounds.then(|| type3_placement_bounds_key(fallback_bounds));
         let mut glyph_clip_depth = 0usize;
         let mut glyph_blend_depth = 0usize;
 
@@ -823,6 +848,7 @@ pub fn render_type3_tiling_transformed(
                                     font_id: run.font_id,
                                     glyph_id: g.glyph_id,
                                     images: &glyph_images,
+                                    placement_bounds,
                                 }),
                                 map,
                                 0,
@@ -1023,6 +1049,7 @@ pub fn render_type3_tiling_transformed(
                                 glyph_id: g.glyph_id,
                                 image_id: draw.image_id,
                                 stencil_tint: white_tint,
+                                placement_bounds,
                             };
                             if rec.record_subops_clipped_into(&mut mask_ops, |r| {
                                 r.add_type3_image_cached(key, quad, || {
@@ -1064,6 +1091,7 @@ pub fn render_type3_tiling_transformed(
                                 glyph_id: g.glyph_id,
                                 image_id: draw.image_id,
                                 stencil_tint: None,
+                                placement_bounds,
                             };
                             rec.add_type3_image_cached(key, quad, || src_img.clone());
                         }

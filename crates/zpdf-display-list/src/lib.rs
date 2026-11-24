@@ -276,11 +276,33 @@ impl RetainedMaskAccounting {
     /// `TilingPattern` allocation is charged separately from its shared cell
     /// `DisplayList`, and every reachable allocation is charged at most once.
     pub fn delta_for_display_list(&self, root: &std::sync::Arc<DisplayList>) -> RetainedMaskDelta {
+        self.delta_for_root(root, None)
+    }
+
+    /// Estimate newly-retained heap bytes for caching a [`SoftMask`] (both its
+    /// `commands` DAG and its outer `transfer` LUT, deduplicated against any
+    /// nested transfer tables and previously committed entries).
+    pub fn delta_for_soft_mask(&self, mask: &SoftMask) -> RetainedMaskDelta {
+        self.delta_for_root(&mask.commands, mask.transfer.as_ref())
+    }
+
+    fn delta_for_root(
+        &self,
+        root: &std::sync::Arc<DisplayList>,
+        root_transfer: Option<&std::sync::Arc<[u8; 256]>>,
+    ) -> RetainedMaskDelta {
         let mut delta = RetainedMaskDelta::default();
         let mut seen_dls = std::collections::HashSet::new();
         let mut seen_tilings = std::collections::HashSet::new();
         let mut seen_inlines = std::collections::HashSet::new();
         let mut seen_transfers = std::collections::HashSet::new();
+        if let Some(tr) = root_transfer {
+            let tr_ptr = std::sync::Arc::as_ptr(tr) as usize;
+            if seen_transfers.insert(tr_ptr) && !self.transfer_ptrs.contains(&tr_ptr) {
+                delta.added_bytes = delta.added_bytes.saturating_add(256);
+                delta.new_transfers.push(tr_ptr);
+            }
+        }
         let mut stack: Vec<&DisplayList> = vec![root.as_ref()];
 
         while let Some(dl) = stack.pop() {
@@ -3483,5 +3505,73 @@ mod tiling_backdrop_tests {
             distinct_outer + 2 * tiling_struct_bytes + cell_bytes,
             "two distinct Arc<TilingPattern> objects sharing one cell must charge both patterns + one cell"
         );
+    }
+
+    #[test]
+    fn retained_mask_accounting_charges_and_deduplicates_root_transfer_table() {
+        let tr1 = Arc::new([128u8; 256]);
+        let tr2 = Arc::new([64u8; 256]);
+
+        let mut inner = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        inner.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let inner_arc = Arc::new(inner);
+
+        // Outer mask shares `tr1` with its nested soft mask: `tr1` must be charged ONCE (256 bytes).
+        let mut outer = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        outer.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: Some(SoftMask {
+                kind: SoftMaskKind::Luminosity,
+                commands: Arc::clone(&inner_arc),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: Some(Arc::clone(&tr1)),
+            }),
+        });
+        outer.push(RenderCommand::PopBlendGroup);
+        let outer_arc = Arc::new(outer);
+
+        let mask1 = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::clone(&outer_arc),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: Some(Arc::clone(&tr1)),
+        };
+        let mask2 = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::clone(&outer_arc),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: Some(Arc::clone(&tr2)),
+        };
+
+        let mut acct = RetainedMaskAccounting::default();
+        let d_dl_only = acct.delta_for_display_list(&outer_arc);
+        let d_mask1 = acct.delta_for_soft_mask(&mask1);
+        assert_eq!(
+            d_mask1.added_bytes, d_dl_only.added_bytes,
+            "root transfer shared with a nested mask must be deduplicated"
+        );
+        acct.commit(d_mask1);
+
+        // Distinct root transfer table sharing the already-committed command list adds 256 bytes.
+        let d_mask2 = acct.delta_for_soft_mask(&mask2);
+        assert_eq!(
+            d_mask2.added_bytes, 256,
+            "distinct root transfer table sharing one command list must charge 256 bytes"
+        );
+        acct.commit(d_mask2);
+        assert_eq!(acct.delta_for_soft_mask(&mask2).added_bytes, 0);
     }
 }

@@ -5614,3 +5614,237 @@ fn type3_luminosity_mask_shading_bbox_clips_extended_gradient_matches_live() {
         Err(e) => panic!("GPU shading /BBox test failed: {e}"),
     }
 }
+
+#[test]
+fn type3_all_zero_bbox_axial_two_placements_and_zero_scale_prefix_matches_live() {
+    use zpdf::display_list::{
+        Color, DisplayList, FillRule, GlyphRun, Paint, Path, PositionedGlyph, RenderCommand,
+    };
+    use zpdf_core::{Matrix, Rect};
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    // Case 1: Same all-zero `/FontBBox` unclipped axial-shading Type 3 glyph
+    // rendered at two distinct x positions on one 100x20 page:
+    //   - Placement 1 (clipped to [0..40]): x = 10 -> x=5 red, x=35 blue
+    //   - Placement 2 (clipped to [50..100]): x = 70 -> x=55 red, x=95 blue
+    // If GPU/SVG image caches reused Placement 1's texture under local
+    // `image_id = 0`, Placement 2 at x = 55 would sample blue instead of red.
+    let two_page_content = b"q 0 0 40 20 re W n BT /F1 1 Tf 10 0 Td (A) Tj ET Q \
+          q 50 0 50 20 re W n BT /F1 1 Tf 70 0 Td (A) Tj ET Q";
+    let charproc = b"2500 0 d0 /Fade sh";
+    let pdf_two = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 20] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", two_page_content),              // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 0 0] \
+          /FontMatrix [0.04 0 0 0.04 0 0] /CharProcs << /A 6 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A] >> \
+          /FirstChar 65 /LastChar 65 /Widths [2500] \
+          /Resources << /Shading << /Fade 7 0 R >> >> >>"
+            .to_vec(), // 5
+        stream_obj("", charproc),                      // 6
+        b"<< /ShadingType 2 /ColorSpace /DeviceRGB \
+          /Coords [0 0 500 0] /Function 8 0 R /Extend [true true] >>"
+            .to_vec(), // 7
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>".to_vec(), // 8
+    ]);
+
+    let doc = PdfDocument::open(pdf_two).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut live_images = ImageCache::new();
+    let live_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut live_images)
+        .interpret(&content);
+    let live_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&live_images)
+        .render_display_list(&live_dl, 1.0)
+        .expect("live CPU");
+
+    let (font_id, _) = fonts.get_by_name("F1").expect("loaded F1");
+    let mut clip1 = Path::new();
+    clip1.rect(Rect::new(0.0, 0.0, 40.0, 20.0));
+    let mut clip2 = Path::new();
+    clip2.rect(Rect::new(50.0, 0.0, 100.0, 20.0));
+    let mut standalone_two = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+    standalone_two.push(RenderCommand::PushClip {
+        path: clip1,
+        rule: FillRule::NonZero,
+    });
+    standalone_two.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 10.0,
+            y: 0.0,
+            advance: 100.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    standalone_two.push(RenderCommand::PopClip);
+    standalone_two.push(RenderCommand::PushClip {
+        path: clip2,
+        rule: FillRule::NonZero,
+    });
+    standalone_two.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 70.0,
+            y: 0.0,
+            advance: 100.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    standalone_two.push(RenderCommand::PopClip);
+
+    let standalone_cpu_two = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&standalone_two, 1.0)
+        .expect("standalone CPU two placements");
+
+    let assert_two_placements = |label: &str, data: &[u8], w: u32| {
+        let p1_red = px(data, w, 5, 10);
+        let p1_blue = px(data, w, 35, 10);
+        let p2_red = px(data, w, 55, 10);
+        let p2_blue = px(data, w, 95, 10);
+        assert!(
+            p1_red[0] > 240 && p1_red[2] < 15,
+            "{label}: placement 1 left (x=5) must be red, got {p1_red:?}"
+        );
+        assert!(
+            p1_blue[0] < 15 && p1_blue[2] > 240,
+            "{label}: placement 1 right (x=35) must be blue, got {p1_blue:?}"
+        );
+        assert!(
+            p2_red[0] > 240 && p2_red[2] < 15,
+            "{label}: placement 2 left (x=55) must be red (not reused placement 1 texture), got {p2_red:?}"
+        );
+        assert!(
+            p2_blue[0] < 15 && p2_blue[2] > 240,
+            "{label}: placement 2 right (x=95) must be blue, got {p2_blue:?}"
+        );
+    };
+    assert_two_placements("live CPU", &live_cpu.data, live_cpu.width);
+    assert_two_placements(
+        "standalone CPU",
+        &standalone_cpu_two.data,
+        standalone_cpu_two.width,
+    );
+    let cpu_max_diff = live_cpu
+        .data
+        .iter()
+        .zip(standalone_cpu_two.data.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        cpu_max_diff <= 4,
+        "standalone CPU two placements must match live CPU within 4 LSB, max_diff={cpu_max_diff}"
+    );
+
+    match render_gpu_shared(&standalone_two, Some(&fonts), None, 1.0) {
+        Ok(standalone_gpu_two) => {
+            assert_two_placements(
+                "standalone GPU",
+                &standalone_gpu_two.data,
+                standalone_gpu_two.width,
+            );
+            let gpu_max_diff = live_cpu
+                .data
+                .iter()
+                .zip(standalone_gpu_two.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                gpu_max_diff <= 4,
+                "standalone GPU two placements must match live CPU within 4 LSB, max_diff={gpu_max_diff}"
+            );
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU two-placement test (no adapter)");
+        }
+        Err(e) => panic!("GPU two-placement test failed: {e}"),
+    }
+
+    // Case 2: A zero-scale (singular) occurrence BEFORE a visible occurrence
+    // must NOT cache the provisional placeholder program and crop the visible
+    // glyph at x = 1000 glyph units (page x = 40).
+    let mut standalone_zero = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+    standalone_zero.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 0.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 0.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::scale(0.0, 0.0),
+        h_scale: 1.0,
+    }));
+    standalone_zero.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 100.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    let cpu_zero = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&standalone_zero, 1.0)
+        .expect("standalone CPU zero-scale prefix");
+    let cpu_far = px(&cpu_zero.data, cpu_zero.width, 80, 10);
+    assert!(
+        cpu_far[0] < 15 && cpu_far[1] < 15 && cpu_far[2] > 240,
+        "standalone CPU visible glyph after zero-scale occurrence must paint blue past x=1000, got {cpu_far:?}"
+    );
+    if let Ok(gpu_zero) = render_gpu_shared(&standalone_zero, Some(&fonts), None, 1.0) {
+        let gpu_far = px(&gpu_zero.data, gpu_zero.width, 80, 10);
+        assert!(
+            gpu_far[0] < 15 && gpu_far[1] < 15 && gpu_far[2] > 240,
+            "standalone GPU visible glyph after zero-scale occurrence must paint blue past x=1000, got {gpu_far:?}"
+        );
+    }
+}

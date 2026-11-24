@@ -1331,6 +1331,7 @@ pub(crate) enum RecordImages<'a> {
         font_id: zpdf_font::FontId,
         glyph_id: u16,
         images: &'a zpdf_image::ImageCache,
+        placement_bounds: Option<[u64; 4]>,
     },
 }
 
@@ -1427,6 +1428,7 @@ fn record_dl_commands_at(
                         font_id,
                         glyph_id,
                         images: cache,
+                        placement_bounds,
                     }) => (
                         cache.get(draw.image_id),
                         Some(record::Type3ImageKey {
@@ -1434,6 +1436,7 @@ fn record_dl_commands_at(
                             glyph_id,
                             image_id: draw.image_id,
                             stencil_tint: None,
+                            placement_bounds,
                         }),
                     ),
                     None => (None, None),

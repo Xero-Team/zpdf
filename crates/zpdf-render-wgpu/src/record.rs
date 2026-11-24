@@ -334,6 +334,11 @@ pub struct Type3ImageKey {
     /// Straight RGB tint bits for `/ImageMask true` stencils; `None` for
     /// intrinsic colored (`d0`) images.
     pub stencil_tint: Option<[u32; 3]>,
+    /// Canonical glyph-space destination bounds bits when this glyph's
+    /// interpretation depended on placement bounds (e.g. unclipped unbounded
+    /// shading with all-zero `/FontBBox`), preventing distinct placements from
+    /// aliasing one texture under local `image_id = 0`.
+    pub placement_bounds: Option<[u64; 4]>,
 }
 
 /// Base image ID reserved for inline images decoded inside Type 3 CharProcs
@@ -507,6 +512,7 @@ impl PageRecorder {
         resources: Option<&zpdf_font::Type3Resources>,
     ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
         self.interpret_type3_stream_with_bbox(stream, resources, None, None)
+            .map(|(dl, images, _)| (dl, images))
     }
 
     pub fn interpret_type3_stream_with_bbox(
@@ -515,7 +521,7 @@ impl PageRecorder {
         resources: Option<&zpdf_font::Type3Resources>,
         font_bbox: Option<zpdf_core::Rect>,
         fallback_bounds: Option<zpdf_core::Rect>,
-    ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
+    ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache, bool)> {
         if !self.can_record() {
             return None;
         }
@@ -555,7 +561,7 @@ impl PageRecorder {
         if !self.can_record() {
             return None;
         }
-        Some((dl, images))
+        Some((dl, images, stats.type3_used_dest_bounds))
     }
 
     fn reserve_geometry<V>(

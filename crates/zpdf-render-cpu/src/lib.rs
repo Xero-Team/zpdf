@@ -5601,18 +5601,14 @@ impl<'a> CpuRenderer<'a> {
             }
         };
         let base_bytes = base.len() as u64;
-        let mut delta = self
-            .soft_mask_accounting
-            .delta_for_display_list(&mask.commands);
+        let mut delta = self.soft_mask_accounting.delta_for_soft_mask(mask);
         let mut entry_bytes = base_bytes.saturating_add(delta.added_bytes);
         if entry_bytes <= self.max_soft_mask_cache_bytes {
             if self.soft_mask_cache_bytes.saturating_add(entry_bytes)
                 > self.max_soft_mask_cache_bytes
             {
                 self.clear_soft_mask_cache();
-                delta = self
-                    .soft_mask_accounting
-                    .delta_for_display_list(&mask.commands);
+                delta = self.soft_mask_accounting.delta_for_soft_mask(mask);
                 entry_bytes = base_bytes.saturating_add(delta.added_bytes);
             }
             if entry_bytes <= self.max_soft_mask_cache_bytes {
@@ -13857,6 +13853,93 @@ mod tests {
             r_tight.soft_mask_planes.is_empty(),
             "distinct-pattern mask exceeding 1x-pattern budget must be declined"
         );
+        let _ = r_tight.end_page().expect("end_page");
+    }
+
+    #[test]
+    fn cpu_soft_mask_cache_charges_distinct_root_transfer_tables_sharing_commands() {
+        let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 4.0, 4.0));
+        mask_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 4.0, 4.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let shared_cmds = Arc::new(mask_dl);
+        let tr1 = Arc::new([255u8; 256]);
+        let tr2 = Arc::new([128u8; 256]);
+
+        let info = PageRenderInfo {
+            page_rect: Rect::new(0.0, 0.0, 4.0, 4.0),
+            scale: 1.0,
+            background: Color::white(),
+        };
+        let mut dl = DisplayList::new(info.page_rect);
+        for tr in [&tr1, &tr2] {
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: info.page_rect,
+                alpha: 1.0,
+                mask: Some(SoftMask {
+                    kind: SoftMaskKind::Luminosity,
+                    commands: Arc::clone(&shared_cmds),
+                    offset: (0.0, 0.0),
+                    backdrop_luma: 0.0,
+                    transfer: Some(Arc::clone(tr)),
+                }),
+            });
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 4.0, 4.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+        }
+
+        // Unconstrained: first entry charges commands + plane(16) + tr1(256);
+        // second entry sharing `shared_cmds` charges plane(16) + tr2(256).
+        let mut r_first = CpuRenderer::new();
+        r_first.begin_page(&info).expect("begin_page");
+        for cmd in &dl.commands[..3] {
+            r_first.execute(cmd).expect("execute");
+        }
+        let first_bytes = r_first.soft_mask_cache_bytes;
+        assert_eq!(r_first.soft_mask_planes.len(), 1);
+        let _ = r_first.end_page().expect("end_page");
+
+        let mut r_both = CpuRenderer::new();
+        r_both.begin_page(&info).expect("begin_page");
+        for cmd in &dl.commands {
+            r_both.execute(cmd).expect("execute");
+        }
+        let both_bytes = r_both.soft_mask_cache_bytes;
+        assert_eq!(r_both.soft_mask_planes.len(), 2);
+        assert_eq!(
+            both_bytes - first_bytes,
+            16 + 256,
+            "second distinct root transfer table sharing commands must charge plane (16 B) + transfer LUT (256 B)"
+        );
+        let _ = r_both.end_page().expect("end_page");
+
+        // Tight budget fitting first entry + second plane (16 B), but NOT the
+        // second 256-byte transfer table, must evict before caching the second.
+        let mut r_tight = CpuRenderer::new();
+        r_tight.max_soft_mask_cache_bytes = first_bytes + 16;
+        r_tight.begin_page(&info).expect("begin_page");
+        for cmd in &dl.commands {
+            r_tight.execute(cmd).expect("execute");
+        }
+        assert_eq!(
+            r_tight.soft_mask_planes.len(),
+            1,
+            "budget without room for second root transfer LUT must not retain both entries"
+        );
+        assert!(r_tight.soft_mask_cache_bytes <= first_bytes + 16);
         let _ = r_tight.end_page().expect("end_page");
     }
 }

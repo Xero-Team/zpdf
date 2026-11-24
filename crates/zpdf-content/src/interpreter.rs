@@ -4649,6 +4649,10 @@ impl<'a> ContentInterpreter<'a> {
                 self.stats.type3_used_dest_bounds = true;
                 dest
             } else {
+                // Unresolved shading extent (unknown `/FontBBox` with no finite
+                // geometry, `/BBox`, or invertible destination bounds): keep
+                // this provisional program out of placement-independent caches.
+                self.stats.type3_used_dest_bounds = true;
                 let base = self.display_list.page_rect.normalize();
                 match def.coords_bounds() {
                     Some(cb) => Rect::new(

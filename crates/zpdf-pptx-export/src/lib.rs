@@ -975,7 +975,7 @@ struct SlideConverter<'a> {
     /// Per-slide cache of conservative glyph-space ink bounds for synthetic
     /// Type 3 `DrawGlyphRun`s so repeated occurrences never re-interpret
     /// CharProcs or re-decode images.
-    type3_glyph_bounds: std::collections::HashMap<(zpdf_font::FontId, u16), Option<Rect>>,
+    type3_glyph_bounds: std::collections::HashMap<(zpdf_font::FontId, u16), CommandBounds>,
     stats: ConversionStats,
     #[cfg(test)]
     expire_backdrop_after_groups: Option<usize>,
@@ -1396,7 +1396,7 @@ impl<'a> SlideConverter<'a> {
         font_id: zpdf_font::FontId,
         font: &zpdf_font::LoadedFont,
         glyph_id: u16,
-    ) -> Result<Option<Rect>> {
+    ) -> Result<CommandBounds> {
         const MAX_CACHED_TYPE3_BOUNDS: usize = 4096;
         if let Some(&cached) = self.type3_glyph_bounds.get(&(font_id, glyph_id)) {
             return Ok(cached);
@@ -1410,7 +1410,7 @@ impl<'a> SlideConverter<'a> {
             ));
         }
         let Some((stream, _)) = font.type3_glyph_stream(glyph_id) else {
-            return Ok(None);
+            return Ok(CommandBounds::Empty);
         };
         let glyph_rect = Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
         let mut images = ImageCache::new();
@@ -1427,6 +1427,16 @@ impl<'a> SlideConverter<'a> {
             return Err(zpdf_core::Error::StreamDecode(
                 "PPTX Type 3 bounds measurement exceeded time budget".into(),
             ));
+        }
+        if stats.type3_used_dest_bounds {
+            // Unclipped unbounded shading with unspecified `/FontBBox [0 0 0 0]`
+            // extends across the active slide/clip crop rather than the
+            // placeholder glyph rectangle.
+            if self.type3_glyph_bounds.len() < MAX_CACHED_TYPE3_BOUNDS {
+                self.type3_glyph_bounds
+                    .insert((font_id, glyph_id), CommandBounds::Unknown);
+            }
+            return Ok(CommandBounds::Unknown);
         }
 
         #[derive(Clone, Copy)]
@@ -1581,10 +1591,11 @@ impl<'a> SlideConverter<'a> {
                 _ => {}
             }
         }
+        let result = acc.map_or(CommandBounds::Empty, CommandBounds::Known);
         if self.type3_glyph_bounds.len() < MAX_CACHED_TYPE3_BOUNDS {
-            self.type3_glyph_bounds.insert((font_id, glyph_id), acc);
+            self.type3_glyph_bounds.insert((font_id, glyph_id), result);
         }
-        Ok(acc)
+        Ok(result)
     }
 
     fn type3_glyph_run_bounds(
@@ -1616,9 +1627,10 @@ impl<'a> SlideConverter<'a> {
             let Some((_, fm)) = font.type3_glyph_stream(glyph.glyph_id) else {
                 continue;
             };
-            let Some(local) = self.type3_glyph_local_bounds(run.font_id, font, glyph.glyph_id)?
-            else {
-                continue;
+            let local = match self.type3_glyph_local_bounds(run.font_id, font, glyph.glyph_id)? {
+                CommandBounds::Empty => continue,
+                CommandBounds::Unknown => return Ok(CommandBounds::Unknown),
+                CommandBounds::Known(r) => r,
             };
             let glyph_to_page = run
                 .transform
@@ -22673,6 +22685,186 @@ mod export_tests {
             stats.tiling_backdrop_cmd_scans <= 320,
             "full PPTX export must share memoized backdrop scans across passes (<= 320), got {}",
             stats.tiling_backdrop_cmd_scans
+        );
+    }
+
+    #[test]
+    fn pptx_flattened_type3_unclipped_axial_shading_all_zero_bbox_preserves_extended_color() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{
+            Color, FillRule, GlyphRun, Paint, Path, PositionedGlyph, TilingPattern,
+        };
+        use zpdf_font::{
+            CidWidths, FontCache, LoadedFont, PdfFontType, Type3Function, Type3Resources,
+            Type3Shading,
+        };
+
+        let mut func_dict = zpdf_core::PdfDict::new();
+        func_dict.insert(
+            zpdf_core::PdfName::new("FunctionType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("Domain"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C0"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(1.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C1"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("N"),
+            zpdf_core::PdfObject::Real(1.0),
+        );
+        let mut sh_dict = zpdf_core::PdfDict::new();
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ShadingType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Coords"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(500.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Extend"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Bool(true),
+                zpdf_core::PdfObject::Bool(true),
+            ]),
+        );
+        let mut t3_res = Type3Resources::default();
+        t3_res.shadings.insert(
+            "Fade".into(),
+            Arc::new(Type3Shading {
+                dict: sh_dict,
+                stream_data: None,
+                functions: vec![Arc::new(Type3Function::Dict {
+                    dict: func_dict,
+                    children: Vec::new(),
+                })],
+            }),
+        );
+        let charproc = b"2500 0 d0 /Fade sh";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [0.04, 0.0, 0.0, 0.04, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![2500.0],
+                first_char: 0,
+            },
+            "AllZeroAxialPptx".into(),
+            Vec::new(),
+            CidWidths::new(2500.0),
+        )
+        .with_type3_resources(Arc::new(t3_res))
+        .with_type3_font_bbox(Rect::new(0.0, 0.0, 0.0, 0.0));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut cell_path = Path::new();
+        cell_path.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: cell_path,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let (slide, _) = display_list_to_slide_internal(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("PPTX export of patterned Type 3 axial shading");
+
+        let (x_emu, width_emu, image_data) = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::Image {
+                    x_emu,
+                    width_emu,
+                    image_data,
+                    ..
+                } => Some((*x_emu, *width_emu, image_data.as_slice())),
+                _ => None,
+            })
+            .expect("flattened Type 3 run must produce a SlideElement::Image");
+
+        let full_slide_w_emu = pt_to_emu(100.0);
+        assert!(
+            x_emu <= pt_to_emu(1.0) && width_emu >= full_slide_w_emu - pt_to_emu(2.0),
+            "flattened crop must span the full 100pt slide instead of placeholder 40pt (x_emu={x_emu}, width_emu={width_emu}, expected ~{full_slide_w_emu})"
+        );
+        let img = image::load_from_memory(image_data)
+            .expect("valid flattened PNG")
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        // 80% across the 100pt slide = glyph x=2000 (past 1000 units), extended solid blue.
+        let px = img.get_pixel((w * 8) / 10, h / 2);
+        assert!(
+            px[0] < 15 && px[1] < 15 && px[2] > 240 && px[3] > 240,
+            "flattened PPTX image at x=80% (glyph x=2000) must preserve extended blue, got {px:?}"
         );
     }
 }
