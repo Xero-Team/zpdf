@@ -1818,7 +1818,7 @@ impl<'a> SlideConverter<'a> {
                         None,
                     )?;
                 } else {
-                    self.convert_fill_path(path, paint, effective_alpha, !in_artwork_range)?;
+                    self.convert_fill_path(path, paint, effective_alpha, in_artwork_range)?;
                 }
             }
             RenderCommand::StrokePath {
@@ -2053,7 +2053,7 @@ impl<'a> SlideConverter<'a> {
         path: &zpdf_display_list::Path,
         paint: &zpdf_display_list::Paint,
         effective_alpha: f32,
-        allow_ellipse_recognition: bool,
+        in_artwork_range: bool,
     ) -> Result<()> {
         use zpdf_display_list::Paint;
 
@@ -2062,9 +2062,16 @@ impl<'a> SlideConverter<'a> {
             _ => None,
         };
 
-        // Try to recognize simple shapes
+        // Try to recognize simple shapes (glyph artwork requires an exact
+        // four-corner axis-aligned rectangle so explicitly closed triangles
+        // or sheared/rotated quads never expand to their bounding box).
         if self.options.recognize_rectangles {
-            if let Some(rect) = shape_recognizer::recognize_rectangle(path) {
+            let recognized = if in_artwork_range {
+                exact_axis_aligned_rect(path)
+            } else {
+                shape_recognizer::recognize_rectangle(path)
+            };
+            if let Some(rect) = recognized {
                 let (x_ppt, y_ppt) = self.pdf_to_ppt_coords(rect.x0, rect.y1);
                 let element = SlideElement::Rectangle {
                     x_emu: pt_to_emu(x_ppt),
@@ -2080,7 +2087,7 @@ impl<'a> SlideConverter<'a> {
             }
         }
 
-        if allow_ellipse_recognition && self.options.recognize_ellipses {
+        if !in_artwork_range && self.options.recognize_ellipses {
             if let Some(rect) = shape_recognizer::recognize_ellipse(path) {
                 let (x_ppt, y_ppt) = self.pdf_to_ppt_coords(rect.x0, rect.y1);
                 let element = SlideElement::Ellipse {
@@ -11459,6 +11466,111 @@ mod export_tests {
         assert!(
             path_data.contains("C "),
             "stroked four-cubic heart must preserve cubic curve segments: {path_data}"
+        );
+    }
+
+    #[test]
+    fn type3_explicitly_closed_right_triangle_stays_freeform_while_rectangle_stays_native() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // /tri traces a right triangle, draws an explicit line back to (0, 0), and closes (`h`).
+        // That yields 5 path elements (4 point entries with 2 unique Xs and 2 unique Ys),
+        // which must NOT be misclassified as a Rectangle.
+        // /rect is a genuine four-corner axis-aligned rectangle and must stay native Rectangle.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"0 0 1 rg BT /F1 100 Tf 10 10 Td (AB) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /tri 8 0 R /rect 9 0 R >>".to_vec(),      // 6
+            b"<< /Type /Encoding /Differences [65 /tri /rect] >>".to_vec(), // 7
+            stream("", b"1000 0 d0 0 0 m 800 0 l 0 800 l 0 0 l h f"), // 8
+            stream("", b"1000 0 d0 0 0 800 800 re f"),     // 9
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+        assert_eq!(slide.elements.len(), 2);
+
+        let SlideElement::FreeformPath {
+            path_data,
+            fill_rgb: Some((0, 0, 255)),
+            ..
+        } = &slide.elements[0]
+        else {
+            panic!(
+                "explicitly closed right-triangle Type 3 glyph must stay FreeformPath, got {:?}",
+                slide.elements[0]
+            );
+        };
+        assert!(
+            path_data.contains("10.00 110.00")
+                && path_data.contains("90.00 110.00")
+                && path_data.contains("10.00 30.00"),
+            "triangle FreeformPath must retain its three vertices: {path_data}"
+        );
+        assert!(
+            !path_data.contains("90.00 30.00"),
+            "triangle FreeformPath must not synthesize the missing fourth rectangle corner: {path_data}"
+        );
+
+        assert!(
+            matches!(
+                slide.elements[1],
+                SlideElement::Rectangle {
+                    fill_rgb: Some((0, 0, 255)),
+                    ..
+                }
+            ),
+            "genuine axis-aligned Type 3 rectangle must stay native Rectangle, got {:?}",
+            slide.elements[1]
         );
     }
 }
