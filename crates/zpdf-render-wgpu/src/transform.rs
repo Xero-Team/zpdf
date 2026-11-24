@@ -57,6 +57,9 @@ pub struct PageMap {
     /// maps page y to `(y1 - y) * scale`, so the bottom edge is not needed.
     pub x0: f32,
     pub y1: f32,
+    /// Full page rectangle in page coordinates (used as destination fallback
+    /// bounds when replaying unclipped Type 3 shadings with all-zero `/FontBBox`).
+    pub page_rect: zpdf_core::Rect,
 }
 
 impl PageMap {
@@ -65,6 +68,7 @@ impl PageMap {
             scale,
             x0: rect.x0 as f32,
             y1: rect.y1 as f32,
+            page_rect: rect.normalize(),
         }
     }
 
@@ -156,11 +160,7 @@ mod tests {
 
     #[test]
     fn page_map_flips_y_like_cpu() {
-        let m = PageMap {
-            scale: 2.0,
-            x0: 0.0,
-            y1: 100.0,
-        };
+        let m = PageMap::new(zpdf_core::Rect::new(0.0, 0.0, 100.0, 100.0), 2.0);
         // (10, 80) page -> (20, (100-80)*2 = 40) device pixels.
         let p = m.pt(Point::new(10.0, 80.0));
         assert_eq!(p.x, 20.0);

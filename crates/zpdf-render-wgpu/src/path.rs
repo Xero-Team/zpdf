@@ -594,11 +594,7 @@ mod tests {
     use zpdf_display_list::Path as DlPath;
 
     fn map() -> PageMap {
-        PageMap {
-            scale: 1.0,
-            x0: 0.0,
-            y1: 100.0,
-        }
+        PageMap::new(zpdf_core::Rect::new(0.0, 0.0, 100.0, 100.0), 1.0)
     }
 
     #[test]

@@ -2228,12 +2228,10 @@ impl LoadedFont {
         self
     }
 
-    /// Glyph-space bounds for standalone Type 3 CharProc replay: the font's
-    /// declared non-degenerate `/FontBBox` when present, otherwise a symmetric
-    /// 1000-unit fallback `[-1000, -1000, 1000, 1000]`.
-    pub fn type3_glyph_rect(&self) -> zpdf_core::Rect {
+    /// Declared non-degenerate `/FontBBox` of a Type 3 font in glyph space,
+    /// or `None` when omitted or all-zero (`[0 0 0 0]`, ISO 32000-1 Table 112).
+    pub fn type3_font_bbox(&self) -> Option<zpdf_core::Rect> {
         self.type3_font_bbox
-            .unwrap_or_else(|| zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0))
     }
 
     /// True when this is a Type 3 font that still retains at least one decoded

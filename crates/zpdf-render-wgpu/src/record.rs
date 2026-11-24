@@ -506,18 +506,15 @@ impl PageRecorder {
         stream: &[u8],
         resources: Option<&zpdf_font::Type3Resources>,
     ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
-        self.interpret_type3_stream_in_rect(
-            stream,
-            resources,
-            zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0),
-        )
+        self.interpret_type3_stream_with_bbox(stream, resources, None, None)
     }
 
-    pub fn interpret_type3_stream_in_rect(
+    pub fn interpret_type3_stream_with_bbox(
         &mut self,
         stream: &[u8],
         resources: Option<&zpdf_font::Type3Resources>,
-        rect: zpdf_core::Rect,
+        font_bbox: Option<zpdf_core::Rect>,
+        fallback_bounds: Option<zpdf_core::Rect>,
     ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
         if !self.can_record() {
             return None;
@@ -533,10 +530,13 @@ impl PageRecorder {
         let deadline = *self
             .deadline
             .get_or_insert_with(|| Instant::now() + RECORD_BUDGET);
+        let rect = zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
         let mut images = zpdf_image::ImageCache::new();
         let (dl, stats) = zpdf_content::interpreter::ContentInterpreter::new(rect)
             .for_type3_glyph()
             .with_type3_resources(resources)
+            .with_type3_glyph_bbox(font_bbox)
+            .with_type3_fallback_bounds(fallback_bounds)
             .with_images(&mut images)
             .with_limits(&limits)
             .with_deadline(deadline)
@@ -1373,11 +1373,7 @@ mod tests {
     use zpdf_core::Point;
 
     fn map() -> PageMap {
-        PageMap {
-            scale: 1.0,
-            x0: 0.0,
-            y1: 100.0,
-        }
+        PageMap::new(zpdf_core::Rect::new(0.0, 0.0, 100.0, 100.0), 1.0)
     }
 
     fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> DlPath {

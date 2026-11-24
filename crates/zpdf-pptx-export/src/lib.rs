@@ -1412,11 +1412,12 @@ impl<'a> SlideConverter<'a> {
         let Some((stream, _)) = font.type3_glyph_stream(glyph_id) else {
             return Ok(None);
         };
-        let glyph_rect = font.type3_glyph_rect();
+        let glyph_rect = Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
         let mut images = ImageCache::new();
         let mut interp = zpdf_content::interpreter::ContentInterpreter::new(glyph_rect)
             .for_type3_glyph()
             .with_type3_resources(font.type3_resources())
+            .with_type3_glyph_bbox(font.type3_font_bbox())
             .with_images(&mut images);
         if let Some(d) = self.bounds_deadline {
             interp = interp.with_deadline(d);

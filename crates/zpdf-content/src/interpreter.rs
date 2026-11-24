@@ -306,6 +306,14 @@ pub struct ContentInterpreter<'a> {
     /// the enclosing text paint while preserving explicit `d0` fill/stroke
     /// colors and stencils.
     type3_glyph: bool,
+    /// True when standalone Type 3 replay has known glyph bounds (declared
+    /// non-degenerate `/FontBBox` or `d1` glyph bounding box); false when
+    /// `/FontBBox` was omitted or all-zero (`[0 0 0 0]`).
+    type3_glyph_bounds_known: bool,
+    /// Inverse-mapped destination page/clip bounds in glyph space for
+    /// standalone Type 3 replay when `/FontBBox` is unspecified (`[0 0 0 0]`)
+    /// and an unclipped shading has no finite geometry or `/BBox`.
+    type3_fallback_bounds: Option<Rect>,
     /// Pre-resolved named resources from the Type 3 font's `/Resources` dict so
     /// CharProcs can invoke `/Name Do`, `/GS gs`, and named `/ColorSpace` entries
     /// during standalone replay without a live `PdfFile`.
@@ -1552,6 +1560,8 @@ impl<'a> ContentInterpreter<'a> {
             page_base_ctm: Matrix::identity(),
             suppress_color_ops: false,
             type3_glyph: false,
+            type3_glyph_bounds_known: false,
+            type3_fallback_bounds: None,
             type3_resources: None,
             type3_resource_stack: Vec::new(),
             oc_config: None,
@@ -1617,6 +1627,55 @@ impl<'a> ContentInterpreter<'a> {
     ) -> Self {
         self.type3_resources = resources;
         self
+    }
+
+    /// Supply the Type 3 font's declared non-degenerate `/FontBBox` when known.
+    /// `None` preserves unknown glyph bounds (e.g. `/FontBBox [0 0 0 0]`) so
+    /// unclipped shadings can derive finite raster extents from shading
+    /// geometry or `/BBox` rather than truncating to a placeholder box.
+    pub fn with_type3_glyph_bbox(mut self, bbox: Option<Rect>) -> Self {
+        if let Some(b) = bbox.and_then(Self::finite_rect) {
+            if b.width() > 0.0 && b.height() > 0.0 {
+                self.display_list.page_rect = b;
+                self.type3_glyph_bounds_known = true;
+            }
+        }
+        self
+    }
+
+    /// Supply inverse-mapped destination page/clip bounds (in glyph space) as a
+    /// fallback raster extent for unclipped unbounded shadings when `/FontBBox`
+    /// is omitted or all-zero (`[0 0 0 0]`).
+    pub fn with_type3_fallback_bounds(mut self, bounds: Option<Rect>) -> Self {
+        self.type3_fallback_bounds = bounds
+            .and_then(Self::finite_rect)
+            .filter(|b| b.width() > 0.0 && b.height() > 0.0);
+        self
+    }
+
+    /// Inverse-map a page-space destination rectangle (page rect or active clip
+    /// bounds) back into Type 3 glyph space via `glyph_to_page.inverse()`.
+    pub fn inverse_map_rect(page_rect: Rect, glyph_to_page: &Matrix) -> Option<Rect> {
+        let inv = glyph_to_page.inverse()?;
+        let r = Self::finite_rect(page_rect)?;
+        let corners = [
+            Point::new(r.x0, r.y0).transform(&inv),
+            Point::new(r.x1, r.y0).transform(&inv),
+            Point::new(r.x0, r.y1).transform(&inv),
+            Point::new(r.x1, r.y1).transform(&inv),
+        ];
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in corners {
+            if !p.x.is_finite() || !p.y.is_finite() {
+                return None;
+            }
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x);
+            y1 = y1.max(p.y);
+        }
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1, y1))
     }
 
     fn lookup_type3_xobject(&self, name: &str) -> Option<zpdf_font::Type3XObject> {
@@ -2962,6 +3021,7 @@ impl<'a> ContentInterpreter<'a> {
                         && ury > lly
                     {
                         self.display_list.page_rect = Rect::new(llx, lly, urx, ury);
+                        self.type3_glyph_bounds_known = true;
                     }
                 }
             }
@@ -3971,13 +4031,33 @@ impl<'a> ContentInterpreter<'a> {
             })
             .unwrap_or((false, false));
 
+        let bbox = dict
+            .get("BBox")
+            .map(|o| self.resolve_plain(o))
+            .and_then(|o| o.as_array().ok().and_then(Self::parse_shading_bbox_array));
+
         Some(ShadingDef {
             kind,
             lut,
             extend_start,
             extend_end,
             to_page,
+            bbox,
         })
+    }
+
+    fn parse_shading_bbox_array(arr: &[PdfObject]) -> Option<Rect> {
+        let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+        if v.len() == 4 && v.iter().all(|c| c.is_finite()) {
+            Some(Rect::new(
+                v[0].min(v[2]),
+                v[1].min(v[3]),
+                v[0].max(v[2]),
+                v[1].max(v[3]),
+            ))
+        } else {
+            None
+        }
     }
 
     fn build_type3_shading(
@@ -4061,12 +4141,18 @@ impl<'a> ContentInterpreter<'a> {
             })
             .unwrap_or((false, false));
 
+        let bbox = dict
+            .get("BBox")
+            .map(|o| self.resolve_plain(o))
+            .and_then(|o| o.as_array().ok().and_then(Self::parse_shading_bbox_array));
+
         Some(ShadingDef {
             kind,
             lut,
             extend_start,
             extend_end,
             to_page,
+            bbox,
         })
     }
 
@@ -4212,12 +4298,18 @@ impl<'a> ContentInterpreter<'a> {
             (acc[2] / nverts) as f32,
         ];
 
+        let bbox = dict
+            .get("BBox")
+            .map(|o| self.resolve_plain(o))
+            .and_then(|o| o.as_array().ok().and_then(Self::parse_shading_bbox_array));
+
         Some(ShadingDef {
             kind: ShadingKind::Mesh { triangles },
             lut: vec![mean],
             extend_start: false,
             extend_end: false,
             to_page,
+            bbox,
         })
     }
 
@@ -4531,10 +4623,6 @@ impl<'a> ContentInterpreter<'a> {
                 tracing::debug!("Type 3 shading {name} not found in resources");
                 return;
             };
-            let region = self.shading_region();
-            if region.width() <= 0.0 || region.height() <= 0.0 {
-                return;
-            }
             let Some(def) = self.build_type3_shading(&t3_shading, self.current.ctm) else {
                 self.stats.diagnostics.unsupported_features = self
                     .stats
@@ -4543,6 +4631,51 @@ impl<'a> ContentInterpreter<'a> {
                     .saturating_add(1);
                 return;
             };
+            let mut region = if self.current.clip_bounds.is_some() {
+                self.shading_region()
+            } else if let Some(sb) = def.bbox {
+                if sb.width() <= 0.0 || sb.height() <= 0.0 {
+                    return;
+                }
+                let mut bbox_path = Path::new();
+                bbox_path.rect(sb);
+                let mapped = bbox_path.map_points(|p| p.transform(&def.to_page));
+                Self::path_bounds(&mapped).unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0))
+            } else if let Some(fb) = def.finite_geometry_bounds() {
+                fb
+            } else if self.type3_glyph_bounds_known {
+                self.shading_region()
+            } else if let Some(dest) = self.type3_fallback_bounds {
+                self.stats.type3_used_dest_bounds = true;
+                dest
+            } else {
+                let base = self.display_list.page_rect.normalize();
+                match def.coords_bounds() {
+                    Some(cb) => Rect::new(
+                        base.x0.min(cb.x0),
+                        base.y0.min(cb.y0),
+                        base.x1.max(cb.x1),
+                        base.y1.max(cb.y1),
+                    ),
+                    None => base,
+                }
+            };
+            if self.current.clip_bounds.is_some() || def.bbox.is_some() {
+                if let Some(fb) = def.finite_geometry_bounds() {
+                    let x0 = region.x0.max(fb.x0);
+                    let y0 = region.y0.max(fb.y0);
+                    let x1 = region.x1.min(fb.x1);
+                    let y1 = region.y1.min(fb.y1);
+                    region = if x1 > x0 && y1 > y0 {
+                        Rect::new(x0, y0, x1, y1)
+                    } else {
+                        Rect::new(0.0, 0.0, 0.0, 0.0)
+                    };
+                }
+            }
+            if region.width() <= 0.0 || region.height() <= 0.0 {
+                return;
+            }
             self.emit_shading_image(&def, region);
             return;
         }
@@ -4610,6 +4743,30 @@ impl<'a> ContentInterpreter<'a> {
         if self.skip_images || region.width() <= 0.0 || region.height() <= 0.0 {
             return false;
         }
+        // Honor optional shading dictionary `/BBox` (ISO 32000-1 Table 78) as
+        // a temporary clip in the shading's target coordinate system.
+        let mut region = region;
+        let mut bbox_clip_path: Option<Path> = None;
+        if let Some(sb) = def.bbox {
+            if sb.width() <= 0.0 || sb.height() <= 0.0 {
+                return true;
+            }
+            let mut p = Path::new();
+            p.rect(sb);
+            let mapped = p.map_points(|pt| pt.transform(&def.to_page));
+            let Some(bb) = Self::path_bounds(&mapped) else {
+                return true;
+            };
+            let x0 = region.x0.max(bb.x0);
+            let y0 = region.y0.max(bb.y0);
+            let x1 = region.x1.min(bb.x1);
+            let y1 = region.y1.min(bb.y1);
+            if x1 <= x0 || y1 <= y0 {
+                return true;
+            }
+            region = Rect::new(x0, y0, x1, y1);
+            bbox_clip_path = Some(mapped);
+        }
         let embed_inline = self.image_cache.is_none() && !self.active_type3_glyphs.is_empty();
         let m = self.shading_space_to_page;
         let page_w = (m.a * region.width()).hypot(m.b * region.width());
@@ -4662,13 +4819,35 @@ impl<'a> ContentInterpreter<'a> {
             region.y0,
         );
         if embed_inline {
+            if let Some(clip_path) = bbox_clip_path {
+                let mark = self.display_list.commands.len();
+                self.display_list.push(RenderCommand::PushClip {
+                    path: clip_path,
+                    rule: FillRule::NonZero,
+                });
+                if self.emit_draw_inline_image_at(image, transform).is_some() {
+                    self.display_list.push(RenderCommand::PopClip);
+                    return true;
+                }
+                self.display_list.truncate_commands(mark);
+                return false;
+            }
             return self.emit_draw_inline_image_at(image, transform).is_some();
         }
         let image = self.fit_image_to_footprint(image, &transform);
         let Some(image_id) = self.admit_image(image) else {
             return false;
         };
-        self.emit_image_draw(image_id, transform, false);
+        if let Some(clip_path) = bbox_clip_path {
+            self.display_list.push(RenderCommand::PushClip {
+                path: clip_path,
+                rule: FillRule::NonZero,
+            });
+            self.emit_image_draw(image_id, transform, false);
+            self.display_list.push(RenderCommand::PopClip);
+        } else {
+            self.emit_image_draw(image_id, transform, false);
+        }
         true
     }
 
@@ -14869,6 +15048,7 @@ mod tests {
             extend_start: false,
             extend_end: false,
             to_page: Matrix::identity(),
+            bbox: None,
         };
 
         let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 612.0, 792.0));

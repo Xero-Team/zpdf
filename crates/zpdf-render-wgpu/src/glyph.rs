@@ -419,14 +419,25 @@ fn render_type3(
         let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
             continue;
         };
-        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream_in_rect(
+        let glyph_to_page = type3_glyph_to_page(tm, (g.x, g.y), font_size, h_scale, &font_matrix);
+        let font_bbox = font.type3_font_bbox();
+        let fallback_bounds = font_bbox
+            .is_none()
+            .then(|| {
+                zpdf_content::interpreter::ContentInterpreter::inverse_map_rect(
+                    map.page_rect,
+                    &glyph_to_page,
+                )
+            })
+            .flatten();
+        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream_with_bbox(
             stream,
             font.type3_resources(),
-            font.type3_glyph_rect(),
+            font_bbox,
+            fallback_bounds,
         ) else {
             return;
         };
-        let glyph_to_page = type3_glyph_to_page(tm, (g.x, g.y), font_size, h_scale, &font_matrix);
         let mut glyph_clip_depth = 0usize;
         let mut glyph_blend_depth = 0usize;
 
@@ -736,14 +747,25 @@ pub fn render_type3_tiling_transformed(
         let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
             continue;
         };
-        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream_in_rect(
+        let glyph_to_page = type3_glyph_to_page(&tm, (g.x, g.y), font_size, h_scale, &font_matrix);
+        let font_bbox = font.type3_font_bbox();
+        let fallback_bounds = font_bbox
+            .is_none()
+            .then(|| {
+                zpdf_content::interpreter::ContentInterpreter::inverse_map_rect(
+                    map.page_rect,
+                    &glyph_to_page,
+                )
+            })
+            .flatten();
+        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream_with_bbox(
             stream,
             font.type3_resources(),
-            font.type3_glyph_rect(),
+            font_bbox,
+            fallback_bounds,
         ) else {
             return;
         };
-        let glyph_to_page = type3_glyph_to_page(&tm, (g.x, g.y), font_size, h_scale, &font_matrix);
         let mut glyph_clip_depth = 0usize;
         let mut glyph_blend_depth = 0usize;
 
@@ -1165,7 +1187,7 @@ mod tests {
     use super::*;
 
     fn map(scale: f32, y1: f32) -> PageMap {
-        PageMap { scale, x0: 0.0, y1 }
+        PageMap::new(zpdf_core::Rect::new(0.0, 0.0, 1000.0, y1 as f64), scale)
     }
 
     #[test]
@@ -1308,11 +1330,7 @@ mod tests {
         let x = GlyphXform {
             upem: 1000.0,
             font_size: 10.0,
-            map: PageMap {
-                scale: 2.0,
-                x0: 20.0,
-                y1: 110.0,
-            },
+            map: PageMap::new(zpdf_core::Rect::new(20.0, 10.0, 120.0, 110.0), 2.0),
             h_scale: 1.0,
         };
         let tm = Matrix {

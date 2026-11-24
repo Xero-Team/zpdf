@@ -23,6 +23,10 @@ pub struct ShadingDef {
     /// Maps shading space to page space (CTM for `sh`, pattern /Matrix for
     /// shading patterns).
     pub to_page: Matrix,
+    /// Optional `/BBox` from the shading dictionary (ISO 32000-1 Table 78),
+    /// in the shading's own coordinate space (mapped by `to_page` when
+    /// painted as a temporary clipping boundary).
+    pub bbox: Option<Rect>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +79,127 @@ impl ShadingDef {
         std::mem::size_of::<Self>()
             + self.lut.len() * std::mem::size_of::<[f32; 3]>()
             + triangles * std::mem::size_of::<MeshTriangle>()
+    }
+
+    fn transform_rect_bounds(r: Rect, m: &Matrix) -> Option<Rect> {
+        let r = r.normalize();
+        let corners = [
+            zpdf_core::Point::new(r.x0, r.y0).transform(m),
+            zpdf_core::Point::new(r.x1, r.y0).transform(m),
+            zpdf_core::Point::new(r.x0, r.y1).transform(m),
+            zpdf_core::Point::new(r.x1, r.y1).transform(m),
+        ];
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for c in corners {
+            if !c.x.is_finite() || !c.y.is_finite() {
+                return None;
+            }
+            x0 = x0.min(c.x);
+            y0 = y0.min(c.y);
+            x1 = x1.max(c.x);
+            y1 = y1.max(c.y);
+        }
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1, y1))
+    }
+
+    /// Finite page/glyph-space bounding box of this shading when its geometry
+    /// alone is strictly bounded (non-extended radial shading or mesh), padded
+    /// slightly so texture edge clamping keeps a transparent outer border.
+    /// Returns `None` for unbounded shadings (axial or extended radial).
+    pub fn finite_geometry_bounds(&self) -> Option<Rect> {
+        let raw = match &self.kind {
+            ShadingKind::Radial {
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+            } if !self.extend_start && !self.extend_end => {
+                if ![*x0, *y0, *r0, *x1, *y1, *r1].iter().all(|v| v.is_finite())
+                    || *r0 < 0.0
+                    || *r1 < 0.0
+                {
+                    return None;
+                }
+                let local = Rect::new(
+                    (x0 - r0).min(x1 - r1),
+                    (y0 - r0).min(y1 - r1),
+                    (x0 + r0).max(x1 + r1),
+                    (y0 + r0).max(y1 + r1),
+                );
+                Self::transform_rect_bounds(local, &self.to_page)?
+            }
+            ShadingKind::Mesh { triangles } => {
+                let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+                let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for tri in triangles {
+                    for v in &tri.v {
+                        let (vx, vy) = (v.x as f64, v.y as f64);
+                        if vx.is_finite() && vy.is_finite() {
+                            x0 = x0.min(vx);
+                            y0 = y0.min(vy);
+                            x1 = x1.max(vx);
+                            y1 = y1.max(vy);
+                        }
+                    }
+                }
+                (x0.is_finite() && y0.is_finite() && x1 > x0 && y1 > y0)
+                    .then(|| Rect::new(x0, y0, x1, y1))?
+            }
+            _ => return None,
+        };
+        let pad = (raw.width().max(raw.height()) * 0.02).max(1e-3);
+        Some(Rect::new(
+            raw.x0 - pad,
+            raw.y0 - pad,
+            raw.x1 + pad,
+            raw.y1 + pad,
+        ))
+    }
+
+    /// Bounding box of the shading's declared control coordinates mapped by
+    /// `to_page` (useful to expand fallback extents when an unclipped extended
+    /// shading has unknown glyph bounds).
+    pub fn coords_bounds(&self) -> Option<Rect> {
+        match &self.kind {
+            ShadingKind::Axial { x0, y0, x1, y1 } => {
+                if ![*x0, *y0, *x1, *y1].iter().all(|v| v.is_finite()) {
+                    return None;
+                }
+                let p0 = zpdf_core::Point::new(*x0, *y0).transform(&self.to_page);
+                let p1 = zpdf_core::Point::new(*x1, *y1).transform(&self.to_page);
+                if !(p0.x.is_finite() && p0.y.is_finite() && p1.x.is_finite() && p1.y.is_finite()) {
+                    return None;
+                }
+                Some(Rect::new(
+                    p0.x.min(p1.x),
+                    p0.y.min(p1.y),
+                    p0.x.max(p1.x),
+                    p0.y.max(p1.y),
+                ))
+            }
+            ShadingKind::Radial {
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+            } => {
+                let r0 = r0.abs();
+                let r1 = r1.abs();
+                let local = Rect::new(
+                    (x0 - r0).min(x1 - r1),
+                    (y0 - r0).min(y1 - r1),
+                    (x0 + r0).max(x1 + r1),
+                    (y0 + r0).max(y1 + r1),
+                );
+                Self::transform_rect_bounds(local, &self.to_page)
+            }
+            ShadingKind::Mesh { .. } => self.finite_geometry_bounds(),
+        }
     }
 
     /// Mean LUT color — used as the solid approximation for shading-pattern
@@ -362,6 +487,7 @@ mod tests {
             extend_start: extend.0,
             extend_end: extend.1,
             to_page: Matrix::identity(),
+            bbox: None,
         }
     }
 
@@ -484,6 +610,7 @@ mod tests {
             extend_start: false,
             extend_end: false,
             to_page: Matrix::identity(),
+            bbox: None,
         };
         let buf = rasterize(&def, Rect::new(0.0, 0.0, 1.0, 1.0), 4, 4).unwrap();
         // Bottom-left pixel (page near (0,0)) sits by the red corner: opaque & red-dominant.
@@ -527,6 +654,7 @@ mod tests {
             extend_start: false,
             extend_end: false,
             to_page: Matrix::identity(),
+            bbox: None,
         };
         assert!(rasterize(&def, Rect::new(0.0, 0.0, 1.0, 1.0), 16, 16).is_none());
     }

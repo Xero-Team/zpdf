@@ -220,7 +220,142 @@ impl DisplayList {
         for cmd in &self.commands {
             bytes = bytes.saturating_add(cmd.owned_heap_bytes());
         }
+        for expanded in &self.expanded_glyph_runs {
+            bytes = bytes.saturating_add(
+                (expanded.run.glyphs.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<PositionedGlyph>() as u64),
+            );
+        }
         bytes
+    }
+}
+
+/// Deduplication state tracking ref-counted allocations currently retained by a
+/// renderer or exporter's soft-mask cache (`DisplayList`, `TilingPattern`,
+/// `InlineImage`, and transfer-LUT allocations tracked independently by their
+/// allocation identities).
+#[derive(Debug, Default, Clone)]
+pub struct RetainedMaskAccounting {
+    display_list_ptrs: std::collections::HashSet<usize>,
+    tiling_ptrs: std::collections::HashSet<usize>,
+    inline_image_ptrs: std::collections::HashSet<usize>,
+    transfer_ptrs: std::collections::HashSet<usize>,
+}
+
+/// Incremental retention delta computed for admitting a `DisplayList` (or
+/// `SoftMask`) into a cache without mutating [`RetainedMaskAccounting`] until
+/// admission succeeds.
+#[derive(Debug, Default)]
+pub struct RetainedMaskDelta {
+    pub added_bytes: u64,
+    new_display_lists: Vec<usize>,
+    new_tilings: Vec<usize>,
+    new_inline_images: Vec<usize>,
+    new_transfers: Vec<usize>,
+}
+
+impl RetainedMaskAccounting {
+    pub fn clear(&mut self) {
+        self.display_list_ptrs.clear();
+        self.tiling_ptrs.clear();
+        self.inline_image_ptrs.clear();
+        self.transfer_ptrs.clear();
+    }
+
+    pub fn commit(&mut self, delta: RetainedMaskDelta) {
+        self.display_list_ptrs.extend(delta.new_display_lists);
+        self.tiling_ptrs.extend(delta.new_tilings);
+        self.inline_image_ptrs.extend(delta.new_inline_images);
+        self.transfer_ptrs.extend(delta.new_transfers);
+    }
+
+    /// Estimate newly-retained heap bytes reachable from `root` (following all
+    /// nested `SoftMask` lists, `Paint::Tiling` pattern objects and their cell
+    /// display lists, and `DrawInlineImage` pixel buffers) via an iterative
+    /// visited-set DAG worklist with no nesting cutoff. Every distinct
+    /// `TilingPattern` allocation is charged separately from its shared cell
+    /// `DisplayList`, and every reachable allocation is charged at most once.
+    pub fn delta_for_display_list(&self, root: &std::sync::Arc<DisplayList>) -> RetainedMaskDelta {
+        let mut delta = RetainedMaskDelta::default();
+        let mut seen_dls = std::collections::HashSet::new();
+        let mut seen_tilings = std::collections::HashSet::new();
+        let mut seen_inlines = std::collections::HashSet::new();
+        let mut seen_transfers = std::collections::HashSet::new();
+        let mut stack: Vec<&DisplayList> = vec![root.as_ref()];
+
+        while let Some(dl) = stack.pop() {
+            let dl_ptr = dl as *const DisplayList as usize;
+            if !seen_dls.insert(dl_ptr) {
+                continue;
+            }
+            if !self.display_list_ptrs.contains(&dl_ptr) {
+                delta.added_bytes = delta.added_bytes.saturating_add(dl.owned_heap_bytes());
+                delta.new_display_lists.push(dl_ptr);
+            }
+            for cmd in &dl.commands {
+                match cmd {
+                    RenderCommand::DrawInlineImage(draw) => {
+                        let ptr = std::sync::Arc::as_ptr(&draw.image) as usize;
+                        if seen_inlines.insert(ptr) && !self.inline_image_ptrs.contains(&ptr) {
+                            let img_bytes = (draw.image.data.len() as u64)
+                                .saturating_add(std::mem::size_of::<InlineImage>() as u64);
+                            delta.added_bytes = delta.added_bytes.saturating_add(img_bytes);
+                            delta.new_inline_images.push(ptr);
+                        }
+                    }
+                    RenderCommand::PushBlendGroup {
+                        mask: Some(sub), ..
+                    } => {
+                        if let Some(tr) = &sub.transfer {
+                            let tr_ptr = std::sync::Arc::as_ptr(tr) as usize;
+                            if seen_transfers.insert(tr_ptr)
+                                && !self.transfer_ptrs.contains(&tr_ptr)
+                            {
+                                delta.added_bytes = delta.added_bytes.saturating_add(256);
+                                delta.new_transfers.push(tr_ptr);
+                            }
+                        }
+                        stack.push(sub.commands.as_ref());
+                    }
+                    RenderCommand::FillPath {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }
+                    | RenderCommand::StrokePath {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }
+                    | RenderCommand::DrawGlyphRun(GlyphRun {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }) => {
+                        let t_ptr = std::sync::Arc::as_ptr(tiling) as usize;
+                        if seen_tilings.insert(t_ptr) && !self.tiling_ptrs.contains(&t_ptr) {
+                            delta.added_bytes = delta
+                                .added_bytes
+                                .saturating_add(std::mem::size_of::<TilingPattern>() as u64);
+                            delta.new_tilings.push(t_ptr);
+                        }
+                        stack.push(tiling.commands.as_ref());
+                    }
+                    _ => {}
+                }
+            }
+            for expanded in &dl.expanded_glyph_runs {
+                if let Paint::Tiling(tiling) = &expanded.run.paint {
+                    let t_ptr = std::sync::Arc::as_ptr(tiling) as usize;
+                    if seen_tilings.insert(t_ptr) && !self.tiling_ptrs.contains(&t_ptr) {
+                        delta.added_bytes =
+                            delta
+                                .added_bytes
+                                .saturating_add(std::mem::size_of::<TilingPattern>() as u64);
+                        delta.new_tilings.push(t_ptr);
+                    }
+                    stack.push(tiling.commands.as_ref());
+                }
+            }
+        }
+        delta
     }
 }
 
@@ -3215,5 +3350,138 @@ mod tiling_backdrop_tests {
         };
         let first_pt = path.points().first().expect("translated point");
         assert!((first_pt.x - 15.0).abs() < 1e-6 && (first_pt.y - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn retained_mask_accounting_counts_oversized_descendant_beyond_depth_16() {
+        let leaf_img = Arc::new(InlineImage {
+            width: 32,
+            height: 64,
+            data: vec![255u8; 32 * 64 * 4],
+            has_alpha: true,
+            is_image_mask: false,
+            premultiplied: true,
+        });
+        let mut current = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        current.push(RenderCommand::DrawInlineImage(InlineImageDraw {
+            image: Arc::clone(&leaf_img),
+            transform: Matrix::new(20.0, 0.0, 0.0, 20.0, 0.0, 0.0),
+            alpha: 1.0,
+        }));
+        let mut current = Arc::new(current);
+        for _ in 0..20 {
+            let mut parent = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+            parent.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+                alpha: 1.0,
+                mask: Some(SoftMask {
+                    kind: SoftMaskKind::Luminosity,
+                    commands: Arc::clone(&current),
+                    offset: (0.0, 0.0),
+                    backdrop_luma: 0.0,
+                    transfer: None,
+                }),
+            });
+            parent.push(RenderCommand::PopBlendGroup);
+            current = Arc::new(parent);
+        }
+
+        let mut accounting = RetainedMaskAccounting::default();
+        let delta = accounting.delta_for_display_list(&current);
+        assert!(
+            delta.added_bytes >= 8_192,
+            "deeply nested 8 KB inline image at depth 20 must be counted, got {} bytes",
+            delta.added_bytes
+        );
+        accounting.commit(delta);
+        let repeat = accounting.delta_for_display_list(&current);
+        assert_eq!(repeat.added_bytes, 0);
+    }
+
+    #[test]
+    fn retained_mask_accounting_distinguishes_tiling_patterns_sharing_one_cell() {
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let cell_arc = Arc::new(cell);
+        let cell_bytes = cell_arc.owned_heap_bytes();
+        let tiling_struct_bytes = std::mem::size_of::<TilingPattern>() as u64;
+
+        let t1 = Arc::new(TilingPattern {
+            commands: Arc::clone(&cell_arc),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+        let t2 = Arc::new(TilingPattern {
+            commands: Arc::clone(&cell_arc),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::translate(5.0, 5.0),
+            tiling_type: 1,
+        });
+
+        let mut same_dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        same_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&t1)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        same_dl.push(RenderCommand::FillPath {
+            path: rect_path(10.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&t1)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let same_outer = same_dl.owned_heap_bytes();
+        let same_arc = Arc::new(same_dl);
+
+        let mut distinct_dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        distinct_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&t1)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        distinct_dl.push(RenderCommand::FillPath {
+            path: rect_path(10.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&t2)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let distinct_outer = distinct_dl.owned_heap_bytes();
+        let distinct_arc = Arc::new(distinct_dl);
+
+        let acct_same = RetainedMaskAccounting::default();
+        let d_same = acct_same.delta_for_display_list(&same_arc);
+        assert_eq!(
+            d_same.added_bytes,
+            same_outer + tiling_struct_bytes + cell_bytes,
+            "two references to one Arc<TilingPattern> must charge one pattern + one cell"
+        );
+
+        let acct_distinct = RetainedMaskAccounting::default();
+        let d_distinct = acct_distinct.delta_for_display_list(&distinct_arc);
+        assert_eq!(
+            d_distinct.added_bytes,
+            distinct_outer + 2 * tiling_struct_bytes + cell_bytes,
+            "two distinct Arc<TilingPattern> objects sharing one cell must charge both patterns + one cell"
+        );
     }
 }
