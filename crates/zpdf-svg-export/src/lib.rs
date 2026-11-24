@@ -2652,7 +2652,10 @@ impl<'a> SvgWriter<'a> {
         off: (f32, f32),
     ) -> bool {
         d.push(verb);
-        for &(gx, gy) in points {
+        for (i, &(gx, gy)) in points.iter().enumerate() {
+            if i > 0 {
+                d.push(' ');
+            }
             // font units → text space; the shape x carries Th (Tz/100), the
             // offset already includes it (accumulated advance).
             let tx = gx / upem * run.font_size as f64 * run.h_scale as f64 + off.0 as f64;
