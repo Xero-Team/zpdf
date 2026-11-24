@@ -129,3 +129,73 @@ fn rich_image_budget_exhaustion_does_not_drop_text() {
     assert!(converted.pages[0].images.is_empty());
     assert!(converted.pages[0].diagnostics.resource_limit_reached);
 }
+
+#[test]
+fn text_only_conversion_skips_type3_inline_bitmaps_under_zero_image_budget() {
+    // Type 3 glyph `/A` paints an inline `/ImageMask true` bitmap stencil.
+    // In `ConversionMode::TextOnly` (the default), `convert_pdf` must skip
+    // bitmap decoding entirely so a zero image budget still extracts "A"
+    // completely without raising `resource_limit_reached`.
+    let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
+        800 0 0 800 0 0 cm\n\
+        BI /IM true /W 4 /H 4 /BPC 1 ID "
+        .to_vec();
+    glyph_bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    glyph_bytes.extend_from_slice(b"\nEI");
+
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 10 40 Td (A) Tj ET"),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(),
+        b"<< /A 8 0 R >>".to_vec(),
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(),
+        stream("", &glyph_bytes),
+    ];
+
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let limits = zpdf::ParseLimits {
+        max_image_cache_bytes: 0,
+        ..zpdf::ParseLimits::default()
+    };
+    let doc = PdfDocument::open_with_limits(pdf, limits).expect("open pdf");
+    let converted = convert_pdf(&doc, &[0], ConversionOptions::default()).expect("convert");
+
+    assert_eq!(converted.pages[0].text, "A");
+    assert!(converted.pages[0].images.is_empty());
+    assert!(
+        !converted.pages[0].diagnostics.resource_limit_reached,
+        "text-only conversion must skip Type 3 inline bitmaps without triggering image budget diagnostics"
+    );
+    assert!(
+        converted.is_complete(),
+        "text-only conversion with bitmap Type 3 glyph must stay complete under max_image_cache_bytes=0"
+    );
+}

@@ -3563,6 +3563,12 @@ pub enum CompanionSource {
         form_id: zpdf_core::ObjectId,
         font_name: String,
     },
+    /// Inline font dictionary directly inside an indirect `/Resources`
+    /// dictionary's `/Font` subdictionary.
+    ResourcesInlineFont {
+        resources_id: zpdf_core::ObjectId,
+        font_name: String,
+    },
     /// No external reload source (e.g. direct `FontCache` caller or inline Form).
     None,
 }
@@ -3719,6 +3725,12 @@ pub enum Type3Source {
         owner_id: zpdf_core::ObjectId,
         font_name: String,
     },
+    /// Inline Type 3 font dictionary located directly under `/Font /<name>` of
+    /// an indirect `/Resources` dictionary object.
+    ResourcesInlineFont {
+        resources_id: zpdf_core::ObjectId,
+        font_name: String,
+    },
     /// Inline Type 3 font dictionary without an indirect container object;
     /// retained only when its estimated byte size fits in the font cache
     /// budget and accounted for in [`FontCache::bytes_used`].
@@ -3828,6 +3840,32 @@ impl FontCache {
             id,
             Type3Source::ContainerInlineFont {
                 owner_id,
+                font_name,
+            },
+        );
+    }
+
+    /// Record a lightweight reload reference for an inline Type 3 font located
+    /// directly under `/Font /<name>` of an indirect `/Resources` dictionary.
+    /// Skips metrics-only Type 3 entries and never overwrites an existing
+    /// source binding for `id`.
+    #[doc(hidden)]
+    pub fn record_type3_resources_source(
+        &mut self,
+        id: FontId,
+        resources_id: zpdf_core::ObjectId,
+        font_name: String,
+    ) {
+        if self.type3_sources.contains_key(&id) {
+            return;
+        }
+        if !self.fonts.get(&id).is_some_and(|f| f.has_type3_programs()) {
+            return;
+        }
+        self.type3_sources.insert(
+            id,
+            Type3Source::ResourcesInlineFont {
+                resources_id,
                 font_name,
             },
         );

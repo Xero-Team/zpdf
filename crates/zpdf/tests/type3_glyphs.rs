@@ -1217,6 +1217,106 @@ fn type3_d1_bitmap_stencil_paints_with_colored_tiling_pattern() {
 }
 
 #[test]
+fn type3_d1_bitmap_stencil_paints_with_shading_pattern() {
+    // PatternType 2 axial shading: red (x=0) -> blue (x=80).
+    let shading_pattern = b"<< /Type /Pattern /PatternType 2 \
+        /Shading << /ShadingType 2 /ColorSpace /DeviceRGB \
+          /Coords [0 0 80 0] /Extend [true true] \
+          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>"
+        .to_vec();
+    // 4x2 1-bpc /ImageMask true stencil:
+    //   Row 0 (top half, pdf_y in [40..80]):    0 0 0 0 -> 0x00 (all painted)
+    //   Row 1 (bottom half, pdf_y in [0..40]):  0 1 1 0 -> 0x60 (outer painted, middle transparent)
+    let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
+        1000 0 0 1000 0 0 cm\n\
+        BI /IM true /W 4 /H 2 /BPC 1 ID "
+        .to_vec();
+    glyph_bytes.extend_from_slice(&[0x00, 0x60]);
+    glyph_bytes.extend_from_slice(b"\nEI");
+
+    let content = b"/Pattern cs /P1 scn\nBT /F1 80 Tf 0 0 Td (A) Tj ET";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 80] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 9 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", content),                       // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                    // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        stream_obj("", &glyph_bytes),                  // 8
+        shading_pattern,                               // 9
+    ]);
+
+    for use_image_cache in [true, false] {
+        let doc = PdfDocument::open(pdf.clone()).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+        let mut images = ImageCache::new();
+        let dl = if use_image_cache {
+            ContentInterpreter::new(page.media_box)
+                .with_fonts(&mut fonts)
+                .with_document(doc.file(), &page.resources)
+                .with_images(&mut images)
+                .interpret(&content_bytes)
+        } else {
+            ContentInterpreter::new(page.media_box)
+                .with_fonts(&mut fonts)
+                .with_document(doc.file(), &page.resources)
+                .interpret(&content_bytes)
+        };
+        let rendered = if use_image_cache {
+            zpdf::cpu::CpuRenderer::new()
+                .with_fonts(&fonts)
+                .with_images(&images)
+                .render_display_list(&dl, 1.0)
+                .expect("cpu render")
+        } else {
+            zpdf::cpu::CpuRenderer::new()
+                .with_fonts(&fonts)
+                .render_display_list(&dl, 1.0)
+                .expect("cpu render")
+        };
+
+        let left_top = px(&rendered, 5, 70);
+        assert!(
+            left_top[0] > 200 && left_top[2] < 60,
+            "left stencil pixel must paint red side of shading gradient (cache={use_image_cache}), got {left_top:?}"
+        );
+        let right_top = px(&rendered, 75, 70);
+        assert!(
+            right_top[2] > 200 && right_top[0] < 60,
+            "right stencil pixel must paint blue side of shading gradient (cache={use_image_cache}), got {right_top:?}"
+        );
+        let left_bot = px(&rendered, 5, 10);
+        assert!(
+            left_bot[0] > 200 && left_bot[2] < 60,
+            "bottom-left painted stencil pixel must keep red gradient (cache={use_image_cache}), got {left_bot:?}"
+        );
+        assert_eq!(
+            px(&rendered, 35, 10),
+            [255, 255, 255],
+            "transparent middle stencil pixel must stay white (cache={use_image_cache})"
+        );
+        assert_eq!(
+            px(&rendered, 45, 10),
+            [255, 255, 255],
+            "transparent middle stencil pixel must stay white (cache={use_image_cache})"
+        );
+        let right_bot = px(&rendered, 75, 10);
+        assert!(
+            right_bot[2] > 200 && right_bot[0] < 60,
+            "bottom-right painted stencil pixel must keep blue gradient (cache={use_image_cache}), got {right_bot:?}"
+        );
+    }
+}
+
+#[test]
 fn type3_inline_font_in_form_reloads_from_container_under_small_budget() {
     // Indirect Form XObject contains an INLINE Type 3 font dictionary with a
     // large padding entry and a `/Resources << /XObject << /FmInner 7 0 R >> >>`.

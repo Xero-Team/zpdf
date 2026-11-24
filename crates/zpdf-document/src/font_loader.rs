@@ -320,6 +320,29 @@ pub fn load_embedded_companion_form_inline(
     load_embedded_companion_dict(file, font_dict, max_bytes)
 }
 
+/// Reload only the parseable embedded companion font for an inline font
+/// dictionary stored directly under `/Font /<name>` of an indirect
+/// `/Resources` dictionary object when its decoded font stream fits within
+/// `max_bytes`.
+#[doc(hidden)]
+pub fn load_embedded_companion_resources_inline(
+    file: &PdfFile,
+    resources_id: ObjectId,
+    font_name: &str,
+    max_bytes: u64,
+) -> Option<LoadedFont> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let res_obj = file.resolve(resources_id).ok()?;
+    let res_dict = res_obj.as_dict().ok()?;
+    let fonts = resolve_dict(file, res_dict, "Font")?;
+    let PdfObject::Dict(font_dict) = fonts.get(font_name)? else {
+        return None;
+    };
+    load_embedded_companion_dict(file, font_dict, max_bytes)
+}
+
 /// Reload only the parseable embedded companion font for a font dictionary
 /// when its decoded font stream fits within `max_bytes`.
 #[doc(hidden)]

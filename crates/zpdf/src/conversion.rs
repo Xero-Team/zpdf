@@ -170,6 +170,8 @@ pub fn convert_pdf(
                 .with_colors(&mut icc_cache)
                 .with_images(&mut images)
                 .with_image_cache_limit(remaining_image_bytes);
+        } else {
+            interpreter = interpreter.with_skip_images(true);
         }
         if let Some(oc) = &oc_config {
             interpreter = interpreter.with_optional_content(oc);

@@ -170,6 +170,7 @@ pub fn display_list_to_slide(
         options,
         elements: Vec::new(),
         image_counter: 0,
+        clip_stack: Vec::new(),
     };
 
     converter.convert_display_list(display_list)?;
@@ -189,6 +190,7 @@ struct SlideConverter<'a> {
     options: &'a ConversionOptions,
     elements: Vec<SlideElement>,
     image_counter: usize,
+    clip_stack: Vec<RenderCommand>,
 }
 
 impl<'a> SlideConverter<'a> {
@@ -211,15 +213,153 @@ impl<'a> SlideConverter<'a> {
                 }
             }
             if let Some(end) = skipped_to {
+                for cmd in &commands[cmd_idx..end] {
+                    self.track_clip(cmd);
+                }
                 cmd_idx = end;
                 continue;
             }
             if cmd_idx >= commands.len() {
                 break;
             }
+            if let RenderCommand::PushBlendGroup {
+                mask: Some(mask),
+                bounds,
+                ..
+            } = &commands[cmd_idx]
+            {
+                if let Some(end_idx) = Self::find_matching_pop_blend(commands, cmd_idx) {
+                    let has_glyph_run = commands[cmd_idx + 1..end_idx]
+                        .iter()
+                        .any(|c| matches!(c, RenderCommand::DrawGlyphRun(_)));
+                    let has_expanded = expanded[exp_idx..]
+                        .iter()
+                        .any(|e| e.cmd_start >= cmd_idx && e.cmd_start < end_idx);
+                    if !has_glyph_run && !has_expanded {
+                        self.flatten_masked_group(&commands[cmd_idx..=end_idx], mask, *bounds)?;
+                        for cmd in &commands[cmd_idx..=end_idx] {
+                            self.track_clip(cmd);
+                        }
+                        cmd_idx = end_idx + 1;
+                        continue;
+                    }
+                }
+            }
+            self.track_clip(&commands[cmd_idx]);
             self.convert_command(&commands[cmd_idx])?;
             cmd_idx += 1;
         }
+        Ok(())
+    }
+
+    fn track_clip(&mut self, cmd: &RenderCommand) {
+        match cmd {
+            RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                self.clip_stack.push(cmd.clone());
+            }
+            RenderCommand::PopClip => {
+                self.clip_stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn find_matching_pop_blend(commands: &[RenderCommand], push_idx: usize) -> Option<usize> {
+        let mut depth = 1usize;
+        for (idx, cmd) in commands.iter().enumerate().skip(push_idx + 1) {
+            match cmd {
+                RenderCommand::PushBlendGroup { .. } => depth += 1,
+                RenderCommand::PopBlendGroup => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Rasterize a soft-masked drawing group (for example, an unmapped Type 3
+    /// patterned `/ImageMask` logo) onto a transparent bitmap so the mask
+    /// coverage and transparent holes survive PowerPoint export.
+    fn flatten_masked_group(
+        &mut self,
+        group_cmds: &[RenderCommand],
+        mask: &zpdf_display_list::SoftMask,
+        group_bounds: Rect,
+    ) -> Result<()> {
+        use zpdf_display_list::SoftMaskKind;
+        use zpdf_render::{PageRenderInfo, RenderBackend};
+
+        let raw_bounds = if mask.kind == SoftMaskKind::Alpha && mask.transfer.is_none() {
+            if mask.commands.commands.is_empty() {
+                return Ok(());
+            }
+            compute_commands_bounds(&mask.commands.commands, mask.offset)
+                .map(|r| Rect::new(r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0))
+                .unwrap_or(group_bounds)
+        } else {
+            compute_commands_bounds(group_cmds, (0.0, 0.0))
+                .map(|r| Rect::new(r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0))
+                .unwrap_or(group_bounds)
+        };
+        let Some(crop_rect) = intersect_rect(raw_bounds, self.page_rect) else {
+            return Ok(());
+        };
+        let max_dim = crop_rect.width().max(crop_rect.height());
+        let scale = (2.0_f64).min(2048.0 / max_dim.max(1.0)).max(0.25) as f32;
+
+        let mut renderer = zpdf_render_cpu::CpuRenderer::new()
+            .with_fonts(self.font_cache)
+            .with_images(self.image_cache);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: crop_rect,
+                scale,
+                background: zpdf_display_list::Color::rgba(0.0, 0.0, 0.0, 0.0),
+            })
+            .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
+        for clip in &self.clip_stack {
+            renderer
+                .execute(clip)
+                .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
+        }
+        for cmd in group_cmds {
+            renderer
+                .execute(cmd)
+                .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
+        }
+        for _ in 0..self.clip_stack.len() {
+            renderer
+                .execute(&RenderCommand::PopClip)
+                .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
+        }
+        let mut rendered = renderer
+            .end_page()
+            .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
+
+        if rendered.data.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
+            return Ok(());
+        }
+        // `CpuRenderer` produces premultiplied RGBA8; PNG expects straight RGBA8.
+        unpremultiply_rgba(&mut rendered.data);
+        let png_data = rgba_to_png(rendered.width, rendered.height, &rendered.data)?;
+
+        self.image_counter += 1;
+        let image_id = format!("image{}", self.image_counter);
+        let (x_ppt, y_ppt) = self.pdf_to_ppt_coords(crop_rect.x0, crop_rect.y1);
+        let width_ppt = rendered.width as f64 / scale as f64;
+        let height_ppt = rendered.height as f64 / scale as f64;
+        self.elements.push(SlideElement::Image {
+            x_emu: pt_to_emu(x_ppt),
+            y_emu: pt_to_emu(y_ppt),
+            width_emu: pt_to_emu(width_ppt),
+            height_emu: pt_to_emu(height_ppt),
+            image_data: png_data,
+            image_id,
+        });
         Ok(())
     }
 
@@ -584,6 +724,80 @@ impl<'a> SlideConverter<'a> {
 /// 1 inch = 72 points = 914400 EMUs
 fn pt_to_emu(pt: f64) -> i64 {
     (pt * 12700.0) as i64
+}
+
+fn compute_commands_bounds(commands: &[RenderCommand], offset: (f32, f32)) -> Option<Rect> {
+    let mut x0 = f64::INFINITY;
+    let mut y0 = f64::INFINITY;
+    let mut x1 = f64::NEG_INFINITY;
+    let mut y1 = f64::NEG_INFINITY;
+    let dx = offset.0 as f64;
+    let dy = offset.1 as f64;
+    let mut include_pt = |x: f64, y: f64| {
+        if x.is_finite() && y.is_finite() {
+            x0 = x0.min(x + dx);
+            y0 = y0.min(y + dy);
+            x1 = x1.max(x + dx);
+            y1 = y1.max(y + dy);
+        }
+    };
+    for cmd in commands {
+        match cmd {
+            RenderCommand::DrawImage(d) => {
+                for &(u, v) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                    let p = zpdf_core::Point::new(u, v).transform(&d.transform);
+                    include_pt(p.x, p.y);
+                }
+            }
+            RenderCommand::DrawInlineImage(d) => {
+                for &(u, v) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                    let p = zpdf_core::Point::new(u, v).transform(&d.transform);
+                    include_pt(p.x, p.y);
+                }
+            }
+            RenderCommand::FillPath { path, .. } => {
+                for p in path.points() {
+                    include_pt(p.x, p.y);
+                }
+            }
+            RenderCommand::StrokePath { path, style, .. } => {
+                let grow = (style.width.max(1.0) as f64 * 0.5).max(0.5);
+                for p in path.points() {
+                    include_pt(p.x - grow, p.y - grow);
+                    include_pt(p.x + grow, p.y + grow);
+                }
+            }
+            _ => {}
+        }
+    }
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() && x1 > x0 && y1 > y0)
+        .then(|| Rect::new(x0, y0, x1, y1))
+}
+
+fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let a = a.normalize();
+    let b = b.normalize();
+    let x0 = a.x0.max(b.x0);
+    let y0 = a.y0.max(b.y0);
+    let x1 = a.x1.min(b.x1);
+    let y1 = a.y1.min(b.y1);
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() && x1 > x0 && y1 > y0)
+        .then(|| Rect::new(x0, y0, x1, y1))
+}
+
+fn unpremultiply_rgba(data: &mut [u8]) {
+    for px in data.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        if a == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        } else if a < 255 {
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
 }
 
 /// Convert RGBA8 pixels to PNG format
@@ -2133,28 +2347,40 @@ mod export_tests {
             pdf
         };
 
-        // /A and /C draw visible rectangles; /B wraps its only mark inside a
-        // disabled optional-content group (/LayerOff -> OCG 10).
+        // /A and /D draw visible rectangles; /B installs a glyph-local clip and
+        // puts its only fill inside a disabled BDC /OC group; /C invokes a Form
+        // XObject carrying its own disabled /OC entry.
         let glyph_visible = stream("", b"1000 0 d0 0 0 800 800 re f");
-        let glyph_hidden = stream("", b"1000 0 d0 /OC /LayerOff BDC 0 0 800 800 re f EMC");
+        let glyph_clipped_hidden = stream(
+            "",
+            b"1000 0 d0 0 0 800 800 re W n /OC /LayerOff BDC 0 0 800 800 re f EMC",
+        );
+        let glyph_xobj_oc_hidden = stream("", b"1000 0 d0 /FmHidden Do");
+        let form_oc_hidden = stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 1000 1000] /OC 11 0 R",
+            b"0 0 800 800 re f",
+        );
         let pdf = assemble(&[
             b"<< /Type /Catalog /Pages 2 0 R \
-              /OCProperties << /OCGs [10 0 R] /D << /BaseState /ON /OFF [10 0 R] >> >> >>"
+              /OCProperties << /OCGs [11 0 R] /D << /BaseState /ON /OFF [11 0 R] >> >> >>"
                 .to_vec(), // 1
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
-              /Resources << /Font << /F1 5 0 R >> /Properties << /LayerOff 10 0 R >> >> >>"
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> /Properties << /LayerOff 11 0 R >> \
+                            /XObject << /FmHidden 12 0 R >> >> >>"
                 .to_vec(), // 3
-            stream("", b"0 0 0 rg BT /F1 30 Tf 10 30 Td (ABC) Tj ET"), // 4
+            stream("", b"0 0 0 rg BT /F1 30 Tf 10 30 Td (ABCD) Tj ET"), // 4
             b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
               /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
-              /FirstChar 65 /LastChar 67 /Widths [1000 1000 1000] /Resources << >> >>"
+              /FirstChar 65 /LastChar 68 /Widths [1000 1000 1000 1000] /Resources << >> >>"
                 .to_vec(), // 5
-            b"<< /A 8 0 R /B 9 0 R /C 8 0 R >>".to_vec(),          // 6
-            b"<< /Type /Encoding /Differences [65 /A /B /C] >>".to_vec(), // 7
+            b"<< /A 8 0 R /B 9 0 R /C 10 0 R /D 8 0 R >>".to_vec(), // 6
+            b"<< /Type /Encoding /Differences [65 /A /B /C /D] >>".to_vec(), // 7
             glyph_visible,                                         // 8
-            glyph_hidden,                                          // 9
-            b"<< /Type /OCG /Name (Hidden) >>".to_vec(),           // 10
+            glyph_clipped_hidden,                                  // 9
+            glyph_xobj_oc_hidden,                                  // 10
+            b"<< /Type /OCG /Name (Hidden) >>".to_vec(),           // 11
+            form_oc_hidden,                                        // 12
         ]);
 
         let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
@@ -2189,14 +2415,129 @@ mod export_tests {
             .collect();
         assert_eq!(
             texts,
-            vec!["A", "C"],
-            "hidden glyph 'B' must not appear in exported PowerPoint text; got {:?}",
+            vec!["A", "D"],
+            "hidden glyphs 'B' (clipped BDC /OC) and 'C' (XObject /OC) must not appear in slide text; got {:?}",
             slide.elements
         );
         assert_eq!(
             slide.elements.len(),
             2,
             "no extra drawing shapes should be emitted for visible or hidden letters"
+        );
+    }
+
+    #[test]
+    fn type3_unmapped_patterned_stencil_logo_preserves_transparent_hole() {
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        // Colored tiling pattern: red left half [0..45], blue right half [45..90].
+        let pattern = stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+             /BBox [0 0 90 90] /XStep 90 /YStep 90 /Resources << >>",
+            b"1 0 0 rg 0 0 45 90 re f\n0 0 1 rg 45 0 45 90 re f",
+        );
+        // Unmapped /logo glyph: 4x4 ring /ImageMask true stencil (bit 0 = painted,
+        // bit 1 = transparent 2x2 center hole across rows 1..3, cols 1..3).
+        let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
+            1000 0 0 1000 0 0 cm\n\
+            BI /IM true /W 4 /H 4 /BPC 1 ID "
+            .to_vec();
+        glyph_bytes.extend_from_slice(&[0x00, 0x60, 0x60, 0x00]);
+        glyph_bytes.extend_from_slice(b"\nEI");
+
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 90 90] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 9 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"/Pattern cs /P1 scn BT /F1 90 Tf 0 0 Td (A) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /logo 8 0 R >>".to_vec(),                 // 6
+            b"<< /Type /Encoding /Differences [65 /logo] >>".to_vec(), // 7
+            stream("", &glyph_bytes),                      // 8
+            pattern,                                       // 9
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images);
+        let (display_list, _) = interpreter.interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        assert_eq!(
+            slide.elements.len(),
+            1,
+            "patterned stencil logo must flatten to one transparent SlideElement::Image, got {:?}",
+            slide.elements
+        );
+        let SlideElement::Image { image_data, .. } = &slide.elements[0] else {
+            panic!("expected SlideElement::Image, got {:?}", slide.elements[0]);
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode exported PNG")
+            .to_rgba8();
+        let (w, h) = rgba.dimensions();
+
+        // Center pixel lies inside the transparent hole of the 3x3 ring stencil.
+        let center = rgba.get_pixel(w / 2, h / 2).0;
+        assert_eq!(
+            center[3], 0,
+            "transparent hole in patterned Type 3 logo must survive PPTX export, got {center:?}"
+        );
+        // Outer left and right ring edges must be opaque with red and blue stripes.
+        let left_ring = rgba.get_pixel(w / 10, h / 2).0;
+        assert!(
+            left_ring[3] > 200 && left_ring[0] > 200 && left_ring[2] < 40,
+            "left ring pixel must preserve opaque red pattern, got {left_ring:?}"
+        );
+        let right_ring = rgba.get_pixel(w - w / 10 - 1, h / 2).0;
+        assert!(
+            right_ring[3] > 200 && right_ring[2] > 200 && right_ring[0] < 40,
+            "right ring pixel must preserve opaque blue pattern, got {right_ring:?}"
         );
     }
 

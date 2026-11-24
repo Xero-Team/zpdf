@@ -400,7 +400,8 @@ fn page_text(doc: &PdfDocument, idx: usize) -> String {
             .with_fonts(&mut font_cache)
             .with_document(doc.file(), &page.resources)
             .with_shared_fonts(doc)
-            .with_text_sink(&mut spans);
+            .with_text_sink(&mut spans)
+            .with_skip_images(true);
         let _ = interp.interpret(&content);
     }
     let text = zpdf_content::text::spans_to_text(spans, 2.0);

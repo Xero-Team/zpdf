@@ -62,6 +62,10 @@ pub struct ContentInterpreter<'a> {
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
+    /// Skip all image decoding, including self-contained Type 3 inline bitmaps
+    /// and shading rasters (used by extraction-only callers that discard the
+    /// display list).
+    skip_images: bool,
     max_image_cache_bytes: u64,
     max_font_cache_bytes: u64,
     /// Active document/standalone parsing policy used by inline image filters
@@ -814,6 +818,27 @@ struct DeviceClipBounds {
     y1: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InlineFontOwner {
+    /// Indirect container object (Form XObject, tiling pattern, Type 3 font, or
+    /// CharProc stream) whose `/Resources /Font /<name>` holds the inline font.
+    Container(ObjectId),
+    /// Indirect `/Resources` dictionary whose `/Font /<name>` holds the inline
+    /// font directly.
+    ResourcesDict(ObjectId),
+}
+
+fn is_paint_command(cmd: &RenderCommand) -> bool {
+    matches!(
+        cmd,
+        RenderCommand::FillPath { .. }
+            | RenderCommand::StrokePath { .. }
+            | RenderCommand::DrawGlyphRun(_)
+            | RenderCommand::DrawImage(_)
+            | RenderCommand::DrawInlineImage(_)
+    )
+}
+
 #[derive(Debug, Clone)]
 enum CachedFontBinding {
     /// Font resource points to the same `ObjectId` as the page's font under
@@ -1137,6 +1162,7 @@ impl<'a> ContentInterpreter<'a> {
             file: None,
             resources: None,
             image_cache: None,
+            skip_images: false,
             max_image_cache_bytes: limits.max_image_cache_bytes,
             max_font_cache_bytes: limits.max_font_cache_bytes,
             parse_limits: limits,
@@ -1624,6 +1650,17 @@ impl<'a> ContentInterpreter<'a> {
 
     pub fn with_images(mut self, cache: &'a mut ImageCache) -> Self {
         self.image_cache = Some(cache);
+        self
+    }
+
+    /// Skip all image decoding, including self-contained Type 3 inline bitmaps
+    /// and shading rasters when no external `ImageCache` is attached.
+    ///
+    /// Intended for extraction-only callers (such as `ConversionMode::TextOnly`)
+    /// that discard the display list and must not spend image-decode work or
+    /// emit image-budget diagnostics.
+    pub fn with_skip_images(mut self, skip: bool) -> Self {
+        self.skip_images = skip;
         self
     }
 
@@ -3806,7 +3843,7 @@ impl<'a> ContentInterpreter<'a> {
         // and table extraction intentionally omit an image cache, so avoid all
         // function parsing, mesh construction, and raster work when there is no
         // store in which the resulting pixels could be retained.
-        if self.image_cache.is_none() {
+        if self.skip_images || (self.image_cache.is_none() && self.active_type3_glyphs.is_empty()) {
             return;
         }
         let (sh_obj, cache_id) = match self.lookup_res(|r| {
@@ -3865,10 +3902,12 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Rasterize `def` over the page-space `region` and emit it as an image.
-    fn emit_shading_image(&mut self, def: &crate::shading::ShadingDef, region: Rect) {
-        if region.width() <= 0.0 || region.height() <= 0.0 {
-            return;
+    /// Returns `true` when an image command was emitted.
+    fn emit_shading_image(&mut self, def: &crate::shading::ShadingDef, region: Rect) -> bool {
+        if self.skip_images || region.width() <= 0.0 || region.height() <= 0.0 {
+            return false;
         }
+        let embed_inline = self.image_cache.is_none() && !self.active_type3_glyphs.is_empty();
         // Resolution: smooth gradients upscale cleanly; cap the long side.
         let long = region.width().max(region.height());
         let scale = (768.0 / long).min(2.0);
@@ -3882,7 +3921,7 @@ impl<'a> ContentInterpreter<'a> {
         let buf = crate::shading::rasterize(def, region, w, h);
         self.stats.shading_ns += shading_started.elapsed().as_nanos() as u64;
         let Some(buf) = buf else {
-            return;
+            return false;
         };
         self.stats.shading_rasters += 1;
         let image = zpdf_image::DecodedImage {
@@ -3902,11 +3941,15 @@ impl<'a> ContentInterpreter<'a> {
             region.x0,
             region.y0,
         );
+        if embed_inline {
+            return self.emit_draw_inline_image_at(image, transform).is_some();
+        }
         let image = self.fit_image_to_footprint(image, &transform);
         let Some(image_id) = self.admit_image(image) else {
-            return;
+            return false;
         };
         self.emit_image_draw(image_id, transform, false);
+        true
     }
 
     /// Page-space bounding box of a path (for clipping shading fills).
@@ -4721,6 +4764,7 @@ impl<'a> ContentInterpreter<'a> {
         // surrounding BDC /OC state and the XObject's own /OC key).
         if let Some(oc) = stream.dict.get("OC") {
             if !self.oc_object_visible(oc, 0) {
+                self.type3_oc_suppressed_mark = true;
                 return;
             }
         }
@@ -4753,7 +4797,7 @@ impl<'a> ContentInterpreter<'a> {
         // Without an image cache there is nowhere to retain the decoded pixels
         // referenced by a DrawImage command, so avoid paying the stream/image
         // decode cost only to discard the result below.
-        if self.image_cache.is_none() {
+        if self.skip_images || self.image_cache.is_none() {
             return;
         }
         let transform = self.current.ctm;
@@ -5342,6 +5386,9 @@ impl<'a> ContentInterpreter<'a> {
         if cs_produces_no_marks(&self.current.fill_cs) && is_mask {
             return;
         }
+        if self.skip_images {
+            return;
+        }
         // Outside Type 3 glyphs, omit inline images when the caller supplied no
         // `ImageCache`. Inside a Type 3 glyph (including helper Forms it calls),
         // embed decoded pixels directly on `DrawInlineImage` so bitmap glyphs
@@ -5497,7 +5544,14 @@ impl<'a> ContentInterpreter<'a> {
         &mut self,
         image: zpdf_image::DecodedImage,
     ) -> Option<std::sync::Arc<zpdf_display_list::InlineImage>> {
-        let transform = self.current.ctm;
+        self.emit_draw_inline_image_at(image, self.current.ctm)
+    }
+
+    fn emit_draw_inline_image_at(
+        &mut self,
+        image: zpdf_image::DecodedImage,
+        transform: Matrix,
+    ) -> Option<std::sync::Arc<zpdf_display_list::InlineImage>> {
         let image = self.fit_image_to_footprint(image, &transform);
         let bytes = u64::try_from(image.data.capacity()).unwrap_or(u64::MAX);
         if !self.image_room(bytes) {
@@ -5841,16 +5895,20 @@ impl<'a> ContentInterpreter<'a> {
         form_id: Option<ObjectId>,
         file: &PdfFile,
     ) {
-        let res_dict = match form_dict.get("Resources") {
-            Some(PdfObject::Dict(res)) => Some(res.clone()),
-            Some(PdfObject::Ref(r)) => file
-                .resolve(*r)
-                .ok()
-                .and_then(|o| o.as_dict().ok().cloned()),
-            _ => None,
+        let (res_dict, owner) = match form_dict.get("Resources") {
+            Some(PdfObject::Dict(res)) => {
+                (Some(res.clone()), form_id.map(InlineFontOwner::Container))
+            }
+            Some(PdfObject::Ref(r)) => (
+                file.resolve(*r)
+                    .ok()
+                    .and_then(|o| o.as_dict().ok().cloned()),
+                Some(InlineFontOwner::ResourcesDict(*r)),
+            ),
+            _ => (None, None),
         };
         match res_dict {
-            Some(res) => self.load_fonts_from_resources_dict(&res, form_id, file),
+            Some(res) => self.load_fonts_from_resources_dict(&res, owner, file),
             None => self.form_font_overrides.push(HashMap::new()),
         }
     }
@@ -5858,10 +5916,10 @@ impl<'a> ContentInterpreter<'a> {
     fn load_fonts_from_resources_dict(
         &mut self,
         res_dict: &zpdf_core::PdfDict,
-        form_id: Option<ObjectId>,
+        owner: Option<InlineFontOwner>,
         file: &PdfFile,
     ) {
-        let bindings = self.prepare_font_bindings(res_dict, form_id, file);
+        let bindings = self.prepare_font_bindings(res_dict, owner, file);
         self.push_cached_font_bindings(&bindings);
     }
 
@@ -5871,7 +5929,7 @@ impl<'a> ContentInterpreter<'a> {
     fn prepare_font_bindings(
         &mut self,
         res_dict: &zpdf_core::PdfDict,
-        form_id: Option<ObjectId>,
+        owner: Option<InlineFontOwner>,
         file: &PdfFile,
     ) -> Vec<CachedFontBinding> {
         let fonts_dict = match res_dict.get("Font") {
@@ -5982,18 +6040,28 @@ impl<'a> ContentInterpreter<'a> {
                                 ) {
                                     Ok(fid) => {
                                         if fc.get(fid).is_some_and(|f| f.has_type3_programs()) {
-                                            if let Some(owner_id) = form_id {
-                                                fc.record_type3_container_source(
-                                                    fid,
-                                                    owner_id,
-                                                    name.0.clone(),
-                                                );
-                                            } else {
-                                                fc.record_type3_inline_source_with_limit(
-                                                    fid,
-                                                    std::sync::Arc::new(font_dict.clone()),
-                                                    max_font_bytes,
-                                                );
+                                            match owner {
+                                                Some(InlineFontOwner::Container(owner_id)) => {
+                                                    fc.record_type3_container_source(
+                                                        fid,
+                                                        owner_id,
+                                                        name.0.clone(),
+                                                    );
+                                                }
+                                                Some(InlineFontOwner::ResourcesDict(res_id)) => {
+                                                    fc.record_type3_resources_source(
+                                                        fid,
+                                                        res_id,
+                                                        name.0.clone(),
+                                                    );
+                                                }
+                                                None => {
+                                                    fc.record_type3_inline_source_with_limit(
+                                                        fid,
+                                                        std::sync::Arc::new(font_dict.clone()),
+                                                        max_font_bytes,
+                                                    );
+                                                }
                                             }
                                         }
                                         if fc.get(fid).is_some_and(|f| f.has_font_data()) {
@@ -6004,10 +6072,18 @@ impl<'a> ContentInterpreter<'a> {
                                                     max_font_bytes,
                                                 );
                                             } else if companion.is_some() {
-                                                let source = match form_id {
-                                                    Some(id) => {
+                                                let source = match owner {
+                                                    Some(InlineFontOwner::Container(id)) => {
                                                         zpdf_font::CompanionSource::FormInlineFont {
                                                             form_id: id,
+                                                            font_name: name.0.clone(),
+                                                        }
+                                                    }
+                                                    Some(InlineFontOwner::ResourcesDict(
+                                                        resources_id,
+                                                    )) => {
+                                                        zpdf_font::CompanionSource::ResourcesInlineFont {
+                                                            resources_id,
                                                             font_name: name.0.clone(),
                                                         }
                                                     }
@@ -6456,8 +6532,12 @@ impl<'a> ContentInterpreter<'a> {
     fn paint_pattern_in_region(&mut self, pattern: &PatternPaint, bounds: Rect) -> bool {
         match pattern {
             PatternPaint::Shading(def) => {
-                self.emit_shading_image(def, bounds);
-                true
+                if self.skip_images
+                    || (self.image_cache.is_none() && self.active_type3_glyphs.is_empty())
+                {
+                    return false;
+                }
+                self.emit_shading_image(def, bounds)
             }
             PatternPaint::Tiling { def, base_ctm } => {
                 self.paint_tiling_pattern(def, *base_ctm, bounds)
@@ -6791,8 +6871,7 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Resolve an inline Type 3 font dictionary stored under `/Resources /Font`
-    /// of an indirect container object (`owner_id`), or directly under `/Font`
-    /// when `owner_id` itself is an indirect `/Resources` dictionary.
+    /// of an indirect container object (`owner_id`).
     fn resolve_container_inline_font_dict(
         &self,
         file: &PdfFile,
@@ -6805,10 +6884,25 @@ impl<'a> ContentInterpreter<'a> {
             PdfObject::Stream(s) => &s.dict,
             _ => return None,
         };
-        let res_dict = match owner_dict.get("Resources") {
-            Some(res_obj) => self.resolve_dict_of(res_obj)?,
-            None => owner_dict.clone(),
-        };
+        let res_dict = self.resolve_dict_of(owner_dict.get("Resources")?)?;
+        let fonts_dict = self.resolve_dict_of(res_dict.get("Font")?)?;
+        match fonts_dict.get(font_name)? {
+            PdfObject::Dict(d) => Some(d.clone()),
+            PdfObject::Ref(r) => file.resolve(*r).ok()?.as_dict().ok().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Resolve an inline Type 3 font dictionary stored directly under `/Font`
+    /// of an indirect `/Resources` dictionary object (`resources_id`).
+    fn resolve_resources_inline_font_dict(
+        &self,
+        file: &PdfFile,
+        resources_id: ObjectId,
+        font_name: &str,
+    ) -> Option<zpdf_core::PdfDict> {
+        let res_obj = file.resolve_shared(resources_id).ok()?;
+        let res_dict = res_obj.as_dict().ok()?;
         let fonts_dict = self.resolve_dict_of(res_dict.get("Font")?)?;
         match fonts_dict.get(font_name)? {
             PdfObject::Dict(d) => Some(d.clone()),
@@ -6844,7 +6938,11 @@ impl<'a> ContentInterpreter<'a> {
             let parsed_resources = zpdf_document::page::parse_resource_dict(&res_dict, file)
                 .ok()
                 .map(std::sync::Arc::new);
-            let font_bindings = self.prepare_font_bindings(&res_dict, Some(*res_id), file);
+            let font_bindings = self.prepare_font_bindings(
+                &res_dict,
+                Some(InlineFontOwner::ResourcesDict(*res_id)),
+                file,
+            );
             let scope = std::sync::Arc::new(CachedType3ResourceScope {
                 parsed_resources,
                 font_bindings,
@@ -6864,7 +6962,11 @@ impl<'a> ContentInterpreter<'a> {
         let parsed_resources = zpdf_document::page::parse_resource_dict(&res_dict, file)
             .ok()
             .map(std::sync::Arc::new);
-        let font_bindings = self.prepare_font_bindings(&res_dict, container_owner_id, file);
+        let font_bindings = self.prepare_font_bindings(
+            &res_dict,
+            container_owner_id.map(InlineFontOwner::Container),
+            file,
+        );
         let scope = std::sync::Arc::new(CachedType3ResourceScope {
             parsed_resources,
             font_bindings,
@@ -6904,6 +7006,13 @@ impl<'a> ContentInterpreter<'a> {
                     font_name,
                 }) => (
                     self.resolve_container_inline_font_dict(file, owner_id, &font_name),
+                    None,
+                ),
+                Some(zpdf_font::Type3Source::ResourcesInlineFont {
+                    resources_id,
+                    font_name,
+                }) => (
+                    self.resolve_resources_inline_font_dict(file, resources_id, &font_name),
                     None,
                 ),
                 Some(zpdf_font::Type3Source::Inline(dict)) => (Some((*dict).clone()), None),
@@ -7256,7 +7365,10 @@ impl<'a> ContentInterpreter<'a> {
             }
 
             let glyph_cmd_end = self.display_list.commands.len();
-            let fully_hidden_by_oc = glyph_oc_suppressed && glyph_cmd_end == glyph_cmd_start;
+            let emitted_paint = self.display_list.commands[glyph_cmd_start..glyph_cmd_end]
+                .iter()
+                .any(is_paint_command);
+            let fully_hidden_by_oc = glyph_oc_suppressed && !emitted_paint;
             if fully_hidden_by_oc {
                 // Propagate OC suppression to any enclosing Type 3 glyph.
                 self.type3_oc_suppressed_mark = true;
@@ -8531,6 +8643,15 @@ impl<'a> ContentInterpreter<'a> {
                                             } => {
                                                 zpdf_document::font_loader::load_embedded_companion_form_inline(
                                                     file, *form_id, font_name, remaining,
+                                                )
+                                                .map(std::sync::Arc::new)
+                                            }
+                                            zpdf_font::CompanionSource::ResourcesInlineFont {
+                                                resources_id,
+                                                font_name,
+                                            } => {
+                                                zpdf_document::font_loader::load_embedded_companion_resources_inline(
+                                                    file, *resources_id, font_name, remaining,
                                                 )
                                                 .map(std::sync::Arc::new)
                                             }

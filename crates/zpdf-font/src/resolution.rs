@@ -1530,7 +1530,8 @@ impl FontCache {
                     match &entry.source {
                         crate::CompanionSource::None => return None,
                         deferred @ (crate::CompanionSource::Object(_)
-                        | crate::CompanionSource::FormInlineFont { .. }) => {
+                        | crate::CompanionSource::FormInlineFont { .. }
+                        | crate::CompanionSource::ResourcesInlineFont { .. }) => {
                             if let Some(cached) =
                                 run_candidate.as_deref().and_then(|slot| slot.as_ref())
                             {
