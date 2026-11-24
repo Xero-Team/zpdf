@@ -5134,6 +5134,8 @@ impl<'a> ContentInterpreter<'a> {
         let saved_text_sink = self.text_sink.take();
         let saved_span_streams = self.span_streams.take();
         let saved_rule_sink = self.rule_sink.take();
+        let saved_type3_glyph = std::mem::replace(&mut self.type3_glyph, false);
+        let saved_suppress_color_ops = std::mem::replace(&mut self.suppress_color_ops, false);
         self.current.soft_mask = None;
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
@@ -5148,6 +5150,8 @@ impl<'a> ContentInterpreter<'a> {
         let work = self.start_work(Some(Work::Form));
         self.do_form_xobject(Some(g_ref), &g_stream, file);
         self.tock_work(work);
+        self.type3_glyph = saved_type3_glyph;
+        self.suppress_color_ops = saved_suppress_color_ops;
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
         self.text_sink = saved_text_sink;
@@ -5217,9 +5221,10 @@ impl<'a> ContentInterpreter<'a> {
         let saved_span_streams = self.span_streams.take();
         let saved_rule_sink = self.rule_sink.take();
         // Marks inside the mask's transparency group emit concrete `Paint::Solid`
-        // values rather than `Paint::Inherited` so backends evaluate mask alpha
-        // and luminosity directly.
+        // values and honor color operators even when invoked inside a `d1`
+        // uncolored glyph so backends evaluate mask alpha and luminosity directly.
         let saved_type3_glyph = std::mem::replace(&mut self.type3_glyph, false);
+        let saved_suppress_color_ops = std::mem::replace(&mut self.suppress_color_ops, false);
         self.current.soft_mask = None;
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
@@ -5231,6 +5236,7 @@ impl<'a> ContentInterpreter<'a> {
         self.tock_work(work);
 
         self.type3_glyph = saved_type3_glyph;
+        self.suppress_color_ops = saved_suppress_color_ops;
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
         self.text_sink = saved_text_sink;

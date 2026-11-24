@@ -258,10 +258,17 @@ struct SvgWriter<'a> {
     /// Every later draw of the image is a `<use>` of its def, so a repeated
     /// image is PNG-encoded and embedded once, not once per draw.
     image_defs: HashMap<ImageDefKey, Option<u32>>,
+    /// Retains `Arc<InlineImage>` allocations keyed by address in `image_defs`
+    /// (`ImageDefKey::Inline`) so freed temporary inline images (e.g. from
+    /// transformed Type 3 soft masks) cannot alias a later image.
+    retained_inline_images: Vec<std::sync::Arc<zpdf_display_list::InlineImage>>,
     /// Soft-mask defs already written. A soft mask the interpreter reuses
     /// (one `gs` applied to many objects shares one mask list) is written
-    /// once and referenced by every group it masks.
-    mask_defs: HashMap<MaskDefKey, u32>,
+    /// once and referenced by every group it masks. Retains the keyed
+    /// `Arc<DisplayList>` so raw pointer keys can never alias freed temporary
+    /// allocations (such as uncached Type 3 glyph masks or nested transformed
+    /// soft masks).
+    mask_defs: HashMap<MaskDefKey, (std::sync::Arc<DisplayList>, u32)>,
     /// Tiling-pattern `<pattern>` defs already written, deduplicated per page.
     /// Retains each source `Arc<DisplayList>` so pointer keys never alias freed
     /// allocations (e.g. temporary lifted nested cells from `blend_segments()`).
@@ -323,17 +330,51 @@ impl EmitDepth {
     }
 }
 
-/// Identity of a soft-mask def: the shared mask list plus the parameters
-/// written around it, and the nesting depths it was written at (masks nested
-/// past [`MAX_MASK_DEPTH`] or tiles past [`MAX_TILING_DEPTH`] are left out).
+/// Identity of a soft-mask def: the retained source mask list plus any
+/// placement transform applied to it (for Type 3 glyph-local masks), the
+/// parameters written around it, and the nesting depths it was written at
+/// (masks nested past [`MAX_MASK_DEPTH`] or tiles past [`MAX_TILING_DEPTH`]
+/// are left out).
 #[derive(PartialEq, Eq, Hash)]
 struct MaskDefKey {
     commands: *const DisplayList,
+    placement: Option<[u64; 6]>,
     kind: SoftMaskKind,
     offset: [u32; 2],
     backdrop_luma: u32,
     origin_scale: [u64; 3],
     depth: EmitDepth,
+}
+
+fn canonical_f64_bits(v: f64) -> u64 {
+    if v == 0.0 {
+        0.0f64.to_bits()
+    } else if v.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
+fn canonical_f32_bits(v: f32) -> u32 {
+    if v == 0.0 {
+        0.0f32.to_bits()
+    } else if v.is_nan() {
+        f32::NAN.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
+fn matrix_key_bits(m: &zpdf_core::Matrix) -> [u64; 6] {
+    [
+        canonical_f64_bits(m.a),
+        canonical_f64_bits(m.b),
+        canonical_f64_bits(m.c),
+        canonical_f64_bits(m.d),
+        canonical_f64_bits(m.e),
+        canonical_f64_bits(m.f),
+    ]
 }
 
 /// Identity of a tiling-pattern `<pattern>` def.
@@ -614,6 +655,7 @@ impl<'a> SvgWriter<'a> {
             warned_knockout: false,
             warned_transfer: false,
             image_defs: HashMap::new(),
+            retained_inline_images: Vec::new(),
             mask_defs: HashMap::new(),
             pattern_defs: HashMap::new(),
             tiling_backdrop_cache: HashMap::new(),
@@ -4603,26 +4645,66 @@ impl<'a> SvgWriter<'a> {
     /// SVG masks are luminance-based by default, which is exactly PDF's
     /// luminosity soft mask; alpha masks use `mask-type:alpha`.
     fn emit_soft_mask_def(&mut self, mask: &SoftMask, depth: EmitDepth) -> Option<u32> {
+        self.emit_soft_mask_def_inner(mask, None, depth, || None)
+    }
+
+    /// Emit a Type 3 glyph-local soft mask placed at `placement`, keyed by the
+    /// retained source mask and placement transform so separate glyph positions
+    /// get distinct `<mask>` defs while identical placements deduplicate.
+    fn emit_transformed_soft_mask_def<F>(
+        &mut self,
+        source: &SoftMask,
+        placement: &zpdf_core::Matrix,
+        resolve_image: &F,
+        depth: EmitDepth,
+    ) -> Option<u32>
+    where
+        F: Fn(ImageId) -> Option<std::sync::Arc<zpdf_display_list::InlineImage>>,
+    {
+        self.emit_soft_mask_def_inner(source, Some(matrix_key_bits(placement)), depth, || {
+            Some(source.transform_with_images(placement, resolve_image))
+        })
+    }
+
+    fn emit_soft_mask_def_inner(
+        &mut self,
+        source: &SoftMask,
+        placement: Option<[u64; 6]>,
+        depth: EmitDepth,
+        materialize: impl FnOnce() -> Option<SoftMask>,
+    ) -> Option<u32> {
         if depth.mask >= MAX_MASK_DEPTH {
             tracing::warn!("soft-mask nesting exceeds depth budget; mask dropped");
             return None;
         }
-        if mask.transfer.is_some() {
+        if source.transfer.is_some() {
             self.warn_transfer();
         }
         let key = MaskDefKey {
-            commands: std::sync::Arc::as_ptr(&mask.commands),
-            kind: mask.kind,
-            offset: [mask.offset.0.to_bits(), mask.offset.1.to_bits()],
-            backdrop_luma: mask.backdrop_luma.to_bits(),
-            origin_scale: [self.x0.to_bits(), self.y1.to_bits(), self.scale.to_bits()],
+            commands: std::sync::Arc::as_ptr(&source.commands),
+            placement,
+            kind: source.kind,
+            offset: [
+                canonical_f32_bits(source.offset.0),
+                canonical_f32_bits(source.offset.1),
+            ],
+            backdrop_luma: canonical_f32_bits(source.backdrop_luma),
+            origin_scale: [
+                canonical_f64_bits(self.x0),
+                canonical_f64_bits(self.y1),
+                canonical_f64_bits(self.scale),
+            ],
             depth,
         };
-        if let Some(&id) = self.mask_defs.get(&key) {
+        if let Some(&(_, id)) = self.mask_defs.get(&key) {
             return Some(id);
         }
         let id = self.fresh_id();
-        self.mask_defs.insert(key, id);
+        self.mask_defs
+            .insert(key, (std::sync::Arc::clone(&source.commands), id));
+
+        let transformed = materialize();
+        let mask = transformed.as_ref().unwrap_or(source);
 
         let saved_out = std::mem::take(&mut self.out);
         let saved_pending = self.pending_backdrop.take();
@@ -5250,9 +5332,12 @@ impl<'a> SvgWriter<'a> {
                             1.0
                         };
                         let mask_id = mask.as_ref().and_then(|m| {
-                            let page_mask =
-                                m.transform_with_images(&glyph_to_page, &resolve_glyph_img);
-                            self.emit_soft_mask_def(&page_mask, depth)
+                            self.emit_transformed_soft_mask_def(
+                                m,
+                                &glyph_to_page,
+                                &resolve_glyph_img,
+                                depth,
+                            )
                         });
                         let prev_out = std::mem::take(&mut self.out);
                         glyph_blends.push((
@@ -6170,9 +6255,12 @@ impl<'a> SvgWriter<'a> {
                             1.0
                         };
                         let mask_id = mask.as_ref().and_then(|m| {
-                            let page_mask =
-                                m.transform_with_images(&glyph_to_page, &resolve_glyph_img);
-                            self.emit_soft_mask_def(&page_mask, depth)
+                            self.emit_transformed_soft_mask_def(
+                                m,
+                                &glyph_to_page,
+                                &resolve_glyph_img,
+                                depth,
+                            )
                         });
                         let prev_out = std::mem::take(&mut self.out);
                         glyph_blends.push((*blend_mode, *isolated, eff_alpha, mask_id, prev_out));
@@ -6360,6 +6448,7 @@ impl<'a> SvgWriter<'a> {
             return;
         }
         let key = ImageDefKey::Inline(std::sync::Arc::as_ptr(&draw.image) as usize);
+        let was_cached = self.image_defs.contains_key(&key);
         self.place_rgba_image(
             key,
             draw.image.width,
@@ -6370,6 +6459,10 @@ impl<'a> SvgWriter<'a> {
             &draw.transform,
             alpha,
         );
+        if !was_cached && self.image_defs.contains_key(&key) {
+            self.retained_inline_images
+                .push(std::sync::Arc::clone(&draw.image));
+        }
     }
 
     /// Draw `image` (the def `key`, written on first use) over the unit square
@@ -12209,5 +12302,184 @@ mod tests {
             "SVG Type 3 /SMask right half must remain white, got {:?}",
             [right.red(), right.green(), right.blue()]
         );
+    }
+
+    #[test]
+    fn svg_type3_ext_gstate_smask_separated_placements_keep_distinct_masks() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3FormXObject, Type3Resources, Type3SoftMask};
+
+        let mut form_dict = zpdf_core::PdfDict::new();
+        form_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(20.0),
+                zpdf_core::PdfObject::Real(20.0),
+            ]),
+        );
+        let group = Arc::new(Type3FormXObject {
+            dict: form_dict,
+            data: Arc::from(&b"1 g 0 0 10 20 re f"[..]),
+            resources: None,
+        });
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_state_smasks.insert(
+            "GSMask".into(),
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group,
+                backdrop_luma: 0.0,
+                transfer: None,
+            },
+        );
+        // Colored glyph (`d0`) for solid-run replay and stencil glyph (`d1`)
+        // for tiling-run replay, both using the same /ExtGState /SMask.
+        let d0_proc = b"20 0 d0 /GSMask gs 1 0 0 rg 0 0 20 20 re f";
+        let d1_proc = b"20 0 0 0 20 20 d1 /GSMask gs 0 0 20 20 re f";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), Arc::<[u8]>::from(&d0_proc[..])),
+                    ("B".into(), Arc::<[u8]>::from(&d1_proc[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![20.0, 20.0],
+                first_char: 0,
+            },
+            "Type3SMaskSeparated".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(20.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        // 1. Solid Type 3 run: three separated placements plus one identical
+        // repeat at x = 30.0. The three distinct positions must each emit
+        // their own <mask> def (no freed-Arc address aliasing), while the
+        // identical repeat reuses the existing def.
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 90.0, 20.0));
+        let glyph_at = |glyph_id: u16, x: f32| PositionedGlyph {
+            glyph_id,
+            code_len: 1,
+            code: if glyph_id == 0 { b'A' } else { b'B' } as u32,
+            x,
+            y: 0.0,
+            advance: 20.0,
+        };
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![
+                glyph_at(0, 0.0),
+                glyph_at(0, 30.0),
+                glyph_at(0, 60.0),
+                glyph_at(0, 30.0),
+            ],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        assert_eq!(
+            svg.matches("<mask ").count(),
+            3,
+            "3 separated placements + 1 identical repeat must emit exactly 3 <mask> defs: {svg}"
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(180, 40).expect("pixmap");
+        let sx = 180.0 / tree.size().width();
+        let sy = 40.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        for base_x in [0u32, 30, 60] {
+            let left = pixmap.pixel((base_x + 5) * 2, 20).expect("left half");
+            let right = pixmap.pixel((base_x + 15) * 2, 20).expect("right half");
+            assert!(
+                left.red() > 240 && left.green() < 15 && left.blue() < 15,
+                "placement at x={base_x} left half must be red, got {:?}",
+                [left.red(), left.green(), left.blue()]
+            );
+            assert!(
+                right.red() > 240 && right.green() > 240 && right.blue() > 240,
+                "placement at x={base_x} masked right half must stay white, got {:?}",
+                [right.red(), right.green(), right.blue()]
+            );
+        }
+
+        // 2. Tiling-patterned Type 3 run (`emit_tiling_type3_run`): two
+        // separated placements painted with a blue tiling pattern.
+        let mut tile_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        tile_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(zpdf_display_list::TilingPattern {
+            commands: Arc::new(tile_dl),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut tiling_page = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 20.0));
+        tiling_page.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![glyph_at(1, 0.0), glyph_at(1, 30.0)],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let tiling_svg = display_list_to_svg(
+            &tiling_page,
+            &fonts,
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        let tiling_tree =
+            resvg::usvg::Tree::from_data(tiling_svg.as_bytes(), &resvg::usvg::Options::default())
+                .expect("valid tiling SVG");
+        let mut tiling_px = resvg::tiny_skia::Pixmap::new(120, 40).expect("tiling pixmap");
+        resvg::render(
+            &tiling_tree,
+            resvg::tiny_skia::Transform::from_scale(
+                120.0 / tiling_tree.size().width(),
+                40.0 / tiling_tree.size().height(),
+            ),
+            &mut tiling_px.as_mut(),
+        );
+        for base_x in [0u32, 30] {
+            let left = tiling_px.pixel((base_x + 5) * 2, 20).expect("tiling left");
+            let right = tiling_px
+                .pixel((base_x + 15) * 2, 20)
+                .expect("tiling right");
+            assert!(
+                left.red() < 15 && left.green() < 15 && left.blue() > 240,
+                "tiling placement at x={base_x} left half must be blue, got {:?}",
+                [left.red(), left.green(), left.blue()]
+            );
+            assert!(
+                right.red() > 240 && right.green() > 240 && right.blue() > 240,
+                "tiling placement at x={base_x} masked right half must stay white, got {:?}",
+                [right.red(), right.green(), right.blue()]
+            );
+        }
     }
 }
