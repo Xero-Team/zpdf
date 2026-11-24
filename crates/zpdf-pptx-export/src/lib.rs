@@ -193,8 +193,16 @@ pub fn display_list_to_slide(
     image_cache: &ImageCache,
     options: &ConversionOptions,
 ) -> Result<PptxSlide> {
-    let (slide, _stats) =
-        display_list_to_slide_internal(display_list, page_index, font_cache, image_cache, options)?;
+    let (slide, _stats) = display_list_to_slide_internal(
+        display_list,
+        page_index,
+        font_cache,
+        image_cache,
+        options,
+        Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+        #[cfg(test)]
+        None,
+    )?;
     Ok(slide)
 }
 
@@ -202,6 +210,10 @@ pub fn display_list_to_slide(
 struct ConversionStats {
     backdrop_command_visits: usize,
     pass1_command_visits: usize,
+    peak_backdrop_pixels: u64,
+    peak_rebaser_mask_entries: usize,
+    peak_rebaser_mask_bytes: usize,
+    backdrop_groups_completed: usize,
 }
 
 fn display_list_to_slide_internal(
@@ -210,6 +222,8 @@ fn display_list_to_slide_internal(
     font_cache: &FontCache,
     image_cache: &ImageCache,
     options: &ConversionOptions,
+    render_budget: Option<std::time::Duration>,
+    #[cfg(test)] expire_backdrop_after_groups: Option<usize>,
 ) -> Result<(PptxSlide, ConversionStats)> {
     let mut converter = SlideConverter {
         page_rect: display_list.page_rect,
@@ -220,8 +234,11 @@ fn display_list_to_slide_internal(
         elements: Vec::new(),
         image_counter: 0,
         clip_stack: Vec::new(),
-        backdrop: None,
+        backdrop_mgr: BackdropManager::new(render_budget),
+        render_budget,
         stats: ConversionStats::default(),
+        #[cfg(test)]
+        expire_backdrop_after_groups,
     };
 
     converter.convert_display_list(display_list)?;
@@ -235,13 +252,469 @@ fn display_list_to_slide_internal(
     ))
 }
 
-struct BackdropCanvas<'a> {
+const MAX_MASK_RASTER_DIM: f64 = 2048.0;
+const MAX_MASK_RASTER_SCALE: f64 = 2.0;
+/// Tile size in PDF points for high-resolution (`2.0x`) cropped backdrop tiles
+/// on large sheets (`512 × 512` pt -> `1024 × 1024` px = 4 MiB per tile).
+const BACKDROP_TILE_PT: f64 = 512.0;
+/// Total live pixel ceiling across all retained backdrop surfaces (4 Mi pixels = 16 MiB).
+const MAX_BACKDROP_CACHE_PIXELS: u64 = 2048 * 2048;
+
+fn fit_scale_to_max_dim(max_dim: f64) -> Option<f32> {
+    if !max_dim.is_finite() || max_dim <= 0.0 {
+        return None;
+    }
+    let mut scale = MAX_MASK_RASTER_SCALE.min(MAX_MASK_RASTER_DIM / max_dim) as f32;
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    while (max_dim * scale as f64).ceil() > MAX_MASK_RASTER_DIM && scale > f32::MIN_POSITIVE {
+        scale = f32::from_bits(scale.to_bits() - 1);
+    }
+    Some(scale)
+}
+
+struct BackdropSurface<'a> {
     renderer: zpdf_render_cpu::CpuRenderer<'a>,
     rebaser: SoftMaskRebaser,
+    rect: Rect,
     scale: f32,
     width: u32,
     height: u32,
+    /// Active render time remaining for `execute` calls on this surface
+    /// (paused while `SlideConverter` converts other elements or encodes PNGs).
+    remaining_budget: Option<std::time::Duration>,
+}
+
+impl<'a> BackdropSurface<'a> {
+    fn open(
+        rect: Rect,
+        scale: f32,
+        font_cache: &'a FontCache,
+        image_cache: &'a ImageCache,
+        render_budget: Option<std::time::Duration>,
+    ) -> Result<Option<Self>> {
+        use zpdf_render::{PageRenderInfo, RenderBackend};
+
+        let mut renderer = zpdf_render_cpu::CpuRenderer::new()
+            .with_fonts(font_cache)
+            .with_images(image_cache)
+            .with_render_budget(None);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: rect,
+                scale,
+                background: zpdf_display_list::Color::white(),
+            })
+            .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX blend render: {e}")))?;
+        let Some((width, height, _)) = renderer.current_surface() else {
+            return Ok(None);
+        };
+        let actual_scale = renderer.current_scale();
+        let rebaser =
+            SoftMaskRebaser::new(rect.x0, rect.y1, 1.0, 1.0, actual_scale).with_target_rect(rect);
+        Ok(Some(Self {
+            renderer,
+            rebaser,
+            rect,
+            scale: actual_scale,
+            width,
+            height,
+            remaining_budget: render_budget,
+        }))
+    }
+
+    fn pixels(&self) -> u64 {
+        self.width as u64 * self.height as u64
+    }
+
+    fn start_batch_deadline(&mut self) -> zpdf_core::time::Instant {
+        let now = zpdf_core::time::Instant::now();
+        let deadline = self.remaining_budget.map(|rem| now + rem);
+        self.renderer.set_deadline(deadline);
+        now
+    }
+
+    fn finish_batch_deadline(&mut self, batch_start: zpdf_core::time::Instant) {
+        if let Some(rem) = &mut self.remaining_budget {
+            *rem = rem.saturating_sub(batch_start.elapsed());
+        }
+        self.renderer.set_deadline(None);
+    }
+
+    fn execute_command(&mut self, cmd: &RenderCommand, stats: &mut ConversionStats) -> Result<()> {
+        use zpdf_render::RenderBackend;
+
+        let prepared = self.rebaser.prepare_command(cmd);
+        let exec_res = self
+            .renderer
+            .execute(prepared.as_ref())
+            .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX blend render: {e}")));
+        let invalidated = self.rebaser.take_needs_cpu_mask_cache_invalidation();
+        if invalidated {
+            self.renderer.clear_soft_mask_cache();
+        }
+        drop(prepared);
+        exec_res?;
+        stats.backdrop_command_visits += 1;
+        stats.peak_rebaser_mask_entries = stats
+            .peak_rebaser_mask_entries
+            .max(self.rebaser.translated_cache.len());
+        stats.peak_rebaser_mask_bytes = stats
+            .peak_rebaser_mask_bytes
+            .max(self.rebaser.retained_bytes);
+        if self.renderer.is_over_budget() {
+            return Err(zpdf_core::Error::StreamDecode(
+                "PPTX blend backdrop render exceeded time budget".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct FullPageBackdrop<'a> {
+    surface: BackdropSurface<'a>,
     cursor: usize,
+}
+
+struct TiledBackdrop<'a> {
+    surface: BackdropSurface<'a>,
+    relevant_items: Vec<usize>,
+    item_pos: usize,
+    last_used: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedBackdropItem {
+    start: usize,
+    end: usize,
+    bounds: Option<Rect>,
+}
+
+struct BackdropIndex {
+    origin_x: f64,
+    origin_y: f64,
+    items: Vec<IndexedBackdropItem>,
+    global_items: Vec<usize>,
+    buckets: std::collections::HashMap<(i32, i32), Vec<usize>>,
+}
+
+impl BackdropIndex {
+    fn cell_range(origin_x: f64, origin_y: f64, r: Rect) -> Option<(i32, i32, i32, i32)> {
+        let tx0 = ((r.x0 - origin_x) / BACKDROP_TILE_PT).floor();
+        let tx1 = ((r.x1 - origin_x) / BACKDROP_TILE_PT).floor();
+        let ty0 = ((r.y0 - origin_y) / BACKDROP_TILE_PT).floor();
+        let ty1 = ((r.y1 - origin_y) / BACKDROP_TILE_PT).floor();
+        if !(tx0.is_finite() && tx1.is_finite() && ty0.is_finite() && ty1.is_finite()) {
+            return None;
+        }
+        Some((tx0 as i32, tx1 as i32, ty0 as i32, ty1 as i32))
+    }
+
+    fn insert_item(&mut self, item: IndexedBackdropItem) {
+        const MAX_BUCKET_CELLS: i64 = 16;
+        let id = self.items.len();
+        let bounds = item.bounds;
+        self.items.push(item);
+        if let Some(r) = bounds {
+            if let Some((tx0, tx1, ty0, ty1)) = Self::cell_range(self.origin_x, self.origin_y, r) {
+                let cols = tx1 as i64 - tx0 as i64 + 1;
+                let rows = ty1 as i64 - ty0 as i64 + 1;
+                if cols > 0 && rows > 0 && cols.saturating_mul(rows) <= MAX_BUCKET_CELLS {
+                    for ty in ty0..=ty1 {
+                        for tx in tx0..=tx1 {
+                            self.buckets.entry((tx, ty)).or_default().push(id);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        self.global_items.push(id);
+    }
+
+    fn build(commands: &[RenderCommand], page_rect: Rect, font_cache: &FontCache) -> Self {
+        use zpdf_display_list::SoftMaskKind;
+
+        let mut index = Self {
+            origin_x: page_rect.x0,
+            origin_y: page_rect.y0,
+            items: Vec::new(),
+            global_items: Vec::new(),
+            buckets: std::collections::HashMap::new(),
+        };
+        // Stack of active open clip bounds: `(pop_idx, clip_bounds_for_bucket, cumulative_bounds)`.
+        let mut open_clips: Vec<(usize, Option<Rect>, Rect)> = Vec::new();
+        let mut passthrough_blend_depth = 0usize;
+        let mut idx = 0usize;
+
+        while idx < commands.len() {
+            let active_clip = open_clips.last().map(|&(_, _, c)| c).unwrap_or(page_rect);
+            match &commands[idx] {
+                RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                    if let Some(pop_idx) = SlideConverter::find_matching_pop_clip(commands, idx) {
+                        let Some(tightened) = tighten_rect_to_clip(active_clip, &commands[idx])
+                        else {
+                            idx = pop_idx + 1;
+                            continue;
+                        };
+                        let clip_item_bounds = Some(tightened);
+                        index.insert_item(IndexedBackdropItem {
+                            start: idx,
+                            end: idx,
+                            bounds: clip_item_bounds,
+                        });
+                        open_clips.push((pop_idx, clip_item_bounds, tightened));
+                    } else {
+                        index.insert_item(IndexedBackdropItem {
+                            start: idx,
+                            end: idx,
+                            bounds: None,
+                        });
+                    }
+                    idx += 1;
+                }
+                RenderCommand::PopClip => {
+                    if open_clips.last().is_some_and(|&(pop, _, _)| pop == idx) {
+                        let (_, clip_item_bounds, _) = open_clips.pop().expect("checked");
+                        index.insert_item(IndexedBackdropItem {
+                            start: idx,
+                            end: idx,
+                            bounds: clip_item_bounds,
+                        });
+                    }
+                    idx += 1;
+                }
+                RenderCommand::PushBlendGroup {
+                    blend_mode,
+                    isolated,
+                    knockout,
+                    alpha,
+                    mask,
+                    bounds,
+                } => {
+                    let group_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let passthrough = !*isolated
+                        && !*knockout
+                        && *blend_mode == zpdf_display_list::BlendMode::Normal
+                        && group_alpha >= 1.0
+                        && mask.is_none();
+                    if passthrough {
+                        passthrough_blend_depth += 1;
+                        idx += 1;
+                        continue;
+                    }
+                    if let Some(end_idx) = SlideConverter::find_matching_pop_blend(commands, idx) {
+                        if group_alpha <= 0.0 {
+                            idx = end_idx + 1;
+                            continue;
+                        }
+                        let group_slice = &commands[idx..=end_idx];
+                        let fallback = intersect_rect(*bounds, active_clip).unwrap_or(active_clip);
+                        let draw_rect =
+                            match compute_commands_bounds(group_slice, (0.0, 0.0), font_cache) {
+                                CommandBounds::Empty => {
+                                    idx = end_idx + 1;
+                                    continue;
+                                }
+                                CommandBounds::Known(r) => {
+                                    Rect::new(r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0)
+                                }
+                                CommandBounds::Unknown => fallback,
+                            };
+                        let masked = match mask {
+                            Some(m) if m.kind == SoftMaskKind::Alpha && m.transfer.is_none() => {
+                                match compute_commands_bounds(
+                                    &m.commands.commands,
+                                    m.offset,
+                                    font_cache,
+                                ) {
+                                    CommandBounds::Empty => {
+                                        idx = end_idx + 1;
+                                        continue;
+                                    }
+                                    CommandBounds::Known(mr) => {
+                                        let padded = Rect::new(
+                                            mr.x0 - 1.0,
+                                            mr.y0 - 1.0,
+                                            mr.x1 + 1.0,
+                                            mr.y1 + 1.0,
+                                        );
+                                        let Some(both) = intersect_rect(draw_rect, padded) else {
+                                            idx = end_idx + 1;
+                                            continue;
+                                        };
+                                        both
+                                    }
+                                    CommandBounds::Unknown => draw_rect,
+                                }
+                            }
+                            _ => draw_rect,
+                        };
+                        let Some(clipped) = intersect_rect(masked, active_clip) else {
+                            idx = end_idx + 1;
+                            continue;
+                        };
+                        index.insert_item(IndexedBackdropItem {
+                            start: idx,
+                            end: end_idx,
+                            bounds: Some(clipped),
+                        });
+                        idx = end_idx + 1;
+                    } else {
+                        index.insert_item(IndexedBackdropItem {
+                            start: idx,
+                            end: idx,
+                            bounds: None,
+                        });
+                        idx += 1;
+                    }
+                }
+                RenderCommand::PopBlendGroup => {
+                    if passthrough_blend_depth > 0 {
+                        passthrough_blend_depth -= 1;
+                    } else {
+                        index.insert_item(IndexedBackdropItem {
+                            start: idx,
+                            end: idx,
+                            bounds: None,
+                        });
+                    }
+                    idx += 1;
+                }
+                _ => {
+                    let item_bounds = match compute_commands_bounds(
+                        std::slice::from_ref(&commands[idx]),
+                        (0.0, 0.0),
+                        font_cache,
+                    ) {
+                        CommandBounds::Empty => {
+                            idx += 1;
+                            continue;
+                        }
+                        CommandBounds::Known(r) => {
+                            let padded = Rect::new(r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0);
+                            let Some(clipped) = intersect_rect(padded, active_clip) else {
+                                idx += 1;
+                                continue;
+                            };
+                            Some(clipped)
+                        }
+                        CommandBounds::Unknown => Some(active_clip),
+                    };
+                    index.insert_item(IndexedBackdropItem {
+                        start: idx,
+                        end: idx,
+                        bounds: item_bounds,
+                    });
+                    idx += 1;
+                }
+            }
+        }
+        index
+    }
+
+    fn relevant_items_for_rect(&self, rect: Rect) -> Vec<usize> {
+        let mut ids: Vec<usize> = Vec::new();
+        if let Some((tx0, tx1, ty0, ty1)) = Self::cell_range(self.origin_x, self.origin_y, rect) {
+            let cols = tx1 as i64 - tx0 as i64 + 1;
+            let rows = ty1 as i64 - ty0 as i64 + 1;
+            if cols > 0 && rows > 0 && cols.saturating_mul(rows) <= 16 {
+                ids.extend_from_slice(&self.global_items);
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        if let Some(bucket) = self.buckets.get(&(tx, ty)) {
+                            ids.extend_from_slice(bucket);
+                        }
+                    }
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                return ids;
+            }
+        }
+        for (id, item) in self.items.iter().enumerate() {
+            if item
+                .bounds
+                .is_none_or(|b| intersect_rect(b, rect).is_some())
+            {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+}
+
+struct BackdropTarget {
+    use_full_page: bool,
+    tile_idx: usize,
+    rect: Rect,
+    scale: f32,
+    width: u32,
+    height: u32,
+}
+
+struct BackdropManager<'a> {
+    full_page: Option<FullPageBackdrop<'a>>,
+    tiled: Vec<TiledBackdrop<'a>>,
+    index: Option<BackdropIndex>,
+    lru_clock: u64,
+    render_budget: Option<std::time::Duration>,
+}
+
+impl<'a> BackdropManager<'a> {
+    fn new(render_budget: Option<std::time::Duration>) -> Self {
+        Self {
+            full_page: None,
+            tiled: Vec::new(),
+            index: None,
+            lru_clock: 0,
+            render_budget,
+        }
+    }
+
+    fn live_pixels(&self) -> u64 {
+        let full = self.full_page.as_ref().map_or(0, |f| f.surface.pixels());
+        let tiled: u64 = self.tiled.iter().map(|t| t.surface.pixels()).sum();
+        full.saturating_add(tiled)
+    }
+
+    fn evict_to_fit(&mut self, needed_pixels: u64, keep_full_page: bool) {
+        if !keep_full_page
+            && self.live_pixels().saturating_add(needed_pixels) > MAX_BACKDROP_CACHE_PIXELS
+        {
+            self.full_page = None;
+        }
+        while !self.tiled.is_empty()
+            && self.live_pixels().saturating_add(needed_pixels) > MAX_BACKDROP_CACHE_PIXELS
+        {
+            if let Some((oldest_idx, _)) = self
+                .tiled
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, t)| t.last_used)
+            {
+                self.tiled.swap_remove(oldest_idx);
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn expire_all_budgets(&mut self) {
+        self.render_budget = Some(std::time::Duration::ZERO);
+        if let Some(full) = &mut self.full_page {
+            full.surface.remaining_budget = Some(std::time::Duration::ZERO);
+        }
+        for tile in &mut self.tiled {
+            tile.surface.remaining_budget = Some(std::time::Duration::ZERO);
+        }
+    }
 }
 
 struct SlideConverter<'a> {
@@ -254,8 +727,11 @@ struct SlideConverter<'a> {
     elements: Vec<SlideElement>,
     image_counter: usize,
     clip_stack: Vec<RenderCommand>,
-    backdrop: Option<BackdropCanvas<'a>>,
+    backdrop_mgr: BackdropManager<'a>,
+    render_budget: Option<std::time::Duration>,
     stats: ConversionStats,
+    #[cfg(test)]
+    expire_backdrop_after_groups: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -544,52 +1020,162 @@ impl<'a> SlideConverter<'a> {
         None
     }
 
-    fn ensure_backdrop_canvas(&mut self) -> Result<Option<()>> {
-        use zpdf_render::{PageRenderInfo, RenderBackend};
+    fn choose_tile_window(&self, crop_rect: Rect, crop_scale: f32) -> (Rect, f32) {
+        let crop_max_dim = crop_rect.width().max(crop_rect.height());
+        if crop_max_dim <= BACKDROP_TILE_PT {
+            let tile_scale = fit_scale_to_max_dim(BACKDROP_TILE_PT).unwrap_or(crop_scale);
+            let ox = self.page_rect.x0;
+            let oy = self.page_rect.y0;
+            let gx0 = ((crop_rect.x0 - ox) / BACKDROP_TILE_PT).floor();
+            let gx1 = ((crop_rect.x1 - ox) / BACKDROP_TILE_PT).floor();
+            let gy0 = ((crop_rect.y0 - oy) / BACKDROP_TILE_PT).floor();
+            let gy1 = ((crop_rect.y1 - oy) / BACKDROP_TILE_PT).floor();
+            let candidate = if gx0 == gx1 && gy0 == gy1 {
+                Rect::new(
+                    ox + gx0 * BACKDROP_TILE_PT,
+                    oy + gy0 * BACKDROP_TILE_PT,
+                    ox + (gx0 + 1.0) * BACKDROP_TILE_PT,
+                    oy + (gy0 + 1.0) * BACKDROP_TILE_PT,
+                )
+            } else {
+                let cx = 0.5 * (crop_rect.x0 + crop_rect.x1);
+                let cy = 0.5 * (crop_rect.y0 + crop_rect.y1);
+                let half = BACKDROP_TILE_PT * 0.5;
+                let mut x0 = (cx - half).max(self.page_rect.x0);
+                let mut x1 = (x0 + BACKDROP_TILE_PT).min(self.page_rect.x1);
+                x0 = (x1 - BACKDROP_TILE_PT).max(self.page_rect.x0);
+                x1 = x1.max(crop_rect.x1);
+                let mut y0 = (cy - half).max(self.page_rect.y0);
+                let mut y1 = (y0 + BACKDROP_TILE_PT).min(self.page_rect.y1);
+                y0 = (y1 - BACKDROP_TILE_PT).max(self.page_rect.y0);
+                y1 = y1.max(crop_rect.y1);
+                Rect::new(x0, y0, x1, y1)
+            };
+            let tile_rect = intersect_rect(candidate, self.page_rect).unwrap_or(crop_rect);
+            (tile_rect, tile_scale)
+        } else {
+            (crop_rect, crop_scale)
+        }
+    }
 
-        const MAX_MASK_RASTER_DIM: f64 = 2048.0;
-        const MAX_MASK_RASTER_SCALE: f64 = 2.0;
-
-        if self.backdrop.is_some() {
-            return Ok(Some(()));
-        }
-        let max_dim = self.page_rect.width().max(self.page_rect.height());
-        if !max_dim.is_finite() || max_dim <= 0.0 {
-            return Ok(None);
-        }
-        let mut scale = MAX_MASK_RASTER_SCALE.min(MAX_MASK_RASTER_DIM / max_dim) as f32;
-        if !scale.is_finite() || scale <= 0.0 {
-            return Ok(None);
-        }
-        while (max_dim * scale as f64).ceil() > MAX_MASK_RASTER_DIM && scale > f32::MIN_POSITIVE {
-            scale = f32::from_bits(scale.to_bits() - 1);
-        }
-
-        let mut renderer = zpdf_render_cpu::CpuRenderer::new()
-            .with_fonts(self.font_cache)
-            .with_images(self.image_cache);
-        renderer
-            .begin_page(&PageRenderInfo {
-                page_rect: self.page_rect,
-                scale,
-                background: zpdf_display_list::Color::white(),
-            })
-            .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX blend render: {e}")))?;
-        let Some((width, height, _)) = renderer.current_surface() else {
+    fn select_backdrop_target(
+        &mut self,
+        all_commands: &[RenderCommand],
+        crop_rect: Rect,
+        crop_scale: f32,
+    ) -> Result<Option<BackdropTarget>> {
+        let page_max_dim = self.page_rect.width().max(self.page_rect.height());
+        let Some(page_scale) = fit_scale_to_max_dim(page_max_dim) else {
             return Ok(None);
         };
-        let actual_scale = renderer.current_scale();
-        let rebaser =
-            SoftMaskRebaser::new(self.page_rect.x0, self.page_rect.y1, 1.0, 1.0, actual_scale);
-        self.backdrop = Some(BackdropCanvas {
-            renderer,
-            rebaser,
-            scale: actual_scale,
-            width,
-            height,
-            cursor: 0,
+
+        if crop_scale <= page_scale + 1e-6 {
+            if self.backdrop_mgr.full_page.is_none() {
+                let est_w = (self.page_rect.width() * page_scale as f64).ceil().max(1.0) as u64;
+                let est_h = (self.page_rect.height() * page_scale as f64)
+                    .ceil()
+                    .max(1.0) as u64;
+                self.backdrop_mgr.evict_to_fit(est_w * est_h, true);
+                let Some(surface) = BackdropSurface::open(
+                    self.page_rect,
+                    page_scale,
+                    self.font_cache,
+                    self.image_cache,
+                    self.backdrop_mgr.render_budget,
+                )?
+                else {
+                    return Ok(None);
+                };
+                self.backdrop_mgr.full_page = Some(FullPageBackdrop { surface, cursor: 0 });
+                self.stats.peak_backdrop_pixels = self
+                    .stats
+                    .peak_backdrop_pixels
+                    .max(self.backdrop_mgr.live_pixels());
+            }
+            let full = self.backdrop_mgr.full_page.as_ref().expect("initialized");
+            return Ok(Some(BackdropTarget {
+                use_full_page: true,
+                tile_idx: 0,
+                rect: full.surface.rect,
+                scale: full.surface.scale,
+                width: full.surface.width,
+                height: full.surface.height,
+            }));
+        }
+
+        // Small/medium crop on a large page: reuse or open a crop-scale tiled
+        // backdrop surface bounded by MAX_BACKDROP_CACHE_PIXELS.
+        self.backdrop_mgr.lru_clock += 1;
+        let tick = self.backdrop_mgr.lru_clock;
+        if let Some((idx, tile)) = self
+            .backdrop_mgr
+            .tiled
+            .iter_mut()
+            .enumerate()
+            .find(|(_, t)| {
+                t.surface.scale >= crop_scale - 1e-6
+                    && rect_contains_with_eps(t.surface.rect, crop_rect, 1e-4)
+            })
+        {
+            tile.last_used = tick;
+            return Ok(Some(BackdropTarget {
+                use_full_page: false,
+                tile_idx: idx,
+                rect: tile.surface.rect,
+                scale: tile.surface.scale,
+                width: tile.surface.width,
+                height: tile.surface.height,
+            }));
+        }
+
+        let (tile_rect, tile_scale) = self.choose_tile_window(crop_rect, crop_scale);
+        let est_w = (tile_rect.width() * tile_scale as f64).ceil().max(1.0) as u64;
+        let est_h = (tile_rect.height() * tile_scale as f64).ceil().max(1.0) as u64;
+        self.backdrop_mgr.evict_to_fit(est_w * est_h, false);
+
+        if self.backdrop_mgr.index.is_none() {
+            self.backdrop_mgr.index = Some(BackdropIndex::build(
+                all_commands,
+                self.page_rect,
+                self.font_cache,
+            ));
+        }
+        let relevant_items = self
+            .backdrop_mgr
+            .index
+            .as_ref()
+            .expect("built above")
+            .relevant_items_for_rect(tile_rect);
+
+        let Some(surface) = BackdropSurface::open(
+            tile_rect,
+            tile_scale,
+            self.font_cache,
+            self.image_cache,
+            self.backdrop_mgr.render_budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        let info = BackdropTarget {
+            use_full_page: false,
+            tile_idx: self.backdrop_mgr.tiled.len(),
+            rect: surface.rect,
+            scale: surface.scale,
+            width: surface.width,
+            height: surface.height,
+        };
+        self.backdrop_mgr.tiled.push(TiledBackdrop {
+            surface,
+            relevant_items,
+            item_pos: 0,
+            last_used: tick,
         });
-        Ok(Some(()))
+        self.stats.peak_backdrop_pixels = self
+            .stats
+            .peak_backdrop_pixels
+            .max(self.backdrop_mgr.live_pixels());
+        Ok(Some(info))
     }
 
     /// Rasterize a drawing group (soft-masked, clipped Type 3 artwork,
@@ -599,9 +1185,9 @@ impl<'a> SlideConverter<'a> {
     ///
     /// When `backdrop_range` is `Some((all_commands, _start, end_idx))` (for
     /// non-Normal blend modes such as `Multiply`), resolves the blend against a
-    /// persistent incremental page backdrop (`Color::white()` + commands executed
-    /// at most once in a single forward pass) and masks the output strictly to
-    /// pixels touched by `group_cmds`.
+    /// persistent incremental backdrop (full-page on standard pages, or a
+    /// bounded crop-scale tile with spatial command indexing on large sheets)
+    /// and masks the output strictly to pixels touched by `group_cmds`.
     fn flatten_commands_group(
         &mut self,
         group_cmds: &[RenderCommand],
@@ -611,9 +1197,6 @@ impl<'a> SlideConverter<'a> {
     ) -> Result<()> {
         use zpdf_display_list::SoftMaskKind;
         use zpdf_render::{PageRenderInfo, RenderBackend};
-
-        const MAX_MASK_RASTER_DIM: f64 = 2048.0;
-        const MAX_MASK_RASTER_SCALE: f64 = 2.0;
 
         let fallback_bounds =
             intersect_rect(group_bounds, self.page_rect).unwrap_or(self.page_rect);
@@ -665,35 +1248,39 @@ impl<'a> SlideConverter<'a> {
         let crop_w = crop_rect.width();
         let crop_h = crop_rect.height();
         let max_dim = crop_w.max(crop_h);
-        if !max_dim.is_finite() || max_dim <= 0.0 {
+        let Some(crop_scale) = fit_scale_to_max_dim(max_dim) else {
             return Ok(());
-        }
+        };
 
         if let Some((all_commands, _start_idx, end_idx)) = backdrop_range {
-            if self.ensure_backdrop_canvas()?.is_none() {
+            let Some(BackdropTarget {
+                use_full_page,
+                tile_idx,
+                rect: bg_rect,
+                scale: bg_scale,
+                width: bg_w,
+                height: bg_h,
+            }) = self.select_backdrop_target(all_commands, crop_rect, crop_scale)?
+            else {
                 return Ok(());
-            }
-            let (bg_scale, bg_w, bg_h) = {
-                let bg = self.backdrop.as_ref().expect("initialized above");
-                (bg.scale, bg.width, bg.height)
             };
             let s = bg_scale as f64;
-            let px0 = ((crop_rect.x0 - self.page_rect.x0) * s).floor().max(0.0) as u32;
-            let py0 = ((self.page_rect.y1 - crop_rect.y1) * s).floor().max(0.0) as u32;
-            let px1 = (((crop_rect.x1 - self.page_rect.x0) * s).ceil().max(0.0) as u32).min(bg_w);
-            let py1 = (((self.page_rect.y1 - crop_rect.y0) * s).ceil().max(0.0) as u32).min(bg_h);
+            let px0 = ((crop_rect.x0 - bg_rect.x0) * s).floor().max(0.0) as u32;
+            let py0 = ((bg_rect.y1 - crop_rect.y1) * s).floor().max(0.0) as u32;
+            let px1 = (((crop_rect.x1 - bg_rect.x0) * s).ceil().max(0.0) as u32).min(bg_w);
+            let py1 = (((bg_rect.y1 - crop_rect.y0) * s).ceil().max(0.0) as u32).min(bg_h);
             if px1 <= px0 || py1 <= py0 {
                 return Ok(());
             }
             let sub_w = px1 - px0;
             let sub_h = py1 - py0;
-            let sub_x0 = self.page_rect.x0 + px0 as f64 / s;
-            let sub_y1 = self.page_rect.y1 - py0 as f64 / s;
-            let mut sub_x1 = self.page_rect.x0 + px1 as f64 / s;
+            let sub_x0 = bg_rect.x0 + px0 as f64 / s;
+            let sub_y1 = bg_rect.y1 - py0 as f64 / s;
+            let mut sub_x1 = bg_rect.x0 + px1 as f64 / s;
             while ((sub_x1 - sub_x0) * s).ceil() > sub_w as f64 && sub_x1 > sub_x0 {
                 sub_x1 = sub_x1.next_down();
             }
-            let mut sub_y0 = self.page_rect.y1 - py1 as f64 / s;
+            let mut sub_y0 = bg_rect.y1 - py1 as f64 / s;
             while ((sub_y1 - sub_y0) * s).ceil() > sub_h as f64 && sub_y0 < sub_y1 {
                 sub_y0 = sub_y0.next_up();
             }
@@ -702,7 +1289,8 @@ impl<'a> SlideConverter<'a> {
             let mut pass1_rebaser = SoftMaskRebaser::new(sub_x0, sub_y1, 1.0, 1.0, bg_scale);
             let mut renderer = zpdf_render_cpu::CpuRenderer::new()
                 .with_fonts(self.font_cache)
-                .with_images(self.image_cache);
+                .with_images(self.image_cache)
+                .with_render_budget(self.render_budget);
             renderer
                 .begin_page(&PageRenderInfo {
                     page_rect: sub_render_rect,
@@ -718,15 +1306,25 @@ impl<'a> SlideConverter<'a> {
             }
             for cmd in group_cmds {
                 let prepared = pass1_rebaser.prepare_command(cmd);
-                renderer.execute(prepared.as_ref()).map_err(|e| {
-                    zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}"))
-                })?;
+                let exec_res = renderer
+                    .execute(prepared.as_ref())
+                    .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")));
+                if pass1_rebaser.take_needs_cpu_mask_cache_invalidation() {
+                    renderer.clear_soft_mask_cache();
+                }
+                drop(prepared);
+                exec_res?;
                 self.stats.pass1_command_visits += 1;
             }
             for _ in 0..self.clip_stack.len() {
                 renderer.execute(&RenderCommand::PopClip).map_err(|e| {
                     zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}"))
                 })?;
+            }
+            if renderer.is_over_budget() {
+                return Err(zpdf_core::Error::StreamDecode(
+                    "PPTX blend coverage render exceeded time budget".into(),
+                ));
             }
             let mut rendered = renderer
                 .end_page()
@@ -736,52 +1334,94 @@ impl<'a> SlideConverter<'a> {
                 return Ok(());
             }
 
-            // Advance the persistent page backdrop incrementally in a single
-            // monotonic forward pass so each preceding command executes at most
-            // once across the entire page regardless of how many blended groups
-            // appear.
-            {
-                let bg = self.backdrop.as_mut().expect("initialized above");
-                while bg.cursor <= end_idx {
-                    let prepared = bg.rebaser.prepare_command(&all_commands[bg.cursor]);
-                    bg.renderer.execute(prepared.as_ref()).map_err(|e| {
-                        zpdf_core::Error::StreamDecode(format!("PPTX blend render: {e}"))
-                    })?;
-                    bg.cursor += 1;
-                    self.stats.backdrop_command_visits += 1;
-                }
-                if let Some((surf_w, surf_h, surf_data)) = bg.renderer.current_surface() {
-                    if px1 <= surf_w
-                        && py1 <= surf_h
-                        && rendered.width == sub_w
-                        && rendered.height == sub_h
+            // Advance the selected backdrop surface incrementally up to `end_idx`,
+            // charging only active execute time against its render budget and
+            // surfacing any budget timeout as an explicit export error.
+            let surf_copy = if use_full_page {
+                let full = self
+                    .backdrop_mgr
+                    .full_page
+                    .as_mut()
+                    .expect("initialized above");
+                let batch_start = full.surface.start_batch_deadline();
+                let mut batch_err: Option<zpdf_core::Error> = None;
+                while full.cursor <= end_idx {
+                    if let Err(err) = full
+                        .surface
+                        .execute_command(&all_commands[full.cursor], &mut self.stats)
                     {
-                        let sw = sub_w as usize;
-                        let bw = surf_w as usize;
-                        for y in 0..sub_h as usize {
-                            let dst_row = y * sw * 4;
-                            let src_row = (py0 as usize + y) * bw * 4 + px0 as usize * 4;
-                            for x in 0..sw {
-                                let d = dst_row + x * 4;
-                                if rendered.data[d + 3] == 0 {
-                                    rendered.data[d..d + 4].copy_from_slice(&[0, 0, 0, 0]);
-                                } else {
-                                    let b = src_row + x * 4;
-                                    rendered.data[d..d + 4].copy_from_slice(&[
-                                        surf_data[b],
-                                        surf_data[b + 1],
-                                        surf_data[b + 2],
-                                        255,
-                                    ]);
-                                }
+                        batch_err = Some(err);
+                        break;
+                    }
+                    full.cursor += 1;
+                }
+                full.surface.finish_batch_deadline(batch_start);
+                if let Some(err) = batch_err {
+                    return Err(err);
+                }
+                full.surface.renderer.current_surface()
+            } else {
+                let index = self.backdrop_mgr.index.as_ref().expect("initialized above");
+                let tile = &mut self.backdrop_mgr.tiled[tile_idx];
+                let batch_start = tile.surface.start_batch_deadline();
+                let mut batch_err: Option<zpdf_core::Error> = None;
+                'tile_items: while tile.item_pos < tile.relevant_items.len() {
+                    let item = &index.items[tile.relevant_items[tile.item_pos]];
+                    if item.start > end_idx {
+                        break;
+                    }
+                    if let Some(b) = item.bounds {
+                        if intersect_rect(b, tile.surface.rect).is_none() {
+                            tile.item_pos += 1;
+                            continue;
+                        }
+                    }
+                    for cmd in &all_commands[item.start..=item.end] {
+                        if let Err(err) = tile.surface.execute_command(cmd, &mut self.stats) {
+                            batch_err = Some(err);
+                            break 'tile_items;
+                        }
+                    }
+                    tile.item_pos += 1;
+                }
+                tile.surface.finish_batch_deadline(batch_start);
+                if let Some(err) = batch_err {
+                    return Err(err);
+                }
+                tile.surface.renderer.current_surface()
+            };
+
+            if let Some((surf_w, surf_h, surf_data)) = surf_copy {
+                if px1 <= surf_w
+                    && py1 <= surf_h
+                    && rendered.width == sub_w
+                    && rendered.height == sub_h
+                {
+                    let sw = sub_w as usize;
+                    let bw = surf_w as usize;
+                    for y in 0..sub_h as usize {
+                        let dst_row = y * sw * 4;
+                        let src_row = (py0 as usize + y) * bw * 4 + px0 as usize * 4;
+                        for x in 0..sw {
+                            let d = dst_row + x * 4;
+                            if rendered.data[d + 3] == 0 {
+                                rendered.data[d..d + 4].copy_from_slice(&[0, 0, 0, 0]);
+                            } else {
+                                let b = src_row + x * 4;
+                                rendered.data[d..d + 4].copy_from_slice(&[
+                                    surf_data[b],
+                                    surf_data[b + 1],
+                                    surf_data[b + 2],
+                                    255,
+                                ]);
                             }
                         }
-                    } else {
-                        unpremultiply_rgba(&mut rendered.data);
                     }
                 } else {
                     unpremultiply_rgba(&mut rendered.data);
                 }
+            } else {
+                unpremultiply_rgba(&mut rendered.data);
             }
 
             let png_data = rgba_to_png(rendered.width, rendered.height, &rendered.data)?;
@@ -800,18 +1440,20 @@ impl<'a> SlideConverter<'a> {
                 image_data: png_data,
                 image_id,
             });
+            self.stats.backdrop_groups_completed += 1;
+            #[cfg(test)]
+            if self
+                .expire_backdrop_after_groups
+                .is_some_and(|n| self.stats.backdrop_groups_completed >= n)
+            {
+                self.backdrop_mgr.expire_all_budgets();
+            }
             return Ok(());
         }
 
         // Honor the raster dimension cap even on huge sheets (no floor that
         // could overshoot 2048 px or trigger an unexpected pixel-limit downscale).
-        let mut scale = MAX_MASK_RASTER_SCALE.min(MAX_MASK_RASTER_DIM / max_dim) as f32;
-        if !scale.is_finite() || scale <= 0.0 {
-            return Ok(());
-        }
-        while (max_dim * scale as f64).ceil() > MAX_MASK_RASTER_DIM && scale > f32::MIN_POSITIVE {
-            scale = f32::from_bits(scale.to_bits() - 1);
-        }
+        let scale = crop_scale;
 
         // Rebase any reused soft mask's `offset` into its commands before
         // rendering into the cropped target; otherwise `CpuRenderer` paints the
@@ -866,7 +1508,8 @@ impl<'a> SlideConverter<'a> {
 
         let mut renderer = zpdf_render_cpu::CpuRenderer::new()
             .with_fonts(self.font_cache)
-            .with_images(self.image_cache);
+            .with_images(self.image_cache)
+            .with_render_budget(self.render_budget);
         renderer
             .begin_page(&PageRenderInfo {
                 page_rect: render_rect,
@@ -891,6 +1534,11 @@ impl<'a> SlideConverter<'a> {
             renderer
                 .execute(&RenderCommand::PopClip)
                 .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
+        }
+        if renderer.is_over_budget() {
+            return Err(zpdf_core::Error::StreamDecode(
+                "PPTX mask render exceeded time budget".into(),
+            ));
         }
         let mut rendered = renderer
             .end_page()
@@ -985,9 +1633,20 @@ impl<'a> SlideConverter<'a> {
                 if !image_draw.alpha.is_finite() || image_draw.alpha <= 0.0 {
                     return Ok(());
                 }
-                if in_artwork_range
-                    && self.clip_stack_constrains_commands(std::slice::from_ref(cmd))
+                if !image_draw.transform.is_finite() {
+                    return Err(zpdf_core::Error::StreamDecode(
+                        "non-finite PPTX image transform".into(),
+                    ));
+                }
+                if (in_artwork_range
+                    && self.clip_stack_constrains_commands(std::slice::from_ref(cmd)))
+                    || matrix_has_shear(&image_draw.transform)
                 {
+                    let image = self
+                        .image_cache
+                        .get(image_draw.image_id)
+                        .ok_or_else(|| zpdf_core::Error::StreamDecode("Image not found".into()))?;
+                    validate_rgba_buffer(image.width, image.height, &image.data)?;
                     self.flatten_commands_group(
                         std::slice::from_ref(cmd),
                         None,
@@ -1002,8 +1661,19 @@ impl<'a> SlideConverter<'a> {
                 if !image_draw.alpha.is_finite() || image_draw.alpha <= 0.0 {
                     return Ok(());
                 }
-                if in_artwork_range
-                    && self.clip_stack_constrains_commands(std::slice::from_ref(cmd))
+                if !image_draw.transform.is_finite() {
+                    return Err(zpdf_core::Error::StreamDecode(
+                        "non-finite PPTX image transform".into(),
+                    ));
+                }
+                validate_rgba_buffer(
+                    image_draw.image.width,
+                    image_draw.image.height,
+                    &image_draw.image.data,
+                )?;
+                if (in_artwork_range
+                    && self.clip_stack_constrains_commands(std::slice::from_ref(cmd)))
+                    || matrix_has_shear(&image_draw.transform)
                 {
                     self.flatten_commands_group(
                         std::slice::from_ref(cmd),
@@ -1303,6 +1973,7 @@ impl<'a> SlideConverter<'a> {
                 "non-finite PPTX image transform".into(),
             ));
         }
+        validate_rgba_buffer(img_width, img_height, data)?;
 
         // Image transform: unit square [0,1]×[0,1] → page space
         let width = (mat.a * mat.a + mat.b * mat.b).sqrt();
@@ -1875,6 +2546,33 @@ fn path_control_bounds(path: &zpdf_display_list::Path) -> Option<Rect> {
         .then(|| Rect::new(x0, y0, x1, y1))
 }
 
+const MAX_TRANSLATED_MASK_ENTRIES: usize = 64;
+const MAX_TRANSLATED_MASK_BYTES: usize = 4 * 1024 * 1024;
+
+fn estimate_display_list_bytes(dl: &DisplayList) -> usize {
+    let mut bytes = std::mem::size_of::<DisplayList>()
+        + dl.commands.len() * std::mem::size_of::<RenderCommand>();
+    for cmd in &dl.commands {
+        match cmd {
+            RenderCommand::FillPath { path, .. }
+            | RenderCommand::StrokePath { path, .. }
+            | RenderCommand::PushClip { path, .. }
+            | RenderCommand::PushClipStroke { path, .. } => {
+                bytes = bytes.saturating_add(path.points().len().saturating_mul(24));
+            }
+            RenderCommand::DrawGlyphRun(run) => {
+                bytes = bytes.saturating_add(
+                    run.glyphs
+                        .len()
+                        .saturating_mul(std::mem::size_of::<zpdf_display_list::PositionedGlyph>()),
+                );
+            }
+            _ => {}
+        }
+    }
+    bytes
+}
+
 struct SoftMaskRebaser {
     origin_x: f64,
     origin_y: f64,
@@ -1883,10 +2581,22 @@ struct SoftMaskRebaser {
     /// Actual `CpuRenderer` page raster scale, used to preserve exact
     /// one-device-pixel hairlines independently of the curve-flattening clamp.
     render_scale: f32,
+    /// Optional target surface rectangle in PDF user space (unit scale only).
+    /// Masks whose unshifted geometry already fits inside `target_rect` do not
+    /// need path translation so `CpuRenderer` can reuse one shared mask plane
+    /// via `mask.offset` across repeated pattern tiles.
+    target_rect: Option<Rect>,
     /// Memoized offset-presence check keyed by input `Arc<DisplayList>` address.
     offset_cache: std::collections::HashMap<usize, bool>,
-    /// Memoized transformed display lists keyed by `(input Arc address, dx bits, dy bits)`.
+    /// Memoized unshifted target-containment check keyed by input `Arc<DisplayList>` address.
+    fits_target_cache: std::collections::HashMap<usize, bool>,
+    /// Bounded memoized transformed display lists keyed by `(input Arc address, dx bits, dy bits)`.
     translated_cache: std::collections::HashMap<(usize, u64, u64), std::sync::Arc<DisplayList>>,
+    retained_bytes: usize,
+    /// Set whenever a translated mask was returned without being retained in
+    /// `translated_cache`, instructing a long-lived `CpuRenderer` to clear its
+    /// `Arc::as_ptr`-keyed `soft_mask_planes` cache before dropping the transient `Arc`.
+    needs_cpu_mask_cache_invalidation: bool,
 }
 
 impl SoftMaskRebaser {
@@ -1897,9 +2607,22 @@ impl SoftMaskRebaser {
             scale_x,
             scale_y,
             render_scale,
+            target_rect: None,
             offset_cache: std::collections::HashMap::new(),
+            fits_target_cache: std::collections::HashMap::new(),
             translated_cache: std::collections::HashMap::new(),
+            retained_bytes: 0,
+            needs_cpu_mask_cache_invalidation: false,
         }
+    }
+
+    fn with_target_rect(mut self, target_rect: Rect) -> Self {
+        self.target_rect = Some(target_rect);
+        self
+    }
+
+    fn take_needs_cpu_mask_cache_invalidation(&mut self) -> bool {
+        std::mem::replace(&mut self.needs_cpu_mask_cache_invalidation, false)
     }
 
     fn is_unit_scale(&self) -> bool {
@@ -2027,6 +2750,98 @@ impl SoftMaskRebaser {
         has
     }
 
+    fn mask_fits_in_target(&mut self, dl: &std::sync::Arc<DisplayList>) -> bool {
+        let Some(target) = self.target_rect else {
+            return false;
+        };
+        let key = std::sync::Arc::as_ptr(dl) as usize;
+        if let Some(&cached) = self.fits_target_cache.get(&key) {
+            return cached;
+        }
+        let mut fits = true;
+        for cmd in &dl.commands {
+            match cmd {
+                RenderCommand::FillPath { path, .. } => {
+                    if !path.is_empty() {
+                        let Some(b) = path_control_bounds(path) else {
+                            fits = false;
+                            break;
+                        };
+                        if !rect_contains_with_eps(target, b, 1e-4) {
+                            fits = false;
+                            break;
+                        }
+                    }
+                }
+                RenderCommand::StrokePath { path, style, .. } => {
+                    if !path.is_empty() {
+                        let (Some(b), Some(grow)) =
+                            (path_control_bounds(path), stroke_style_grow(style))
+                        else {
+                            fits = false;
+                            break;
+                        };
+                        let expanded =
+                            Rect::new(b.x0 - grow, b.y0 - grow, b.x1 + grow, b.y1 + grow);
+                        if !rect_contains_with_eps(target, expanded, 1e-4) {
+                            fits = false;
+                            break;
+                        }
+                    }
+                }
+                RenderCommand::DrawImage(d) => {
+                    for &(u, v) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                        let p = zpdf_core::Point::new(u, v).transform(&d.transform);
+                        if !(p.x.is_finite()
+                            && p.y.is_finite()
+                            && p.x >= target.x0 - 1e-4
+                            && p.x <= target.x1 + 1e-4
+                            && p.y >= target.y0 - 1e-4
+                            && p.y <= target.y1 + 1e-4)
+                        {
+                            fits = false;
+                            break;
+                        }
+                    }
+                    if !fits {
+                        break;
+                    }
+                }
+                RenderCommand::DrawInlineImage(d) => {
+                    for &(u, v) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                        let p = zpdf_core::Point::new(u, v).transform(&d.transform);
+                        if !(p.x.is_finite()
+                            && p.y.is_finite()
+                            && p.x >= target.x0 - 1e-4
+                            && p.x <= target.x1 + 1e-4
+                            && p.y >= target.y0 - 1e-4
+                            && p.y <= target.y1 + 1e-4)
+                        {
+                            fits = false;
+                            break;
+                        }
+                    }
+                    if !fits {
+                        break;
+                    }
+                }
+                RenderCommand::DrawGlyphRun(_) => {
+                    fits = false;
+                    break;
+                }
+                RenderCommand::PushBlendGroup {
+                    mask: Some(inner), ..
+                } if !self.mask_fits_in_target(&inner.commands) => {
+                    fits = false;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        self.fits_target_cache.insert(key, fits);
+        fits
+    }
+
     fn rebase_mask(
         &mut self,
         mask: &zpdf_display_list::SoftMask,
@@ -2035,12 +2850,13 @@ impl SoftMaskRebaser {
     ) -> zpdf_display_list::SoftMask {
         let dx = mask.offset.0 as f64 + extra_dx;
         let dy = mask.offset.1 as f64 + extra_dy;
-        if self.is_unit_scale()
-            && dx == 0.0
-            && dy == 0.0
-            && !self.has_offset_in_list(&mask.commands)
-        {
-            return mask.clone();
+        if self.is_unit_scale() {
+            if dx == 0.0 && dy == 0.0 && !self.has_offset_in_list(&mask.commands) {
+                return mask.clone();
+            }
+            if extra_dx == 0.0 && extra_dy == 0.0 && self.mask_fits_in_target(&mask.commands) {
+                return mask.clone();
+            }
         }
         let commands = self.translate_display_list(&mask.commands, dx, dy);
         zpdf_display_list::SoftMask {
@@ -2070,9 +2886,17 @@ impl SoftMaskRebaser {
         for cmd in &dl.commands {
             out.push(self.translate_render_command(cmd, dx, dy));
         }
+        let entry_bytes = estimate_display_list_bytes(&out);
         let arc = std::sync::Arc::new(out);
-        self.translated_cache
-            .insert(key, std::sync::Arc::clone(&arc));
+        if self.translated_cache.len() < MAX_TRANSLATED_MASK_ENTRIES
+            && self.retained_bytes.saturating_add(entry_bytes) <= MAX_TRANSLATED_MASK_BYTES
+        {
+            self.retained_bytes = self.retained_bytes.saturating_add(entry_bytes);
+            self.translated_cache
+                .insert(key, std::sync::Arc::clone(&arc));
+        } else {
+            self.needs_cpu_mask_cache_invalidation = true;
+        }
         arc
     }
 
@@ -2349,8 +3173,54 @@ fn unpremultiply_rgba(data: &mut [u8]) {
     }
 }
 
+fn rect_contains_with_eps(outer: Rect, inner: Rect, eps: f64) -> bool {
+    let outer = outer.normalize();
+    let inner = inner.normalize();
+    inner.x0 >= outer.x0 - eps
+        && inner.y0 >= outer.y0 - eps
+        && inner.x1 <= outer.x1 + eps
+        && inner.y1 <= outer.y1 + eps
+}
+
+/// Whether the 2D linear part of `m` maps the unit X and Y axes to non-orthogonal
+/// vectors (sheared parallelogram that `SlideElement::Transformed` cannot represent
+/// with rotation + reflection alone).
+fn matrix_has_shear(m: &zpdf_core::Matrix) -> bool {
+    let len_u = m.a.hypot(m.b);
+    let len_v = m.c.hypot(m.d);
+    if !len_u.is_finite() || !len_v.is_finite() || len_u == 0.0 || len_v == 0.0 {
+        return false;
+    }
+    let dot = (m.a * m.c + m.b * m.d).abs();
+    dot / (len_u * len_v) > 1e-4
+}
+
+fn validate_rgba_buffer(width: u32, height: u32, data: &[u8]) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(zpdf_core::Error::StreamDecode(format!(
+            "invalid RGBA image dimensions: {width}x{height}"
+        )));
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            zpdf_core::Error::StreamDecode(format!(
+                "RGBA image dimensions overflow: {width}x{height}"
+            ))
+        })?;
+    if data.len() != expected {
+        return Err(zpdf_core::Error::StreamDecode(format!(
+            "RGBA image buffer length mismatch: expected {expected} bytes for {width}x{height}, got {}",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Convert RGBA8 pixels to PNG format
 fn rgba_to_png(width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>> {
+    validate_rgba_buffer(width, height, data)?;
     let mut png_data = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
     encoder
@@ -7339,6 +8209,8 @@ mod export_tests {
             &FontCache::new(),
             &ImageCache::new(),
             &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
         )
         .expect("small export");
 
@@ -7349,6 +8221,8 @@ mod export_tests {
             &FontCache::new(),
             &ImageCache::new(),
             &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
         )
         .expect("large export");
 
@@ -7443,6 +8317,8 @@ mod export_tests {
             &FontCache::new(),
             &ImageCache::new(),
             &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
         )
         .expect("slide export");
 
@@ -7467,5 +8343,604 @@ mod export_tests {
             [255, 255, 0, 255],
             "non-overlapping yellow Multiply over white must stay yellow"
         );
+    }
+
+    #[test]
+    fn expired_backdrop_deadline_returns_error_instead_of_copying_stale_pixels() {
+        let page_rect = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let mut dl = DisplayList::new(page_rect);
+        let mut bg = zpdf_display_list::Path::new();
+        bg.rect(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: bg,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        for x0 in [10.0, 110.0] {
+            let r = Rect::new(x0, 20.0, x0 + 60.0, 80.0);
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: r,
+                alpha: 1.0,
+                mask: None,
+            });
+            let mut p = zpdf_display_list::Path::new();
+            p.rect(r);
+            dl.push(RenderCommand::FillPath {
+                path: p,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+        }
+
+        // Case 1: already-expired budget at start must fail cleanly.
+        let err = display_list_to_slide_internal(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(std::time::Duration::ZERO),
+            None,
+        )
+        .err()
+        .expect("expired render budget must return an export error");
+        assert!(
+            err.to_string().contains("time budget"),
+            "unexpected error message: {err}"
+        );
+
+        // Case 2: first blend completes, then the backdrop deadline expires before
+        // the second blend — must surface an error rather than stamping stale pixels.
+        let err2 = display_list_to_slide_internal(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            Some(1),
+        )
+        .err()
+        .expect("mid-page backdrop deadline expiry must return an export error");
+        assert!(
+            err2.to_string().contains("time budget"),
+            "unexpected mid-page error message: {err2}"
+        );
+    }
+
+    #[test]
+    fn small_multiply_glyph_on_large_sheet_renders_at_crop_scale_with_bounded_memory_and_linear_visits(
+    ) {
+        let page_rect = Rect::new(0.0, 0.0, 8192.0, 8192.0);
+        let mut dl = DisplayList::new(page_rect);
+        // Light cyan backdrop across the entire 8192x8192 sheet.
+        let mut bg = zpdf_display_list::Path::new();
+        bg.rect(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: bg,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 1.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        // Small 12x12pt Multiply glyph at (100, 100) with two separated 2pt vertical strokes
+        // ([100..102] and [110..112]) and an 8pt transparent gap ([102..110]) between them.
+        let glyph_bounds = Rect::new(100.0, 100.0, 112.0, 112.0);
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: zpdf_display_list::BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: glyph_bounds,
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut left_stem = zpdf_display_list::Path::new();
+        left_stem.rect(Rect::new(100.0, 100.0, 102.0, 112.0));
+        dl.push(RenderCommand::FillPath {
+            path: left_stem,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 1.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut right_stem = zpdf_display_list::Path::new();
+        right_stem.rect(Rect::new(110.0, 100.0, 112.0, 112.0));
+        dl.push(RenderCommand::FillPath {
+            path: right_stem,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 1.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let (slide, stats) = display_list_to_slide_internal(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("large-sheet small glyph export");
+        assert!(
+            stats.peak_backdrop_pixels <= MAX_BACKDROP_CACHE_PIXELS,
+            "backdrop allocation must stay within 16 MiB pixel cap, got {}",
+            stats.peak_backdrop_pixels
+        );
+        assert_eq!(slide.elements.len(), 2);
+        let SlideElement::Image { image_data, .. } = &slide.elements[1] else {
+            panic!("expected Multiply SlideElement::Image");
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let (w, h) = rgba.dimensions();
+        // At crop scale 2.0, the padded 14x14pt crop renders at ~28x28px (NOT 3x3px at page scale 0.25!).
+        assert!(
+            w >= 24 && h >= 24,
+            "small 12pt Multiply glyph on 8192pt sheet must render at crop scale (~28x28px), got {w}x{h}"
+        );
+        // Left stem and right stem must be green (Multiply(yellow, cyan)) while the center gap stays transparent.
+        let mid_y = h / 2;
+        let left_px = rgba.get_pixel(3, mid_y).0;
+        let gap_px = rgba.get_pixel(w / 2, mid_y).0;
+        let right_px = rgba.get_pixel(w - 4, mid_y).0;
+        assert_eq!(
+            left_px,
+            [0, 255, 0, 255],
+            "left stem must be green, got {left_px:?}"
+        );
+        assert_eq!(
+            gap_px[3], 0,
+            "gap between stems must remain transparent, got {gap_px:?}"
+        );
+        assert_eq!(
+            right_px,
+            [0, 255, 0, 255],
+            "right stem must be green, got {right_px:?}"
+        );
+
+        // Also check bounded memory + linear command visits across many disjoint tiles on the 8192x8192 sheet.
+        let build_many = |count: usize| -> DisplayList {
+            let mut d = DisplayList::new(page_rect);
+            let mut full = zpdf_display_list::Path::new();
+            full.rect(page_rect);
+            d.push(RenderCommand::FillPath {
+                path: full,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            for i in 0..count {
+                // Place groups across 8 distinct 512x512 tiles along the sheet.
+                let tile = (i % 8) as f64;
+                let slot = (i / 8) as f64;
+                let x0 = tile * 600.0 + 20.0 + (slot % 10.0) * 20.0;
+                let y0 = 20.0 + (slot / 10.0).floor() * 20.0;
+                let r = Rect::new(x0, y0, x0 + 12.0, y0 + 12.0);
+                d.push(RenderCommand::PushBlendGroup {
+                    blend_mode: zpdf_display_list::BlendMode::Multiply,
+                    isolated: true,
+                    knockout: false,
+                    bounds: r,
+                    alpha: 1.0,
+                    mask: None,
+                });
+                let mut p = zpdf_display_list::Path::new();
+                p.rect(r);
+                d.push(RenderCommand::FillPath {
+                    path: p,
+                    rule: zpdf_display_list::FillRule::NonZero,
+                    paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+                d.push(RenderCommand::PopBlendGroup);
+            }
+            d
+        };
+        let dl_many = build_many(80);
+        let (slide_many, stats_many) = display_list_to_slide_internal(
+            &dl_many,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("many small glyphs on large sheet");
+        assert_eq!(slide_many.elements.len(), 81);
+        assert!(
+            stats_many.peak_backdrop_pixels <= MAX_BACKDROP_CACHE_PIXELS,
+            "multi-tile backdrop cache must stay bounded <= 16 MiB pixels, got {}",
+            stats_many.peak_backdrop_pixels
+        );
+        assert!(
+            stats_many.backdrop_command_visits <= dl_many.commands.len() * 6,
+            "tiled spatial index must keep backdrop command visits linear (not O(N^2)), got {} for {} commands",
+            stats_many.backdrop_command_visits,
+            dl_many.commands.len()
+        );
+    }
+
+    #[test]
+    fn backdrop_rebaser_bounds_retained_masks_and_keeps_cpu_mask_cache_consistent() {
+        let page_rect = Rect::new(0.0, 0.0, 200.0, 200.0);
+
+        // Part 1: Pattern tiles whose shared mask geometry lies inside page_rect
+        // must reuse CpuRenderer's native offset plane with ZERO retained translations.
+        let mut in_bounds_mask_dl = DisplayList::new(page_rect);
+        let mut mrect = zpdf_display_list::Path::new();
+        mrect.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        in_bounds_mask_dl.push(RenderCommand::FillPath {
+            path: mrect,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let shared_in_bounds = std::sync::Arc::new(in_bounds_mask_dl);
+        let mut dl_in = DisplayList::new(page_rect);
+        for i in 0..150 {
+            let x = (i % 15) as f32 * 12.0;
+            let y = (i / 15) as f32 * 12.0;
+            dl_in.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(x as f64, y as f64, x as f64 + 10.0, y as f64 + 10.0),
+                alpha: 1.0,
+                mask: Some(zpdf_display_list::SoftMask {
+                    kind: zpdf_display_list::SoftMaskKind::Alpha,
+                    commands: std::sync::Arc::clone(&shared_in_bounds),
+                    offset: (x, y),
+                    backdrop_luma: 0.0,
+                    transfer: None,
+                }),
+            });
+            let mut tile = zpdf_display_list::Path::new();
+            tile.rect(Rect::new(
+                x as f64,
+                y as f64,
+                x as f64 + 10.0,
+                y as f64 + 10.0,
+            ));
+            dl_in.push(RenderCommand::FillPath {
+                path: tile,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl_in.push(RenderCommand::PopBlendGroup);
+        }
+        // Trigger backdrop replay with a trailing Multiply group.
+        dl_in.push(RenderCommand::PushBlendGroup {
+            blend_mode: zpdf_display_list::BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut probe = zpdf_display_list::Path::new();
+        probe.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        dl_in.push(RenderCommand::FillPath {
+            path: probe,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_in.push(RenderCommand::PopBlendGroup);
+
+        let (_slide_in, stats_in) = display_list_to_slide_internal(
+            &dl_in,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("in-bounds pattern export");
+        assert_eq!(
+            stats_in.peak_rebaser_mask_entries, 0,
+            "in-bounds shared pattern masks must not be duplicated in SoftMaskRebaser"
+        );
+
+        // Part 2: Off-page shared mask translated to > MAX_TRANSLATED_MASK_ENTRIES
+        // distinct offsets must remain strictly bounded in retained cache size AND
+        // produce accurate uncorrupted mask output past the cap.
+        let mut off_page_mask_dl = DisplayList::new(Rect::new(-100.0, -100.0, 0.0, 0.0));
+        let mut off_rect = zpdf_display_list::Path::new();
+        off_rect.rect(Rect::new(-50.0, -50.0, -40.0, -40.0));
+        off_page_mask_dl.push(RenderCommand::FillPath {
+            path: off_rect,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let shared_off_page = std::sync::Arc::new(off_page_mask_dl);
+
+        let mut dl_off = DisplayList::new(page_rect);
+        // 120 distinct offsets (> MAX_TRANSLATED_MASK_ENTRIES = 64); the last tile lands at [150..160]x[150..160].
+        for i in 0..120 {
+            let target_x = if i == 119 {
+                150.0f32
+            } else {
+                (i % 12) as f32 * 10.0
+            };
+            let target_y = if i == 119 {
+                150.0f32
+            } else {
+                (i / 12) as f32 * 10.0
+            };
+            let off_x = target_x + 50.0;
+            let off_y = target_y + 50.0;
+            dl_off.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: page_rect,
+                alpha: 1.0,
+                mask: Some(zpdf_display_list::SoftMask {
+                    kind: zpdf_display_list::SoftMaskKind::Alpha,
+                    commands: std::sync::Arc::clone(&shared_off_page),
+                    offset: (off_x, off_y),
+                    backdrop_luma: 0.0,
+                    transfer: None,
+                }),
+            });
+            let mut tile = zpdf_display_list::Path::new();
+            tile.rect(Rect::new(
+                target_x as f64,
+                target_y as f64,
+                target_x as f64 + 10.0,
+                target_y as f64 + 10.0,
+            ));
+            dl_off.push(RenderCommand::FillPath {
+                path: tile,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl_off.push(RenderCommand::PopBlendGroup);
+        }
+        // Multiply over the final post-cap tile at [150..160]x[150..160] and an unpainted neighbor [170..180].
+        dl_off.push(RenderCommand::PushBlendGroup {
+            blend_mode: zpdf_display_list::BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(150.0, 150.0, 180.0, 160.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut probe_rect = zpdf_display_list::Path::new();
+        probe_rect.rect(Rect::new(150.0, 150.0, 180.0, 160.0));
+        dl_off.push(RenderCommand::FillPath {
+            path: probe_rect,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_off.push(RenderCommand::PopBlendGroup);
+
+        let (slide_off, stats_off) = display_list_to_slide_internal(
+            &dl_off,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("off-page bounded rebaser export");
+        assert!(
+            stats_off.peak_rebaser_mask_entries <= MAX_TRANSLATED_MASK_ENTRIES,
+            "retained translated masks must stay <= {MAX_TRANSLATED_MASK_ENTRIES}, got {}",
+            stats_off.peak_rebaser_mask_entries
+        );
+        assert!(
+            stats_off.peak_rebaser_mask_bytes <= MAX_TRANSLATED_MASK_BYTES,
+            "retained translated mask bytes must stay <= {MAX_TRANSLATED_MASK_BYTES}, got {}",
+            stats_off.peak_rebaser_mask_bytes
+        );
+        let SlideElement::Image { image_data, .. } =
+            slide_off.elements.last().expect("trailing Multiply image")
+        else {
+            panic!("expected trailing Multiply SlideElement::Image");
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let (w, h) = rgba.dimensions();
+        // Left third [150..160] overlaps the 120th post-cap blue tile -> black.
+        assert_eq!(
+            rgba.get_pixel(w / 6, h / 2).0,
+            [0, 0, 0, 255],
+            "post-cap translated mask tile must render accurately onto backdrop without stale cache collision"
+        );
+        // Right third [170..180] is over white -> red.
+        assert_eq!(
+            rgba.get_pixel(w * 5 / 6, h / 2).0,
+            [255, 0, 0, 255],
+            "unpainted neighbor outside post-cap mask tile must remain white->red"
+        );
+    }
+
+    #[test]
+    fn sheared_type3_inline_bitmap_preserves_parallelogram_geometry() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Unmapped Type 3 glyph draws a solid 2x2 red RGB inline bitmap over [0..1000]^2.
+        // Shown with sheared text matrix `1 0 1 1 20 20 Tm` at 40pt:
+        // maps unit square [0..1]^2 -> parallelogram with corners (20,20), (60,20), (60,60), (100,60),
+        // bounding box [20..100] x [20..60] (width = 80pt, height = 40pt).
+        let mut glyph_ops =
+            b"1000 0 d0 1000 0 0 1000 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /RGB ID ".to_vec();
+        glyph_ops.extend_from_slice(&[255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0]);
+        glyph_ops.extend_from_slice(b"\nEI");
+
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"BT /F1 40 Tf 1 0 1 1 20 20 Tm (A) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /logo 8 0 R >>".to_vec(),                 // 6
+            b"<< /Type /Encoding /Differences [65 /logo] >>".to_vec(), // 7
+            stream("", &glyph_ops),                        // 8
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+        assert_eq!(slide.elements.len(), 1);
+        // Must be flattened to an untransformed cropped SlideElement::Image covering [20..100]x[20..60].
+        let SlideElement::Image {
+            width_emu,
+            height_emu,
+            image_data,
+            ..
+        } = &slide.elements[0]
+        else {
+            panic!(
+                "sheared inline bitmap must flatten to affine-rasterized SlideElement::Image, got {:?}",
+                slide.elements[0]
+            );
+        };
+        assert!(
+            *width_emu >= pt_to_emu(79.0) && *height_emu >= pt_to_emu(39.0),
+            "sheared parallelogram bounding box must cover 80x40pt, got {}x{}",
+            *width_emu as f64 / 12700.0,
+            *height_emu as f64 / 12700.0
+        );
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let (w, h) = rgba.dimensions();
+        // Center of parallelogram is opaque red; top-left and bottom-right bounding-box corners
+        // lie outside the parallelogram and must remain transparent!
+        let center = rgba.get_pixel(w / 2, h / 2).0;
+        assert!(
+            center[3] > 240 && center[0] > 240 && center[1] < 15 && center[2] < 15,
+            "sheared bitmap interior must be opaque red, got {center:?}"
+        );
+        assert_eq!(
+            rgba.get_pixel(4, 4).0[3],
+            0,
+            "top-left corner outside sheared parallelogram must stay transparent"
+        );
+        assert_eq!(
+            rgba.get_pixel(w - 5, h - 5).0[3],
+            0,
+            "bottom-right corner outside sheared parallelogram must stay transparent"
+        );
+    }
+
+    #[test]
+    fn inconsistent_inline_image_dimensions_return_error_without_panicking() {
+        let cases = [
+            (0, 2, vec![]),
+            (2, 0, vec![]),
+            (2, 2, vec![255, 0, 0, 255]),     // truncated (4 vs 16)
+            (1, 1, vec![255; 8]),             // oversized (8 vs 4)
+            (u32::MAX, u32::MAX, vec![0; 4]), // checked_mul overflow
+        ];
+        for (width, height, data) in cases {
+            for transform in [
+                Matrix::new(20.0, 0.0, 0.0, 20.0, 10.0, 10.0),
+                Matrix::new(20.0, 0.0, 10.0, 20.0, 10.0, 10.0), // sheared path too
+            ] {
+                let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 80.0, 80.0));
+                dl.push(RenderCommand::DrawInlineImage(
+                    zpdf_display_list::InlineImageDraw {
+                        image: std::sync::Arc::new(zpdf_display_list::InlineImage {
+                            width,
+                            height,
+                            data: data.clone(),
+                            has_alpha: false,
+                            is_image_mask: false,
+                            premultiplied: false,
+                        }),
+                        transform,
+                        alpha: 1.0,
+                    },
+                ));
+                let res = display_list_to_slide(
+                    &dl,
+                    0,
+                    &FontCache::new(),
+                    &ImageCache::new(),
+                    &ConversionOptions::default(),
+                );
+                assert!(
+                    res.is_err(),
+                    "inconsistent inline image ({width}x{height}, {} bytes) must return Err",
+                    data.len()
+                );
+            }
+        }
     }
 }

@@ -360,7 +360,7 @@ fn stroke_overshoot(width: f32, miter_limit: f32) -> f32 {
 /// Default [`CpuRenderer::render_budget`]. Generous enough that no realistic page
 /// approaches it (complex pages render in well under a second) while bounding
 /// pathological inputs to a few seconds.
-const DEFAULT_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+pub const DEFAULT_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Outline commands [`CpuRenderer`] keeps per page for reuse (about 28 MiB);
 /// glyphs past it are extracted from the font program on every draw.
@@ -549,6 +549,28 @@ impl<'a> CpuRenderer<'a> {
     /// Effective device pixel scale currently installed by `begin_page`.
     pub fn current_scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Whether the current page exceeded its configured wall-clock
+    /// `render_budget` and skipped subsequent paint commands.
+    pub fn is_over_budget(&self) -> bool {
+        self.over_budget
+    }
+
+    /// Update the active page's wall-clock deadline (or `None` to pause
+    /// budget tracking while the caller performs unrelated work between
+    /// command batches on a long-lived page surface).
+    pub fn set_deadline(&mut self, deadline: Option<zpdf_core::time::Instant>) {
+        self.deadline = deadline;
+    }
+
+    /// Drop all cached soft-mask coverage planes on the current page. Callers
+    /// that pass temporary rebased `Arc<DisplayList>` masks to a long-lived
+    /// renderer should clear this cache before dropping those temporary `Arc`s
+    /// so subsequent allocations cannot reuse an old `Arc::as_ptr` key.
+    pub fn clear_soft_mask_cache(&mut self) {
+        self.soft_mask_planes.clear();
+        self.soft_mask_cache_bytes = 0;
     }
 
     /// Start a stopwatch, or `None` when not collecting. Pair with [`Self::tock`].
