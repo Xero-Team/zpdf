@@ -1263,23 +1263,39 @@ impl<'a> SlideConverter<'a> {
                     union.y1.max(snap.crop_rect.y1),
                 );
             }
-            // Tighten the tile surface to the union of its queued snapshots
-            // snapped outward onto the tile's device-pixel grid so narrow
-            // strips or sparse tiles allocate and blend only needed pixels.
-            let gs = group.tile_scale as f64;
-            let gx0 = ((union.x0 - group.tile_rect.x0) * gs).floor().max(0.0);
-            let gy0 = ((group.tile_rect.y1 - union.y1) * gs).floor().max(0.0);
-            let gx1 = ((union.x1 - group.tile_rect.x0) * gs).ceil().max(gx0 + 1.0);
-            let gy1 = ((group.tile_rect.y1 - union.y0) * gs).ceil().max(gy0 + 1.0);
-            let tight_rect = Rect::new(
-                (group.tile_rect.x0 + gx0 / gs).max(group.tile_rect.x0),
-                (group.tile_rect.y1 - gy1 / gs).max(group.tile_rect.y0),
-                (group.tile_rect.x0 + gx1 / gs).min(group.tile_rect.x1),
-                (group.tile_rect.y1 - gy0 / gs).min(group.tile_rect.y1),
-            );
+            // Choose the highest permitted raster scale for the collected crop
+            // union (up to MAX_MASK_RASTER_SCALE / MAX_MASK_RASTER_DIM) while
+            // keeping the shared grouping window for O(N) coalescing, so e.g.
+            // a single 800pt strip in a 2048pt window still renders at 2.0x.
+            let snap_tight_rect = |s: f32| -> (Rect, u32, u32) {
+                let gs = s as f64;
+                let gx0 = ((union.x0 - group.tile_rect.x0) * gs).floor().max(0.0);
+                let gy0 = ((group.tile_rect.y1 - union.y1) * gs).floor().max(0.0);
+                let gx1 = ((union.x1 - group.tile_rect.x0) * gs).ceil().max(gx0 + 1.0);
+                let gy1 = ((group.tile_rect.y1 - union.y0) * gs).ceil().max(gy0 + 1.0);
+                let rect = Rect::new(
+                    (group.tile_rect.x0 + gx0 / gs).max(group.tile_rect.x0),
+                    (group.tile_rect.y1 - gy1 / gs).max(group.tile_rect.y0),
+                    (group.tile_rect.x0 + gx1 / gs).min(group.tile_rect.x1),
+                    (group.tile_rect.y1 - gy0 / gs).min(group.tile_rect.y1),
+                );
+                let w = (rect.width() * gs).ceil().max(1.0) as u32;
+                let h = (rect.height() * gs).ceil().max(1.0) as u32;
+                (rect, w, h)
+            };
+            let union_max_dim = union.width().max(union.height());
+            let mut surface_scale = fit_scale_to_max_dim(union_max_dim)
+                .map_or(group.tile_scale, |s| s.max(group.tile_scale));
+            let (mut tight_rect, w, h) = snap_tight_rect(surface_scale);
+            if w > MAX_MASK_RASTER_DIM as u32 || h > MAX_MASK_RASTER_DIM as u32 {
+                let refit_dim = union_max_dim + 2.0 / surface_scale as f64;
+                surface_scale = fit_scale_to_max_dim(refit_dim)
+                    .map_or(group.tile_scale, |s| s.max(group.tile_scale));
+                tight_rect = snap_tight_rect(surface_scale).0;
+            }
             let Some(mut surface) = BackdropSurface::open(
                 tight_rect,
-                group.tile_scale,
+                surface_scale,
                 self.font_cache,
                 self.image_cache,
                 self.backdrop_mgr.render_budget,
@@ -1510,16 +1526,14 @@ impl<'a> SlideConverter<'a> {
             };
             if crop_scale > page_scale + 1e-6 {
                 if let Some((key, tile_rect, tile_scale)) = self.choose_tile_window(crop_rect) {
-                    if tile_scale > page_scale + 1e-6 {
-                        // Small/medium/wide crop on a large sheet: batch snapshots
-                        // on canonical hierarchical grid windows so every window
-                        // renders in a single monotonic forward pass with bounded
-                        // memory and linear command visits.
-                        self.enqueue_tiled_backdrop_snapshot(
-                            start_idx, end_idx, crop_rect, key, tile_rect, tile_scale,
-                        );
-                        return Ok(());
-                    }
+                    // Small/medium/wide crop on a large sheet: batch snapshots
+                    // on canonical hierarchical grid windows so every window
+                    // renders in a single monotonic forward pass with bounded
+                    // memory, linear command visits, and union-fitted scale.
+                    self.enqueue_tiled_backdrop_snapshot(
+                        start_idx, end_idx, crop_rect, key, tile_rect, tile_scale,
+                    );
+                    return Ok(());
                 }
             }
 
@@ -1804,7 +1818,7 @@ impl<'a> SlideConverter<'a> {
                         None,
                     )?;
                 } else {
-                    self.convert_fill_path(path, paint, effective_alpha)?;
+                    self.convert_fill_path(path, paint, effective_alpha, !in_artwork_range)?;
                 }
             }
             RenderCommand::StrokePath {
@@ -2039,6 +2053,7 @@ impl<'a> SlideConverter<'a> {
         path: &zpdf_display_list::Path,
         paint: &zpdf_display_list::Paint,
         effective_alpha: f32,
+        allow_ellipse_recognition: bool,
     ) -> Result<()> {
         use zpdf_display_list::Paint;
 
@@ -2065,7 +2080,7 @@ impl<'a> SlideConverter<'a> {
             }
         }
 
-        if self.options.recognize_ellipses {
+        if allow_ellipse_recognition && self.options.recognize_ellipses {
             if let Some(rect) = shape_recognizer::recognize_ellipse(path) {
                 let (x_ppt, y_ppt) = self.pdf_to_ppt_coords(rect.x0, rect.y1);
                 let element = SlideElement::Ellipse {
@@ -10269,6 +10284,93 @@ mod export_tests {
                 "{label}: red Multiply over blue must blend to black"
             );
         }
+
+        // Single 800pt-wide Multiply strip in a 2048pt grouping window must
+        // choose its raster scale from the 802pt rendered union (2.0x -> ~1604px),
+        // preserving an aligned 0.5pt gap as a clear transparent pixel column.
+        let mut dl_gap = DisplayList::new(page_rect);
+        let mut bg = zpdf_display_list::Path::new();
+        bg.rect(page_rect);
+        dl_gap.push(RenderCommand::FillPath {
+            path: bg,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let strip_bounds = Rect::new(100.0, 100.0, 900.0, 120.0);
+        dl_gap.push(RenderCommand::PushBlendGroup {
+            blend_mode: zpdf_display_list::BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: strip_bounds,
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut left_half = zpdf_display_list::Path::new();
+        left_half.rect(Rect::new(100.0, 100.0, 500.0, 120.0));
+        dl_gap.push(RenderCommand::FillPath {
+            path: left_half,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut right_half = zpdf_display_list::Path::new();
+        right_half.rect(Rect::new(500.5, 100.0, 900.0, 120.0));
+        dl_gap.push(RenderCommand::FillPath {
+            path: right_half,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_gap.push(RenderCommand::PopBlendGroup);
+
+        let (slide_gap, stats_gap) = display_list_to_slide_internal(
+            &dl_gap,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("800pt gapped strip export");
+        assert!(stats_gap.peak_backdrop_pixels <= MAX_BACKDROP_CACHE_PIXELS);
+        assert_eq!(slide_gap.elements.len(), 2);
+        let SlideElement::Image {
+            x_emu, image_data, ..
+        } = &slide_gap.elements[1]
+        else {
+            panic!("expected SlideElement::Image for 800pt strip");
+        };
+        let gap_rgba = image::load_from_memory(image_data)
+            .expect("decode gapped strip PNG")
+            .to_rgba8();
+        let (gw, gh) = gap_rgba.dimensions();
+        assert!(
+            gw >= 1600,
+            "800pt strip in 2048pt window must render at 2.0x (~1604px), got {gw}x{gh}"
+        );
+        let x0_pt = *x_emu as f64 / 12700.0;
+        let gap_x = ((500.0 - x0_pt) * 2.0).round() as u32;
+        assert_eq!(
+            gap_rgba.get_pixel(gap_x, gh / 2).0[3],
+            0,
+            "aligned 0.5pt gap at x=500.0..500.5 must stay transparent at 2.0x, got {:?}",
+            gap_rgba.get_pixel(gap_x, gh / 2).0
+        );
+        assert_eq!(
+            gap_rgba.get_pixel(gap_x - 4, gh / 2).0,
+            [0, 0, 0, 255],
+            "left strip half must blend red Multiply over blue to black"
+        );
+        assert_eq!(
+            gap_rgba.get_pixel(gap_x + 4, gh / 2).0,
+            [0, 0, 0, 255],
+            "right strip half must blend red Multiply over blue to black"
+        );
     }
 
     #[test]
@@ -11206,6 +11308,157 @@ mod export_tests {
             ),
             "/simple_rect must remain native SlideElement::Rectangle, got {:?}",
             slide.elements[4]
+        );
+    }
+
+    #[test]
+    fn type3_four_cubic_notched_glyph_preserves_actual_outline_not_ellipse() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Four-cubic heart-like glyph with a deep inward top notch down to (500, 620)
+        // while the two lobes peak near y=850 and the bottom tip sits at (500, 100).
+        // `recognize_ellipse` would misclassify any closed 4-cubic path as an oval.
+        let heart_curves = b"500 620 m \
+            500 880 100 940 100 600 c \
+            100 350 300 220 500 100 c \
+            700 220 900 350 900 600 c \
+            900 940 500 880 500 620 c h ";
+        let mut filled_heart = b"1000 0 d0 ".to_vec();
+        filled_heart.extend_from_slice(heart_curves);
+        filled_heart.push(b'f');
+        let mut stroked_heart = b"1000 0 d0 40 w ".to_vec();
+        stroked_heart.extend_from_slice(heart_curves);
+        stroked_heart.push(b'S');
+
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 260 120] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"0 0 1 rg 0 0 1 RG BT /F1 100 Tf 10 10 Td (AB) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /heart_fill 8 0 R /heart_stroke 9 0 R >>".to_vec(), // 6
+            b"<< /Type /Encoding /Differences [65 /heart_fill /heart_stroke] >>".to_vec(), // 7
+            stream("", &filled_heart),                     // 8
+            stream("", &stroked_heart),                    // 9
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+        assert_eq!(slide.elements.len(), 2);
+        assert!(
+            !slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::Ellipse { .. })),
+            "four-cubic notched Type 3 glyph must NOT collapse into SlideElement::Ellipse: {:?}",
+            slide.elements
+        );
+
+        let SlideElement::Image {
+            x_emu,
+            y_emu,
+            image_data,
+            ..
+        } = &slide.elements[0]
+        else {
+            panic!(
+                "filled four-cubic heart glyph must preserve actual outline via rasterization, got {:?}",
+                slide.elements[0]
+            );
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode heart PNG")
+            .to_rgba8();
+        let x_pt = *x_emu as f64 / 12700.0;
+        let y_pt = *y_emu as f64 / 12700.0;
+        let sample_pdf = |pdf_x: f64, pdf_y: f64| -> [u8; 4] {
+            let ppt_y = 120.0 - pdf_y;
+            let px = ((pdf_x - x_pt) * 2.0).round() as u32;
+            let py = ((ppt_y - y_pt) * 2.0).round() as u32;
+            rgba.get_pixel(px, py).0
+        };
+        let is_blue = |px: [u8; 4]| px[3] > 240 && px[2] > 240 && px[0] < 15 && px[1] < 15;
+
+        // Top inward notch at glyph (500, 780) -> PDF (60, 88) must be transparent (NOT filled oval!).
+        let notch_px = sample_pdf(60.0, 88.0);
+        assert_eq!(
+            notch_px[3], 0,
+            "inward top notch of 4-cubic heart must stay transparent, got {notch_px:?}"
+        );
+        // Left lobe (300, 680) -> PDF (40, 78), right lobe (700, 680) -> PDF (80, 78),
+        // and lower center (500, 420) -> PDF (60, 52) must be opaque blue.
+        assert!(
+            is_blue(sample_pdf(40.0, 78.0)),
+            "left lobe must be blue, got {:?}",
+            sample_pdf(40.0, 78.0)
+        );
+        assert!(
+            is_blue(sample_pdf(80.0, 78.0)),
+            "right lobe must be blue, got {:?}",
+            sample_pdf(80.0, 78.0)
+        );
+        assert!(
+            is_blue(sample_pdf(60.0, 52.0)),
+            "lower center body must be blue, got {:?}",
+            sample_pdf(60.0, 52.0)
+        );
+
+        // Stroked four-cubic heart preserves its exact freeform cubic Bézier path.
+        let SlideElement::FreeformPath { path_data, .. } = &slide.elements[1] else {
+            panic!(
+                "stroked four-cubic heart must stay FreeformPath, got {:?}",
+                slide.elements[1]
+            );
+        };
+        assert!(
+            path_data.contains("C "),
+            "stroked four-cubic heart must preserve cubic curve segments: {path_data}"
         );
     }
 }
