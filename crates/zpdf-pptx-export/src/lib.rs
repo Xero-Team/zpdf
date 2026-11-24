@@ -495,7 +495,9 @@ struct NativeOnlyTextRecord {
     resolved_alpha: f32,
     is_opaque_black: bool,
     is_opaque_white: bool,
-    occluded: bool,
+    /// Portion of this run painted over by later intervening paint without
+    /// burying the entire run.
+    occluded_regions: MissingTextCoverage,
     alive: bool,
     last_stamp: u64,
 }
@@ -1757,7 +1759,7 @@ impl<'a> SlideConverter<'a> {
                     if rec_a == 0 {
                         return true;
                     }
-                    if rec.occluded {
+                    if rec.occluded_regions.overlaps_rect(target_rect) {
                         overlap_err = Some(zpdf_core::Error::StreamDecode(
                             "PPTX overprinting native-only text overlaps earlier native-only text occluded by intervening paint".into(),
                         ));
@@ -1829,19 +1831,10 @@ impl<'a> SlideConverter<'a> {
                 && (unbounded.iter().any(|&t| t) || bounded.iter().any(|&(_, t)| t));
             let mut stacked_conflict = unbounded_conflicts;
             if !stacked_conflict && bounded.len() > 1 {
-                bounded.sort_unstable_by(|a, b| a.0.x0.total_cmp(&b.0.x0));
-                'sweep: for i in 0..bounded.len() {
-                    let (ra, ta) = bounded[i];
-                    for &(rb, tb) in &bounded[i + 1..] {
-                        if rb.x0 > ra.x1 {
-                            break;
-                        }
-                        if (ta || tb) && intersect_rect(ra, rb).is_some() {
-                            stacked_conflict = true;
-                            break 'sweep;
-                        }
-                    }
-                }
+                stacked_conflict = has_stacked_translucent_rect_overlap(
+                    &bounded,
+                    &mut self.stats.native_text_record_visits,
+                );
             }
             if stacked_conflict {
                 return Err(zpdf_core::Error::StreamDecode(
@@ -1906,7 +1899,7 @@ impl<'a> SlideConverter<'a> {
                 resolved_alpha,
                 is_opaque_black,
                 is_opaque_white,
-                occluded: false,
+                occluded_regions: MissingTextCoverage::None,
                 alive: true,
                 last_stamp: 0,
             });
@@ -1936,7 +1929,16 @@ impl<'a> SlideConverter<'a> {
                 if !((rec.is_opaque_black && paint_is_opaque_black)
                     || (rec.is_opaque_white && paint_is_opaque_white))
                 {
-                    rec.occluded = true;
+                    match (bounds, rec.bounds) {
+                        (Some(pb), Some(tb)) => {
+                            if let Some(inter) = intersect_rect(pb, tb) {
+                                rec.occluded_regions.union_rect(inter);
+                            }
+                        }
+                        _ => {
+                            rec.occluded_regions = MissingTextCoverage::Unbounded;
+                        }
+                    }
                 }
                 true
             });
@@ -3031,7 +3033,7 @@ impl<'a> SlideConverter<'a> {
                             Some(crop_rect),
                             &mut self.stats,
                             |rec_idx, rec| {
-                                let promotable = !rec.occluded
+                                let promotable = rec.occluded_regions.is_empty()
                                     && ((rec.is_opaque_black && preserves_black)
                                         || (rec.is_opaque_white && preserves_white));
                                 if promotable {
@@ -3103,7 +3105,7 @@ impl<'a> SlideConverter<'a> {
                         if overlap_err.is_none()
                             && pass1_touches_rect(&rendered, sub_render_rect, bg_scale, rec.bounds)
                         {
-                            let promotable = !rec.occluded
+                            let promotable = rec.occluded_regions.is_empty()
                                 && ((rec.is_opaque_black && preserves_black)
                                     || (rec.is_opaque_white && preserves_white));
                             if promotable {
@@ -4823,20 +4825,50 @@ enum MissingTextCoverage {
 }
 
 impl MissingTextCoverage {
-    fn union_rect(&mut self, mut r: Rect) {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    fn overlaps_rect(&self, target: Rect) -> bool {
+        match self {
+            Self::None => false,
+            Self::Unbounded => true,
+            Self::Regions(rects) => rects.iter().any(|&r| intersect_rect(r, target).is_some()),
+        }
+    }
+
+    fn union_rect(&mut self, r: Rect) {
+        let mut r = r.normalize();
+        if !(r.x0.is_finite() && r.y0.is_finite() && r.x1.is_finite() && r.y1.is_finite()) {
+            *self = Self::Unbounded;
+            return;
+        }
         match self {
             Self::Unbounded => {}
             Self::None => *self = Self::Regions(vec![r]),
             Self::Regions(rects) => {
-                // Coalesce any rects that touch/overlap `r` while keeping disjoint
-                // regions strictly separate so opposite-edge glyphs never span gaps.
+                // Only merge two rectangles when their union is STILL an exact
+                // rectangle (containment or exact shared edge span) so L-shaped
+                // or disjoint overlaps never fill in uncovered corners or gaps.
                 let mut merged = true;
                 while merged {
                     merged = false;
                     let mut i = 0;
                     while i < rects.len() {
-                        if intersect_rect(rects[i], r).is_some() {
-                            let o = rects.swap_remove(i);
+                        let o = rects[i];
+                        if rect_contains(o, r) {
+                            return;
+                        }
+                        if rect_contains(r, o) {
+                            rects.swap_remove(i);
+                            continue;
+                        }
+                        let same_x = (o.x0 - r.x0).abs() <= 1e-6 && (o.x1 - r.x1).abs() <= 1e-6;
+                        let touch_y = o.y0 <= r.y1 + 1e-6 && r.y0 <= o.y1 + 1e-6;
+                        let same_y = (o.y0 - r.y0).abs() <= 1e-6 && (o.y1 - r.y1).abs() <= 1e-6;
+                        let touch_x = o.x0 <= r.x1 + 1e-6 && r.x0 <= o.x1 + 1e-6;
+                        if (same_x && touch_y) || (same_y && touch_x) {
+                            rects.swap_remove(i);
                             r = Rect::new(
                                 r.x0.min(o.x0),
                                 r.y0.min(o.y0),
@@ -4852,7 +4884,7 @@ impl MissingTextCoverage {
                 const MAX_MISSING_REGIONS: usize = 256;
                 if rects.len() >= MAX_MISSING_REGIONS {
                     let mut best_idx = 0usize;
-                    let mut best_area = f64::INFINITY;
+                    let mut best_added = f64::INFINITY;
                     for (idx, o) in rects.iter().enumerate() {
                         let u = Rect::new(
                             r.x0.min(o.x0),
@@ -4860,9 +4892,10 @@ impl MissingTextCoverage {
                             r.x1.max(o.x1),
                             r.y1.max(o.y1),
                         );
-                        let area = u.width() * u.height();
-                        if area < best_area {
-                            best_area = area;
+                        let u_area = u.width() * u.height();
+                        let added = u_area - o.width() * o.height();
+                        if added < best_added {
+                            best_added = added;
                             best_idx = idx;
                         }
                     }
@@ -5085,10 +5118,13 @@ impl SoftMaskAnalysisCache {
         let mut missing = MissingTextCoverage::None;
         let mut depth_limited = false;
         let mut clips: Vec<&RenderCommand> = Vec::new();
+        // Active nested alpha-mask potential coverage bounds: `(pop_idx, cumulative_rect)`.
+        let mut mask_bounds_stack: Vec<(usize, Rect)> = Vec::new();
         let mut idx = 0usize;
         while idx < commands.len() {
             stats.soft_mask_analysis_visits += 1;
             let cmd = &commands[idx];
+            let active_mask_rect = mask_bounds_stack.last().map(|&(_, r)| r);
             match cmd {
                 RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
                     clips.push(cmd);
@@ -5126,11 +5162,19 @@ impl SoftMaskAnalysisCache {
                         let sub_end = SlideConverter::find_matching_pop_blend(commands, idx)
                             .unwrap_or(commands.len() - 1);
                         let sub_slice = &commands[idx..=sub_end];
+                        let potential = sub_a.potential_bounds();
                         match sub_a.missing_text {
                             MissingTextCoverage::None => {}
                             MissingTextCoverage::Regions(sub_rects) => {
                                 for mr in sub_rects {
-                                    if let Some(clipped_mr) = tighten_rect_to_clips(mr, &clips) {
+                                    let constrained =
+                                        tighten_rect_to_clips(mr, &clips).and_then(|c| {
+                                            match active_mask_rect {
+                                                Some(am) => intersect_rect(c, am),
+                                                None => Some(c),
+                                            }
+                                        });
+                                    if let Some(clipped_mr) = constrained {
                                         if group_has_visible_paint(
                                             sub_slice, &clips, clipped_mr, font_cache, self, stats,
                                         ) {
@@ -5139,29 +5183,73 @@ impl SoftMaskAnalysisCache {
                                     }
                                 }
                             }
-                            MissingTextCoverage::Unbounded => match active_clip_rect_for(&clips) {
-                                ActiveClip::Rect(None) => {}
-                                ActiveClip::Rect(Some(cr)) => {
-                                    if group_has_visible_paint(
-                                        sub_slice, &clips, cr, font_cache, self, stats,
-                                    ) {
-                                        missing.union_rect(cr);
+                            MissingTextCoverage::Unbounded => {
+                                let bound = match active_clip_rect_for(&clips) {
+                                    ActiveClip::Rect(None) => Some(None),
+                                    ActiveClip::Rect(Some(cr)) => Some(match active_mask_rect {
+                                        Some(am) => intersect_rect(cr, am),
+                                        None => Some(cr),
+                                    }),
+                                    ActiveClip::None | ActiveClip::Complex => {
+                                        active_mask_rect.map(Some)
+                                    }
+                                };
+                                match bound {
+                                    Some(None) => {}
+                                    Some(Some(br)) => {
+                                        if group_has_visible_paint(
+                                            sub_slice, &clips, br, font_cache, self, stats,
+                                        ) {
+                                            missing.union_rect(br);
+                                        }
+                                    }
+                                    None => {
+                                        let wide = Rect::new(-1e12, -1e12, 1e12, 1e12);
+                                        if group_has_visible_paint(
+                                            sub_slice, &clips, wide, font_cache, self, stats,
+                                        ) {
+                                            missing = MissingTextCoverage::Unbounded;
+                                        }
                                     }
                                 }
-                                ActiveClip::None | ActiveClip::Complex => {
-                                    let wide = Rect::new(-1e12, -1e12, 1e12, 1e12);
-                                    if group_has_visible_paint(
-                                        sub_slice, &clips, wide, font_cache, self, stats,
-                                    ) {
-                                        missing = MissingTextCoverage::Unbounded;
-                                    }
+                            }
+                        }
+                        match potential {
+                            RenderableMaskBounds::Empty => {
+                                idx = sub_end + 1;
+                                continue;
+                            }
+                            RenderableMaskBounds::Bounded(mr) => {
+                                let effective = match active_mask_rect {
+                                    Some(am) => intersect_rect(mr, am),
+                                    None => Some(mr),
+                                };
+                                let Some(eff_rect) = effective else {
+                                    idx = sub_end + 1;
+                                    continue;
+                                };
+                                if matches!(sub_a.renderable, RenderableMaskBounds::Empty) {
+                                    idx = sub_end + 1;
+                                    continue;
                                 }
-                            },
+                                mask_bounds_stack.push((sub_end, eff_rect));
+                            }
+                            RenderableMaskBounds::Unbounded => {
+                                if matches!(sub_a.renderable, RenderableMaskBounds::Empty) {
+                                    idx = sub_end + 1;
+                                    continue;
+                                }
+                            }
                         }
-                        if matches!(sub_a.renderable, RenderableMaskBounds::Empty) {
-                            idx = sub_end + 1;
-                            continue;
-                        }
+                    }
+                    idx += 1;
+                }
+                RenderCommand::PopBlendGroup => {
+                    while mask_bounds_stack
+                        .last()
+                        .is_some_and(|&(pop_idx, _)| pop_idx == idx)
+                    {
+                        mask_bounds_stack.pop();
                     }
                     idx += 1;
                 }
@@ -5170,23 +5258,40 @@ impl SoftMaskAnalysisCache {
                 {
                     match native_text_ink_bounds(run, font_cache) {
                         Some(r) => {
-                            if let Some(clipped) = tighten_rect_to_clips(r, &clips) {
-                                let padded = Rect::new(
-                                    clipped.x0 - 1.0,
-                                    clipped.y0 - 1.0,
-                                    clipped.x1 + 1.0,
-                                    clipped.y1 + 1.0,
-                                );
-                                missing.union_rect(padded);
+                            let constrained =
+                                tighten_rect_to_clips(r, &clips).and_then(|clipped| {
+                                    let padded = Rect::new(
+                                        clipped.x0 - 1.0,
+                                        clipped.y0 - 1.0,
+                                        clipped.x1 + 1.0,
+                                        clipped.y1 + 1.0,
+                                    );
+                                    match active_mask_rect {
+                                        Some(am) => intersect_rect(padded, am),
+                                        None => Some(padded),
+                                    }
+                                });
+                            if let Some(region) = constrained {
+                                missing.union_rect(region);
                             }
                         }
                         None => match active_clip_rect_for(&clips) {
                             ActiveClip::Rect(None) => {}
                             ActiveClip::Rect(Some(cr)) => {
-                                missing.union_rect(cr);
+                                let constrained = match active_mask_rect {
+                                    Some(am) => intersect_rect(cr, am),
+                                    None => Some(cr),
+                                };
+                                if let Some(region) = constrained {
+                                    missing.union_rect(region);
+                                }
                             }
                             ActiveClip::None | ActiveClip::Complex => {
-                                missing = MissingTextCoverage::Unbounded;
+                                if let Some(am) = active_mask_rect {
+                                    missing.union_rect(am);
+                                } else {
+                                    missing = MissingTextCoverage::Unbounded;
+                                }
                             }
                         },
                     }
@@ -5251,9 +5356,14 @@ fn group_has_visible_paint(
     stats: &mut ConversionStats,
 ) -> bool {
     let mut clips: Vec<&RenderCommand> = outer_clips.to_vec();
+    let mut region_stack: Vec<(usize, Rect)> = Vec::new();
     let mut idx = 0usize;
     while idx < group_cmds.len() {
         let cmd = &group_cmds[idx];
+        let active_region = region_stack
+            .last()
+            .map(|&(_, r)| r)
+            .unwrap_or(visible_region);
         match cmd {
             RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
                 clips.push(cmd);
@@ -5264,18 +5374,48 @@ fn group_has_visible_paint(
                 idx += 1;
             }
             RenderCommand::PushBlendGroup { alpha, mask, .. } if idx > 0 => {
-                if !alpha.is_finite()
-                    || *alpha <= 0.0
-                    || soft_mask_cache
-                        .analyze(mask.as_ref(), font_cache, stats)
-                        .is_proven_empty()
-                {
+                if !alpha.is_finite() || *alpha <= 0.0 {
                     if let Some(sub_end) = SlideConverter::find_matching_pop_blend(group_cmds, idx)
                     {
                         idx = sub_end + 1;
                         continue;
                     }
                     break;
+                }
+                if let Some(m) = mask {
+                    let sub_a = soft_mask_cache.analyze(Some(m), font_cache, stats);
+                    let sub_end = SlideConverter::find_matching_pop_blend(group_cmds, idx);
+                    match sub_a.potential_bounds() {
+                        RenderableMaskBounds::Empty => {
+                            if let Some(end) = sub_end {
+                                idx = end + 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        RenderableMaskBounds::Bounded(mr) => {
+                            let Some(inter) = intersect_rect(mr, active_region) else {
+                                if let Some(end) = sub_end {
+                                    idx = end + 1;
+                                    continue;
+                                }
+                                break;
+                            };
+                            if let Some(end) = sub_end {
+                                region_stack.push((end, inter));
+                            }
+                        }
+                        RenderableMaskBounds::Unbounded => {}
+                    }
+                }
+                idx += 1;
+            }
+            RenderCommand::PopBlendGroup => {
+                while region_stack
+                    .last()
+                    .is_some_and(|&(pop_idx, _)| pop_idx == idx)
+                {
+                    region_stack.pop();
                 }
                 idx += 1;
             }
@@ -5285,7 +5425,7 @@ fn group_has_visible_paint(
                 if is_rect_visible_under_clips(
                     native_text_ink_bounds(run, font_cache),
                     &clips,
-                    visible_region,
+                    active_region,
                 ) {
                     return true;
                 }
@@ -5295,7 +5435,7 @@ fn group_has_visible_paint(
                 match compute_commands_bounds(std::slice::from_ref(other), (0.0, 0.0), font_cache) {
                     CommandBounds::Empty => {}
                     CommandBounds::Known(r) => {
-                        if is_rect_visible_under_clips(Some(r), &clips, visible_region) {
+                        if is_rect_visible_under_clips(Some(r), &clips, active_region) {
                             return true;
                         }
                     }
@@ -5304,7 +5444,7 @@ fn group_has_visible_paint(
                             ActiveClip::None | ActiveClip::Complex => true,
                             ActiveClip::Rect(None) => false,
                             ActiveClip::Rect(Some(cr)) => {
-                                intersect_rect(cr, visible_region).is_some()
+                                intersect_rect(cr, active_region).is_some()
                             }
                         };
                         if visible {
@@ -5729,6 +5869,178 @@ fn rect_contains(outer: Rect, inner: Rect) -> bool {
     o.x0 <= i.x0 && o.y0 <= i.y0 && o.x1 >= i.x1 && o.y1 >= i.y1
 }
 
+/// Static segment tree over `len` elementary intervals `[0..len)` tracking
+/// active coverage counts for O(N log N) 2D rectangle-intersection sweeps.
+struct IntervalCountTree {
+    len: usize,
+    cover: Vec<u32>,
+    any: Vec<bool>,
+}
+
+impl IntervalCountTree {
+    fn new(len: usize) -> Self {
+        let cap = (len.max(1) * 4).max(4);
+        Self {
+            len,
+            cover: vec![0; cap],
+            any: vec![false; cap],
+        }
+    }
+
+    fn update(&mut self, ql: usize, qr: usize, delta: i32, visits: &mut usize) {
+        if ql >= qr || self.len == 0 {
+            return;
+        }
+        self.update_rec(1, 0, self.len, ql, qr, delta, visits);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_rec(
+        &mut self,
+        node: usize,
+        nl: usize,
+        nr: usize,
+        ql: usize,
+        qr: usize,
+        delta: i32,
+        visits: &mut usize,
+    ) {
+        *visits += 1;
+        if ql <= nl && nr <= qr {
+            if delta > 0 {
+                self.cover[node] = self.cover[node].saturating_add(delta as u32);
+            } else {
+                self.cover[node] = self.cover[node].saturating_sub((-delta) as u32);
+            }
+            self.any[node] = self.cover[node] > 0
+                || (nl + 1 < nr && (self.any[node * 2] || self.any[node * 2 + 1]));
+            return;
+        }
+        let mid = nl + (nr - nl) / 2;
+        if ql < mid {
+            self.update_rec(node * 2, nl, mid, ql, qr, delta, visits);
+        }
+        if qr > mid {
+            self.update_rec(node * 2 + 1, mid, nr, ql, qr, delta, visits);
+        }
+        self.any[node] = self.cover[node] > 0 || self.any[node * 2] || self.any[node * 2 + 1];
+    }
+
+    fn query_any(&self, ql: usize, qr: usize, visits: &mut usize) -> bool {
+        if ql >= qr || self.len == 0 {
+            return false;
+        }
+        self.query_rec(1, 0, self.len, ql, qr, visits)
+    }
+
+    fn query_rec(
+        &self,
+        node: usize,
+        nl: usize,
+        nr: usize,
+        ql: usize,
+        qr: usize,
+        visits: &mut usize,
+    ) -> bool {
+        *visits += 1;
+        if !self.any[node] {
+            return false;
+        }
+        if self.cover[node] > 0 || (ql <= nl && nr <= qr) {
+            return true;
+        }
+        let mid = nl + (nr - nl) / 2;
+        (ql < mid && self.query_rec(node * 2, nl, mid, ql, qr, visits))
+            || (qr > mid && self.query_rec(node * 2 + 1, mid, nr, ql, qr, visits))
+    }
+}
+
+/// Returns `true` iff two rectangles in `rects` strictly intersect in both X
+/// and Y (`intersect_rect(a, b).is_some()`) and at least one of the pair has
+/// `translucent_changes_bg == true`, in O(N log N) time regardless of layout.
+fn has_stacked_translucent_rect_overlap(rects: &[(Rect, bool)], visits: &mut usize) -> bool {
+    let mut ys: Vec<f64> = Vec::with_capacity(rects.len() * 2);
+    for &(r, _) in rects {
+        if r.x1 > r.x0 && r.y1 > r.y0 {
+            ys.push(r.y0);
+            ys.push(r.y1);
+        }
+    }
+    if ys.len() < 4 {
+        return false;
+    }
+    ys.sort_unstable_by(f64::total_cmp);
+    ys.dedup();
+    if ys.len() < 2 {
+        return false;
+    }
+
+    struct SweepEvent {
+        x: f64,
+        is_enter: bool,
+        yl: usize,
+        yr: usize,
+        is_translucent: bool,
+    }
+    let mut events: Vec<SweepEvent> = Vec::with_capacity(rects.len() * 2);
+    for &(r, is_translucent) in rects {
+        if !(r.x1 > r.x0 && r.y1 > r.y0) {
+            continue;
+        }
+        let Ok(yl) = ys.binary_search_by(|y| y.total_cmp(&r.y0)) else {
+            continue;
+        };
+        let Ok(yr) = ys.binary_search_by(|y| y.total_cmp(&r.y1)) else {
+            continue;
+        };
+        if yl >= yr {
+            continue;
+        }
+        events.push(SweepEvent {
+            x: r.x0,
+            is_enter: true,
+            yl,
+            yr,
+            is_translucent,
+        });
+        events.push(SweepEvent {
+            x: r.x1,
+            is_enter: false,
+            yl,
+            yr,
+            is_translucent,
+        });
+    }
+    // Exits precede enters at equal x so touching edges (`a.x1 == b.x0`) do not conflict.
+    events.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then(a.is_enter.cmp(&b.is_enter)));
+
+    let num_intervals = ys.len() - 1;
+    let mut active_translucent = IntervalCountTree::new(num_intervals);
+    let mut active_opaque = IntervalCountTree::new(num_intervals);
+    for ev in events {
+        if ev.is_enter {
+            if ev.is_translucent {
+                if active_translucent.query_any(ev.yl, ev.yr, visits)
+                    || active_opaque.query_any(ev.yl, ev.yr, visits)
+                {
+                    return true;
+                }
+                active_translucent.update(ev.yl, ev.yr, 1, visits);
+            } else {
+                if active_translucent.query_any(ev.yl, ev.yr, visits) {
+                    return true;
+                }
+                active_opaque.update(ev.yl, ev.yr, 1, visits);
+            }
+        } else if ev.is_translucent {
+            active_translucent.update(ev.yl, ev.yr, -1, visits);
+        } else {
+            active_opaque.update(ev.yl, ev.yr, -1, visits);
+        }
+    }
+    false
+}
+
 fn native_text_ink_bounds(
     run: &zpdf_display_list::GlyphRun,
     font_cache: &FontCache,
@@ -5749,10 +6061,14 @@ fn native_text_ink_bounds(
     let mut min_y = f32::INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     if is_vertical {
+        let signed_scale_x = run.font_size * run.h_scale;
+        if !signed_scale_x.is_finite() || signed_scale_x == 0.0 {
+            return None;
+        }
         let div = font.advance_divisor();
-        let h_scale = run.h_scale.abs().max(1.0);
+        let abs_h_scale = run.h_scale.abs();
         for g in &run.glyphs {
-            let mut w = fs * h_scale;
+            let mut w_mag = fs * abs_h_scale;
             if div.is_finite() && div > 0.0 {
                 let adv_gid = font.glyph_advance(g.glyph_id);
                 let adv_code = u16::try_from(g.code)
@@ -5760,16 +6076,27 @@ fn native_text_ink_bounds(
                     .unwrap_or(0.0);
                 let adv_units = adv_gid.max(adv_code);
                 if adv_units.is_finite() && adv_units > 0.0 {
-                    w = w.max((adv_units / div) as f32 * fs * run.h_scale.abs());
+                    w_mag = w_mag.max((adv_units / div) as f32 * fs * abs_h_scale);
                 }
             }
-            if g.x < 0.0 {
-                w = w.max(-2.0 * g.x);
+            if g.x * signed_scale_x < 0.0 {
+                w_mag = w_mag.max(2.0 * g.x.abs());
             }
-            let gx0 = g.x.min(g.x + w);
-            let gx1 = g.x.max(g.x + w);
-            let gy0 = g.y.min(g.y + g.advance) - desc;
-            let gy1 = g.y.max(g.y + g.advance) + fs;
+            let signed_w = w_mag.copysign(signed_scale_x);
+            let gx0 = g.x.min(g.x + signed_w);
+            let gx1 = g.x.max(g.x + signed_w);
+            let bot_y = g.y.min(g.y + run.font_size).min(g.y + g.advance);
+            let top_y = g.y.max(g.y + run.font_size).max(g.y + g.advance);
+            let gy0 = if run.font_size >= 0.0 {
+                bot_y - desc
+            } else {
+                bot_y
+            };
+            let gy1 = if run.font_size >= 0.0 {
+                top_y
+            } else {
+                top_y + desc
+            };
             min_x = min_x.min(gx0);
             max_x = max_x.max(gx1);
             min_y = min_y.min(gy0);
@@ -5777,6 +6104,9 @@ fn native_text_ink_bounds(
         }
     } else {
         for g in &run.glyphs {
+            if !g.advance.is_finite() || g.advance == 0.0 {
+                return None;
+            }
             let gx0 = g.x.min(g.x + g.advance);
             let gx1 = g.x.max(g.x + g.advance);
             let gy0 = g.y.min(g.y + run.font_size) - desc;
@@ -18445,6 +18775,89 @@ mod export_tests {
             .is_err(),
             "partially clipped ordinary outline-less 'AB' must error rather than leak 'B'"
         );
+
+        // 3. Standalone zero-advance combining mark (horizontal CID font with /W [1 [0]]
+        //    and /ToUnicode mapping to U+0301) shown unclipped with an empty font provider:
+        //    must NOT be dropped as zero-width; its Unicode mark reaches the slide TextBox.
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+        let to_unicode = b"/CIDInit /ProcSet findresource begin\n\
+            12 dict begin begincmap\n\
+            /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+            /CMapName /MarkUCS def /CMapType 2 def\n\
+            1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
+            1 beginbfchar <0001> <0301> endbfchar\n\
+            endcmap CMapName currentdict /CMap defineresource pop end end";
+        let mark_pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+              /Resources << /Font << /FC 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"BT /FC 24 Tf 100 60 Td <0001> Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /MissingCidMark \
+              /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>"
+                .to_vec(), // 5
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /MissingCidMark \
+              /W [1 [0]] /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>"
+                .to_vec(), // 6
+            stream("", to_unicode),                        // 7
+        ]);
+        let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+        let doc = zpdf_document::PdfDocument::open(mark_pdf)
+            .expect("open mark pdf")
+            .with_font_provider(provider);
+        let page = doc.page(0).expect("page 0");
+        let mut mark_fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (mark_dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut mark_fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+        let mark_slide = display_list_to_slide(
+            &mark_dl,
+            0,
+            &mark_fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("standalone zero-advance combining mark must export");
+        assert_eq!(mark_slide.elements.len(), 1);
+        assert!(matches!(
+            mark_slide.elements[0].base(),
+            SlideElement::TextBox { text, .. } if text == "\u{0301}"
+        ));
     }
 
     #[test]
@@ -18749,6 +19162,531 @@ mod export_tests {
             matches!(shallow_res.missing_text, MissingTextCoverage::None),
             "depth-limited evaluation must not poison cache for shallow reuse of inner mask: {:?}",
             shallow_res.missing_text
+        );
+    }
+
+    #[test]
+    fn identity_v_negative_h_scale_missing_mask_glyph_covers_reflected_cell() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        let run_case = |mask_ops: &[u8], page_ops: &[u8]| {
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+                  /Resources << /ExtGState << /GSsm 5 0 R >> >> >>"
+                    .to_vec(), // 3
+                stream("", page_ops),                          // 4
+                b"<< /Type /ExtGState /SMask << /Type /Mask /S /Alpha /G 6 0 R >> >>".to_vec(), // 5
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 240 120] \
+                     /Group << /Type /Group /S /Transparency /CS /DeviceRGB /I true >> \
+                     /Resources << /Font << /FV 7 0 R >> >>",
+                    mask_ops,
+                ), // 6
+                b"<< /Type /Font /Subtype /Type0 /BaseFont /MissingVertCid \
+                  /Encoding /Identity-V /DescendantFonts [8 0 R] >>"
+                    .to_vec(), // 7
+                b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /MissingVertCid \
+                  /DW 1000 /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>"
+                    .to_vec(), // 8
+            ]);
+            let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .expect("open pdf")
+                .with_font_provider(provider);
+            let page = doc.page(0).expect("page 0");
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+            let mut images = ImageCache::new();
+            let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                .with_document(doc.file(), &page.resources)
+                .with_fonts(&mut fonts)
+                .with_images(&mut images)
+                .interpret_with_stats(&content_bytes);
+            display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+        };
+
+        // 1. 40pt Identity-V glyph at x=100 with `-100 Tz` reflects into x=40..80:
+        //    source fill crossing x=60 ([52..68, 40..80]) must report missing mask outlines.
+        let reflected_overlap = run_case(
+            b"0 g BT /FV 40 Tf -100 Tz 100 100 Td <0041> Tj ET",
+            b"q /GSsm gs 1 0 0 rg 52 40 16 40 re f Q",
+        );
+        assert!(
+            reflected_overlap.is_err(),
+            "Identity-V glyph with -100 Tz at x=100 reflects to x=40..80 and must overlap fill near x=60"
+        );
+
+        // 2. Source fill inside an opaque far-right mask rect [150..220] (disjoint from
+        //    the reflected cell [40..80]): succeeds cleanly.
+        let disjoint_right = run_case(
+            b"0 g 150 20 70 80 re f BT /FV 40 Tf -100 Tz 100 100 Td <0041> Tj ET",
+            b"q /GSsm gs 1 0 0 rg 160 30 50 50 re f Q",
+        )
+        .expect(
+            "fill confined to far-right opaque mask rect disjoint from reflected cell must succeed",
+        );
+        assert_eq!(disjoint_right.elements.len(), 1);
+    }
+
+    #[test]
+    fn partial_occlusion_on_long_native_label_allows_overprint_on_untouched_end() {
+        let page_rect = Rect::new(0.0, 0.0, 240.0, 120.0);
+        let mut fonts = FontCache::new();
+        let fid = fonts.insert(
+            "FH".into(),
+            zpdf_font::LoadedFont::new_placeholder("Helvetica".into()),
+        );
+        let op_k_half = Some(zpdf_display_list::Overprint {
+            cmyk: [0.0, 0.0, 0.0, 0.5],
+            active: zpdf_display_list::Overprint::K,
+        });
+
+        let build_dl = |overprint_x: f64, blue_alpha: f32| -> DisplayList {
+            let mut dl = DisplayList::new(page_rect);
+            // Long neutral-gray native label spanning x in [10..210].
+            dl.push(RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+                font_id: fid,
+                font_size: 24.0,
+                glyphs: vec![zpdf_display_list::PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'L' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 200.0,
+                }],
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::gray(0.5)),
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::translate(10.0, 40.0),
+                h_scale: 1.0,
+            }));
+            // Blue rectangle covering ONLY the left end [0..60] of the label.
+            let mut blue = zpdf_display_list::Path::new();
+            blue.rect(Rect::new(0.0, 0.0, 60.0, 120.0));
+            dl.push(RenderCommand::FillPath {
+                path: blue,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::rgb(
+                    0.0, 0.0, 1.0,
+                )),
+                alpha: blue_alpha,
+                overprint: None,
+            });
+            // 50% K-only overprinting run at `overprint_x..overprint_x+40`.
+            dl.push(RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+                font_id: fid,
+                font_size: 24.0,
+                glyphs: vec![zpdf_display_list::PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'R' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 40.0,
+                }],
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::gray(0.5)),
+                alpha: 1.0,
+                overprint: op_k_half,
+                transform: zpdf_core::Matrix::translate(overprint_x, 40.0),
+                h_scale: 1.0,
+            }));
+            dl
+        };
+
+        // 1. Overprint over untouched right end [150..190] never touches the blue rect
+        //    covering the left end [0..60]: resolves cleanly to gray (128, 128, 128).
+        let right_slide = display_list_to_slide(
+            &build_dl(150.0, 1.0),
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("partial occlusion on left end must not reject overprint on untouched right end");
+        assert_eq!(right_slide.elements.len(), 3);
+        assert!(matches!(
+            right_slide.elements[2].base(),
+            SlideElement::TextBox {
+                text,
+                color_rgb: (128, 128, 128),
+                ..
+            } if text == "R"
+        ));
+
+        // 2. Overprint over the occluded left end [15..55] (under 50%-opaque blue rect):
+        //    hits the occluded region and rejects cleanly.
+        assert!(
+            display_list_to_slide(
+                &build_dl(15.0, 0.5),
+                0,
+                &fonts,
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+            .is_err(),
+            "overprint touching the occluded left end must still reject"
+        );
+    }
+
+    #[test]
+    fn l_shaped_overlapping_missing_mask_strips_preserve_uncovered_corner() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Alpha mask: opaque rectangle [10..200, 10..110] + two outline-less Helvetica runs
+        // clipped to a horizontal bottom strip [0..160, 0..30] and a vertical left strip
+        // [0..30, 0..110], intersecting at [0..30, 0..30] to form an L with empty corner
+        // [30..160, 30..110].
+        let mask_ops = b"0 g 10 10 190 100 re f \
+                         q 0 0 160 30 re W n BT /FH 48 Tf 5 5 Td (AAAAAA) Tj ET Q \
+                         q 0 0 30 110 re W n BT /FH 100 Tf 5 5 Td (A) Tj ET Q";
+
+        let run_masked = |page_ops: &[u8]| {
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+                  /Resources << /ExtGState << /GSsm 5 0 R >> >> >>"
+                    .to_vec(), // 3
+                stream("", page_ops),                          // 4
+                b"<< /Type /ExtGState /SMask << /Type /Mask /S /Alpha /G 6 0 R >> >>".to_vec(), // 5
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 240 120] \
+                     /Group << /Type /Group /S /Transparency /CS /DeviceRGB /I true >> \
+                     /Resources << /Font << /FH 7 0 R >> >>",
+                    mask_ops,
+                ), // 6
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 7
+            ]);
+            let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .expect("open pdf")
+                .with_font_provider(provider);
+            let page = doc.page(0).expect("page 0");
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+            let mut images = ImageCache::new();
+            let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                .with_document(doc.file(), &page.resources)
+                .with_fonts(&mut fonts)
+                .with_images(&mut images)
+                .interpret_with_stats(&content_bytes);
+            display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+        };
+
+        // 1. Source fill inside the uncovered corner of the L [60..140, 50..100]: succeeds!
+        let corner_slide = run_masked(b"q /GSsm gs 1 0 0 rg 60 50 80 50 re f Q")
+            .expect("source fill in uncovered corner of L-shaped missing mask strips must succeed");
+        assert_eq!(corner_slide.elements.len(), 1);
+
+        // 2. Source fill touching the horizontal bottom arm [60..140, 10..25] -> errors!
+        assert!(
+            run_masked(b"q /GSsm gs 1 0 0 rg 60 10 80 15 re f Q").is_err(),
+            "source fill touching horizontal arm of L must error"
+        );
+
+        // 3. Source fill touching the vertical left arm [10..25, 50..90] -> errors!
+        assert!(
+            run_masked(b"q /GSsm gs 1 0 0 rg 10 50 15 40 re f Q").is_err(),
+            "source fill touching vertical arm of L must error"
+        );
+    }
+
+    #[test]
+    fn nested_alpha_mask_constrains_missing_glyph_inside_outer_mask() {
+        let page_rect = Rect::new(0.0, 0.0, 240.0, 120.0);
+        let mut fonts = FontCache::new();
+        let fid = fonts.insert(
+            "FH".into(),
+            zpdf_font::LoadedFont::new_placeholder("Helvetica".into()),
+        );
+
+        // Inner alpha mask paints ONLY on the left [10..70, 10..110].
+        let mut inner_mask_dl = DisplayList::new(page_rect);
+        let mut left_rect = zpdf_display_list::Path::new();
+        left_rect.rect(Rect::new(10.0, 10.0, 70.0, 110.0));
+        inner_mask_dl.push(RenderCommand::FillPath {
+            path: left_rect,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let inner_mask = zpdf_display_list::SoftMask {
+            kind: zpdf_display_list::SoftMaskKind::Alpha,
+            commands: std::sync::Arc::new(inner_mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let run_case = |glyph_x: f64, source_rect: Rect| {
+            // Outer alpha mask has an opaque rect on the right [160..230, 10..110] and a
+            // nested group masked by `inner_mask` (left only) containing an outline-less glyph.
+            let mut outer_mask_dl = DisplayList::new(page_rect);
+            let mut right_rect = zpdf_display_list::Path::new();
+            right_rect.rect(Rect::new(160.0, 10.0, 230.0, 110.0));
+            outer_mask_dl.push(RenderCommand::FillPath {
+                path: right_rect,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            outer_mask_dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: page_rect,
+                alpha: 1.0,
+                mask: Some(inner_mask.clone()),
+            });
+            outer_mask_dl.push(RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+                font_id: fid,
+                font_size: 36.0,
+                glyphs: vec![zpdf_display_list::PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'A' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 30.0,
+                }],
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::white()),
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::translate(glyph_x, 35.0),
+                h_scale: 1.0,
+            }));
+            outer_mask_dl.push(RenderCommand::PopBlendGroup);
+
+            let outer_mask = zpdf_display_list::SoftMask {
+                kind: zpdf_display_list::SoftMaskKind::Alpha,
+                commands: std::sync::Arc::new(outer_mask_dl),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: None,
+            };
+            let mut dl = DisplayList::new(page_rect);
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: page_rect,
+                alpha: 1.0,
+                mask: Some(outer_mask),
+            });
+            let mut src = zpdf_display_list::Path::new();
+            src.rect(source_rect);
+            dl.push(RenderCommand::FillPath {
+                path: src,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::rgb(
+                    1.0, 0.0, 0.0,
+                )),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+            display_list_to_slide(
+                &dl,
+                0,
+                &fonts,
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+        };
+
+        // 1. Glyph on the right (x=180) is masked away completely by the left-only inner
+        //    alpha mask: right-hand source fill [170..225] must succeed without error!
+        let clipped_away = run_case(180.0, Rect::new(170.0, 20.0, 225.0, 100.0)).expect(
+            "glyph masked away by nested left-only alpha mask must not abort right-hand fill",
+        );
+        assert_eq!(clipped_away.elements.len(), 1);
+
+        // 2. Glyph on the left (x=20) sits INSIDE the left-only inner alpha mask:
+        //    left-hand source fill [15..65] must report missing outlines!
+        assert!(
+            run_case(20.0, Rect::new(15.0, 20.0, 65.0, 100.0)).is_err(),
+            "glyph visible through nested left-only alpha mask must error for overlapping left fill"
+        );
+    }
+
+    #[test]
+    fn vertically_aligned_disjoint_translucent_labels_sweep_in_n_log_n() {
+        let page_rect = Rect::new(0.0, 0.0, 200.0, 10_000.0);
+        let mut fonts = FontCache::new();
+        let fid = fonts.insert(
+            "FH".into(),
+            zpdf_font::LoadedFont::new_placeholder("Helvetica".into()),
+        );
+        let op_k_half = Some(zpdf_display_list::Overprint {
+            cmyk: [0.0, 0.0, 0.0, 0.5],
+            active: zpdf_display_list::Overprint::K,
+        });
+
+        // 600 vertically separated translucent neutral-gray labels aligned at the EXACT
+        // same x coordinate [20..50], spanned by one tall opaque K-only 50% overprint.
+        let mut dl = DisplayList::new(page_rect);
+        for i in 0..600 {
+            let y = 20.0 + i as f64 * 16.0;
+            dl.push(RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+                font_id: fid,
+                font_size: 10.0,
+                glyphs: vec![zpdf_display_list::PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'V' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 30.0,
+                }],
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::gray(0.5)),
+                alpha: 0.5,
+                overprint: None,
+                transform: zpdf_core::Matrix::translate(20.0, y),
+                h_scale: 1.0,
+            }));
+        }
+        // Tall overprinting run spanning the entire column (y in [0..9700], x in [20..50]).
+        dl.push(RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+            font_id: fid,
+            font_size: 9_650.0,
+            glyphs: vec![zpdf_display_list::PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'T' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 30.0,
+            }],
+            paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::gray(0.5)),
+            alpha: 1.0,
+            overprint: op_k_half,
+            transform: zpdf_core::Matrix::translate(20.0, 10.0),
+            h_scale: 1.0,
+        }));
+
+        let (slide, stats) = display_list_to_slide_internal(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("600 vertically separated translucent gray labels under spanning K overprint");
+        assert_eq!(slide.elements.len(), 601);
+        assert!(matches!(
+            slide.elements[600].base(),
+            SlideElement::TextBox {
+                text,
+                color_rgb: (128, 128, 128),
+                ..
+            } if text == "T"
+        ));
+        // Quadratic pairwise checks across 600 column-aligned labels would do 179,700
+        // comparisons; the 2D segment-tree sweep completes in O(N log N) (< 40,000).
+        assert!(
+            stats.native_text_record_visits < 40_000,
+            "column-aligned translucent labels must sweep in O(N log N) visits (< 40000), got {}",
+            stats.native_text_record_visits
+        );
+
+        // Adding one vertically overlapping label in the same column must still reject.
+        dl.commands.insert(
+            600,
+            RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+                font_id: fid,
+                font_size: 10.0,
+                glyphs: vec![zpdf_display_list::PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'V' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 30.0,
+                }],
+                paint: zpdf_display_list::Paint::Solid(zpdf_display_list::Color::gray(0.5)),
+                alpha: 0.5,
+                overprint: None,
+                transform: zpdf_core::Matrix::translate(20.0, 22.0),
+                h_scale: 1.0,
+            }),
+        );
+        assert!(
+            display_list_to_slide(
+                &dl,
+                0,
+                &fonts,
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+            .is_err(),
+            "vertically overlapping translucent labels in the same column must still reject"
         );
     }
 }
