@@ -728,7 +728,8 @@ impl<'a> SlideConverter<'a> {
     fn convert_display_list(&mut self, display_list: &'a DisplayList) -> Result<()> {
         let commands = &display_list.commands;
         let expanded = display_list.expanded_glyph_runs();
-        let isolated_inner_blends = compute_isolated_inner_non_normal_blends(commands);
+        let isolated_inner_blends =
+            compute_isolated_inner_non_normal_blends(commands, self.font_cache);
         let later_non_normal_blends = NonNormalBlendIndex::build(
             commands,
             self.page_rect,
@@ -1793,7 +1794,7 @@ impl<'a> SlideConverter<'a> {
                 if effective_alpha <= 0.0 || glyph_run.overprint.is_some_and(|op| op.active == 0) {
                     return Ok(());
                 }
-                let overprint_backdrop = glyph_run.overprint.is_some_and(|op| op.active != 0);
+                let overprint_backdrop = command_has_renderable_overprint(cmd, self.font_cache);
                 if in_artwork_range || overprint_backdrop {
                     let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
                     self.flatten_commands_group(
@@ -2673,17 +2674,21 @@ fn type3_glyph_range_starting_at(display_list: &DisplayList, cmd_idx: usize) -> 
 
 /// Linear O(N) pre-pass marking each `PushBlendGroup` index that contains a
 /// nested backdrop-sampling operation (non-Normal `PushBlendGroup` or
-/// partial-colorant `Overprint`). Used so an isolated Normal group containing
-/// such an operation flattens as one isolated unit rather than losing its
-/// inner backdrop when `current_surface()` is unavailable inside the group.
-fn compute_isolated_inner_non_normal_blends(commands: &[RenderCommand]) -> Vec<bool> {
+/// renderable partial-colorant `Overprint`). Used so an isolated Normal group
+/// containing such an operation flattens as one isolated unit rather than
+/// losing its inner backdrop when `current_surface()` is unavailable inside
+/// the group, while outline-less metrics-only fonts remain native text.
+fn compute_isolated_inner_non_normal_blends(
+    commands: &[RenderCommand],
+    font_cache: &FontCache,
+) -> Vec<bool> {
     let mut flags = vec![false; commands.len()];
     if !commands.iter().any(|c| {
         matches!(
             c,
             RenderCommand::PushBlendGroup { blend_mode, .. }
                 if *blend_mode != zpdf_display_list::BlendMode::Normal
-        ) || command_overprint(c).is_some_and(|op| op.active != 0)
+        ) || command_has_renderable_overprint(c, font_cache)
     }) {
         return flags;
     }
@@ -2709,7 +2714,7 @@ fn compute_isolated_inner_non_normal_blends(commands: &[RenderCommand]) -> Vec<b
                     }
                 }
             }
-            other if command_overprint(other).is_some_and(|op| op.active != 0) => {
+            other if command_has_renderable_overprint(other, font_cache) => {
                 if let Some((_, has_inner)) = stack.last_mut() {
                     *has_inner = true;
                 }
@@ -3066,6 +3071,24 @@ fn command_overprint(cmd: &RenderCommand) -> Option<zpdf_display_list::Overprint
         }
         RenderCommand::DrawGlyphRun(run) => run.overprint,
         _ => None,
+    }
+}
+
+/// Whether `cmd` carries a partial-colorant overprint that `CpuRenderer` can
+/// actually rasterize. Metrics-only fonts without outline data (`!has_font_data()`)
+/// cannot be rasterized by `CpuRenderer` and must stay native `TextBox` elements.
+fn command_has_renderable_overprint(cmd: &RenderCommand, font_cache: &FontCache) -> bool {
+    match cmd {
+        RenderCommand::FillPath { overprint, .. } | RenderCommand::StrokePath { overprint, .. } => {
+            overprint.is_some_and(|op| op.active != 0)
+        }
+        RenderCommand::DrawGlyphRun(run) => {
+            run.overprint.is_some_and(|op| op.active != 0)
+                && font_cache
+                    .get(run.font_id)
+                    .is_some_and(|f| f.has_font_data())
+        }
+        _ => false,
     }
 }
 
@@ -12342,6 +12365,118 @@ mod export_tests {
                 .iter()
                 .any(|e| matches!(e.base(), SlideElement::Image { .. })),
             "overprinting letter A must export as a backdrop-composited Image: {:?}",
+            slide.elements
+        );
+    }
+
+    #[test]
+    fn overprinting_metrics_only_helvetica_stays_native_text_with_empty_provider() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Plain non-embedded Standard 14 Helvetica with `/op true /OPM 1` on white paper:
+        // - `0 g (Hello)` on the page must stay a native black TextBox (not vanish in rasterizer).
+        // - `0 g (InsideForm)` inside an opaque isolated Normal Form must also stay native black TextBox.
+        // - `1 g (Hidden)` (zero ink under OPM 1 -> active == 0) must remain omitted.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 120] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> /ExtGState << /GSop 6 0 R >> \
+              /XObject << /Fm1 7 0 R >> >> >>"
+                .to_vec(), // 3
+            stream(
+                "",
+                b"q /GSop gs 0 g BT /F1 24 Tf 20 80 Td (Hello) Tj ET Q \
+                  q /GSop gs 1 g BT /F1 24 Tf 20 20 Td (Hidden) Tj ET Q \
+                  /Fm1 Do",
+            ), // 4
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 5
+            b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 6
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 320 120] \
+                 /Group << /Type /Group /S /Transparency /I true /K false >> \
+                 /Resources << /Font << /F1 5 0 R >> /ExtGState << /GSop 6 0 R >> >>",
+                b"q /GSop gs 0 g BT /F1 24 Tf 20 50 Td (InsideForm) Tj ET Q",
+            ), // 7
+        ]);
+
+        let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+        let doc = zpdf_document::PdfDocument::open(pdf)
+            .expect("open pdf")
+            .with_font_provider(provider);
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        // Verify the empty provider gave a metrics-only Helvetica face without outline bytes.
+        let run_font_id = dl
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::DrawGlyphRun(r) => Some(r.font_id),
+                _ => None,
+            })
+            .expect("DrawGlyphRun present");
+        assert!(
+            !fonts
+                .get(run_font_id)
+                .expect("font loaded")
+                .has_font_data(),
+            "empty FontProvider::memory_only() must leave Standard 14 Helvetica without outline data"
+        );
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("metrics-only overprint export");
+        let text_boxes: Vec<(&str, (u8, u8, u8))> = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e.base() {
+                SlideElement::TextBox {
+                    text, color_rgb, ..
+                } => Some((text.as_str(), *color_rgb)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_boxes,
+            vec![("Hello", (0, 0, 0)), ("InsideForm", (0, 0, 0))],
+            "overprinting metrics-only Helvetica must preserve native black TextBoxes while omitting zero-ink text: {:?}",
             slide.elements
         );
     }
