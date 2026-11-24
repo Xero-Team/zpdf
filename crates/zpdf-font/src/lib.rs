@@ -249,9 +249,42 @@ pub enum Type3SoftMask {
     },
 }
 
+/// Pre-resolved PDF function node (dict, stream with decoded bytes, or
+/// stitching sub-functions) carried inside [`Type3Shading`] so standalone
+/// Type 3 replay can evaluate `/Function` without a live `PdfFile`.
+#[derive(Debug, Clone)]
+pub enum Type3Function {
+    /// Non-stream function dictionary (Type 2 exponential, or Type 3 stitching
+    /// whose child `/Functions` entries are stored in `children`).
+    Dict {
+        dict: zpdf_core::PdfDict,
+        children: Vec<Type3Function>,
+    },
+    /// Stream-backed function (Type 0 sampled or Type 4 PostScript calculator).
+    Stream {
+        dict: zpdf_core::PdfDict,
+        data: Arc<[u8]>,
+    },
+}
+
+/// Pre-resolved `/Shading` resource carried by [`Type3Resources`] so standalone
+/// Type 3 CharProc / soft-mask replay can execute `/Name sh` without a live
+/// `PdfFile`.
+#[derive(Debug, Clone)]
+pub struct Type3Shading {
+    /// Resolved shading dictionary (`ShadingType`, `Coords`, `ColorSpace`,
+    /// `Domain`, `Extend`, mesh decode keys, etc.).
+    pub dict: zpdf_core::PdfDict,
+    /// Decoded stream bytes for mesh shadings (Types 4–7); `None` for Types 2–3.
+    pub stream_data: Option<Arc<[u8]>>,
+    /// Pre-resolved `/Function` entry (one multi-output function, N 1-output
+    /// functions, or empty for mesh shadings with direct vertex colors).
+    pub functions: Vec<Type3Function>,
+}
+
 /// Resolved named resources carried by a Type 3 [`LoadedFont`] so CharProcs
-/// can resolve `/Name Do`, `/GS gs`, and named `/ColorSpace` entries during
-/// standalone replay across CPU, GPU, SVG, and PPTX backends.
+/// can resolve `/Name Do`, `/GS gs`, `/Shading sh`, and named `/ColorSpace`
+/// entries during standalone replay across CPU, GPU, SVG, and PPTX backends.
 #[derive(Debug, Clone, Default)]
 pub struct Type3Resources {
     pub xobjects: HashMap<String, Type3XObject>,
@@ -260,6 +293,9 @@ pub struct Type3Resources {
     /// Pre-resolved `/SMask` entries for named `/ExtGState` resources, keyed by
     /// the same ExtGState resource name.
     pub ext_g_state_smasks: HashMap<String, Type3SoftMask>,
+    /// Pre-resolved `/Shading` entries referenced by `sh` inside Type 3
+    /// CharProcs, Forms, and `/SMask` transparency groups.
+    pub shadings: HashMap<String, Arc<Type3Shading>>,
 }
 
 #[derive(Default)]
@@ -270,8 +306,40 @@ struct Type3BytesVisited {
     image_ptrs: HashSet<usize>,
     /// Deduplicates shared `Arc<Type3FormXObject>` nodes (and their nested graphs).
     form_ptrs: HashSet<usize>,
+    /// Deduplicates shared `Arc<Type3Shading>` nodes.
+    shading_ptrs: HashSet<usize>,
     /// Deduplicates shared `Type3Resources` maps.
     resource_ptrs: HashSet<usize>,
+}
+
+impl Type3Function {
+    fn estimated_bytes(&self, visited: &mut Type3BytesVisited) -> u64 {
+        let mut bytes = 0u64;
+        let mut stack: Vec<&Self> = vec![self];
+        while let Some(func) = stack.pop() {
+            bytes = bytes.saturating_add(std::mem::size_of::<Self>() as u64);
+            match func {
+                Self::Dict { dict, children } => {
+                    bytes = bytes
+                        .saturating_add(estimated_pdf_dict_bytes(dict))
+                        .saturating_add(
+                            (children.capacity() as u64)
+                                .saturating_mul(std::mem::size_of::<Self>() as u64),
+                        );
+                    for child in children {
+                        stack.push(child);
+                    }
+                }
+                Self::Stream { dict, data } => {
+                    bytes = bytes.saturating_add(estimated_pdf_dict_bytes(dict));
+                    if visited.stream_ptrs.insert(data.as_ptr() as usize) {
+                        bytes = bytes.saturating_add(data.len() as u64);
+                    }
+                }
+            }
+        }
+        bytes
+    }
 }
 
 impl Type3Resources {
@@ -280,6 +348,7 @@ impl Type3Resources {
             && self.color_spaces.is_empty()
             && self.ext_g_states.is_empty()
             && self.ext_g_state_smasks.is_empty()
+            && self.shadings.is_empty()
     }
 
     /// Estimate retained heap bytes across the entire reachable Type 3 resource
@@ -297,7 +366,8 @@ impl Type3Resources {
                 .saturating_add(estimated_map_bytes(&res.xobjects))
                 .saturating_add(estimated_map_bytes(&res.color_spaces))
                 .saturating_add(estimated_map_bytes(&res.ext_g_states))
-                .saturating_add(estimated_map_bytes(&res.ext_g_state_smasks));
+                .saturating_add(estimated_map_bytes(&res.ext_g_state_smasks))
+                .saturating_add(estimated_map_bytes(&res.shadings));
             for (name, xobj) in &res.xobjects {
                 bytes = bytes.saturating_add(name.capacity() as u64);
                 match xobj {
@@ -357,6 +427,26 @@ impl Type3Resources {
                                 bytes = bytes.saturating_add(data.len() as u64);
                             }
                         }
+                    }
+                }
+            }
+            for (name, shading) in &res.shadings {
+                bytes = bytes.saturating_add(name.capacity() as u64);
+                if visited.shading_ptrs.insert(Arc::as_ptr(shading) as usize) {
+                    bytes = bytes
+                        .saturating_add(std::mem::size_of::<Type3Shading>() as u64)
+                        .saturating_add(estimated_pdf_dict_bytes(&shading.dict))
+                        .saturating_add(
+                            (shading.functions.capacity() as u64)
+                                .saturating_mul(std::mem::size_of::<Type3Function>() as u64),
+                        );
+                    if let Some(data) = &shading.stream_data {
+                        if visited.stream_ptrs.insert(data.as_ptr() as usize) {
+                            bytes = bytes.saturating_add(data.len() as u64);
+                        }
+                    }
+                    for func in &shading.functions {
+                        bytes = bytes.saturating_add(func.estimated_bytes(&mut visited));
                     }
                 }
             }

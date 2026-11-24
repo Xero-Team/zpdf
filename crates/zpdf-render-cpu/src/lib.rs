@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use zpdf_core::ParseLimits;
+use zpdf_core::{ParseLimits, Point, Rect};
 use zpdf_display_list::*;
 use zpdf_font::{FontCache, GlyphOutline, OutlineCommand};
 use zpdf_image::ImageCache;
@@ -113,6 +113,11 @@ pub struct CpuRenderer<'a> {
     /// optional `/TR` LUT alongside the coverage bytes so pointer keys stay
     /// unique for as long as the entry lives. Cleared per page.
     soft_mask_planes: HashMap<SoftMaskPlaneKey, SoftMaskPlaneEntry>,
+    /// Distinct `Arc<InlineImage>` addresses currently retained by
+    /// `soft_mask_planes` so shared mask images are charged once against
+    /// `max_soft_mask_cache_bytes` while uncached fresh allocations are charged
+    /// every time.
+    soft_mask_inline_ptrs: std::collections::HashSet<usize>,
     soft_mask_cache_bytes: u64,
     /// Current recursive soft-mask depth (guards malicious/cyclic mask graphs).
     soft_mask_depth: usize,
@@ -664,6 +669,7 @@ impl<'a> CpuRenderer<'a> {
             deadline: None,
             over_budget: false,
             soft_mask_planes: HashMap::new(),
+            soft_mask_inline_ptrs: std::collections::HashSet::new(),
             soft_mask_cache_bytes: 0,
             soft_mask_depth: 0,
             tiling_cache: HashMap::new(),
@@ -727,6 +733,7 @@ impl<'a> CpuRenderer<'a> {
     /// so subsequent allocations cannot reuse an old `Arc::as_ptr` key.
     pub fn clear_soft_mask_cache(&mut self) {
         self.soft_mask_planes.clear();
+        self.soft_mask_inline_ptrs.clear();
         self.soft_mask_cache_bytes = 0;
     }
 
@@ -1440,6 +1447,7 @@ impl<'a> CpuRenderer<'a> {
                 deadline: self.deadline,
                 over_budget: self.over_budget,
                 soft_mask_planes: HashMap::new(),
+                soft_mask_inline_ptrs: std::collections::HashSet::new(),
                 soft_mask_cache_bytes: 0,
                 soft_mask_depth: blend_depth,
                 tiling_cache: HashMap::new(),
@@ -1476,8 +1484,7 @@ impl<'a> CpuRenderer<'a> {
                     // Soft-mask planes are rasterized in `sub`'s device coordinates
                     // (`rect_x0`, `rect_y1`); invalidate before shifting the origin.
                     if !sub.soft_mask_planes.is_empty() {
-                        sub.soft_mask_planes.clear();
-                        sub.soft_mask_cache_bytes = 0;
+                        sub.clear_soft_mask_cache();
                     }
                     sub.rect_x0 = (bx0 - di as f64 * x_step) as f32;
                     sub.rect_y0 = (by0 - dj as f64 * y_step) as f32;
@@ -1743,6 +1750,7 @@ impl<'a> CpuRenderer<'a> {
             deadline: self.deadline,
             over_budget: self.over_budget,
             soft_mask_planes: HashMap::new(),
+            soft_mask_inline_ptrs: std::collections::HashSet::new(),
             soft_mask_cache_bytes: 0,
             soft_mask_depth: blend_depth,
             tiling_cache: HashMap::new(),
@@ -1894,8 +1902,7 @@ impl<'a> CpuRenderer<'a> {
                             break 'copies;
                         }
                         if !sub.soft_mask_planes.is_empty() {
-                            sub.soft_mask_planes.clear();
-                            sub.soft_mask_cache_bytes = 0;
+                            sub.clear_soft_mask_cache();
                         }
                         sub.rect_x0 = (bx0 - di as f64 * x_step) as f32;
                         sub.rect_y0 = (by0 - dj as f64 * y_step) as f32;
@@ -2185,6 +2192,7 @@ impl<'a> CpuRenderer<'a> {
         let saved_clip_stack = std::mem::take(&mut self.clip_stack);
         let saved_mask_pool = std::mem::take(&mut self.mask_pool);
         let saved_soft_masks = std::mem::take(&mut self.soft_mask_planes);
+        let saved_soft_mask_inline_ptrs = std::mem::take(&mut self.soft_mask_inline_ptrs);
         let saved_soft_mask_bytes = std::mem::replace(&mut self.soft_mask_cache_bytes, 0);
         let saved_ox = self.dev_origin_x;
         let saved_oy = self.dev_origin_y;
@@ -2254,8 +2262,7 @@ impl<'a> CpuRenderer<'a> {
                 self.dev_origin_y = saved_oy.saturating_add(by0);
                 // Band-local soft-mask planes are origin-dependent.
                 if !self.soft_mask_planes.is_empty() {
-                    self.soft_mask_planes.clear();
-                    self.soft_mask_cache_bytes = 0;
+                    self.clear_soft_mask_cache();
                 }
 
                 // 1. Rasterize the outer shape into `shape_buf` (unclipped;
@@ -2419,6 +2426,7 @@ impl<'a> CpuRenderer<'a> {
         self.current_clip = saved_clip;
         self.clip_bounds = saved_clip_bounds;
         self.soft_mask_planes = saved_soft_masks;
+        self.soft_mask_inline_ptrs = saved_soft_mask_inline_ptrs;
         self.soft_mask_cache_bytes = saved_soft_mask_bytes;
         self.dev_origin_x = saved_ox;
         self.dev_origin_y = saved_oy;
@@ -2951,6 +2959,7 @@ impl<'a> CpuRenderer<'a> {
         // command list so per-tile transformed mask Arcs never alias freed
         // heap addresses across translated tiles or pollute the page cache.
         let saved_mask_planes = std::mem::take(&mut self.soft_mask_planes);
+        let saved_mask_inline_ptrs = std::mem::take(&mut self.soft_mask_inline_ptrs);
         let saved_mask_bytes = std::mem::replace(&mut self.soft_mask_cache_bytes, 0);
 
         'tiles: for j in j0..=j1 {
@@ -2985,11 +2994,11 @@ impl<'a> CpuRenderer<'a> {
                     self.pop_clip();
                 }
                 // Evict tile-local mask planes before `transformed` drops.
-                self.soft_mask_planes.clear();
-                self.soft_mask_cache_bytes = 0;
+                self.clear_soft_mask_cache();
             }
         }
         self.soft_mask_planes = saved_mask_planes;
+        self.soft_mask_inline_ptrs = saved_mask_inline_ptrs;
         self.soft_mask_cache_bytes = saved_mask_bytes;
         self.tiling_depth = self.tiling_depth.saturating_sub(1);
         true
@@ -4794,6 +4803,7 @@ impl<'a> CpuRenderer<'a> {
         let saved_clip_stack = std::mem::take(&mut self.clip_stack);
         let saved_mask_pool = std::mem::take(&mut self.mask_pool);
         let saved_soft_masks = std::mem::take(&mut self.soft_mask_planes);
+        let saved_soft_mask_inline_ptrs = std::mem::take(&mut self.soft_mask_inline_ptrs);
         let saved_soft_mask_bytes = std::mem::replace(&mut self.soft_mask_cache_bytes, 0);
 
         let mut merged_dirty: Option<PaintedBounds> = None;
@@ -4896,8 +4906,7 @@ impl<'a> CpuRenderer<'a> {
                 self.dev_origin_x = saved_ox.saturating_add(bx0);
                 self.dev_origin_y = saved_oy.saturating_add(by0);
                 if !self.soft_mask_planes.is_empty() {
-                    self.soft_mask_planes.clear();
-                    self.soft_mask_cache_bytes = 0;
+                    self.clear_soft_mask_cache();
                 }
                 self.current_clip = band_clip;
                 self.clip_bounds = self
@@ -5143,6 +5152,7 @@ impl<'a> CpuRenderer<'a> {
         self.current_clip = saved_clip;
         self.clip_bounds = saved_clip_bounds;
         self.soft_mask_planes = saved_soft_masks;
+        self.soft_mask_inline_ptrs = saved_soft_mask_inline_ptrs;
         self.soft_mask_cache_bytes = saved_soft_mask_bytes;
         self.dev_origin_x = saved_ox;
         self.dev_origin_y = saved_oy;
@@ -5591,22 +5601,28 @@ impl<'a> CpuRenderer<'a> {
             }
         };
         let base_bytes = base.len() as u64;
-        if base_bytes <= self.max_soft_mask_cache_bytes {
-            if self.soft_mask_cache_bytes.saturating_add(base_bytes)
+        let (mut entry_bytes, mut new_inline_ptrs) =
+            Self::soft_mask_retained_bytes(mask, &self.soft_mask_inline_ptrs, base_bytes);
+        if entry_bytes <= self.max_soft_mask_cache_bytes {
+            if self.soft_mask_cache_bytes.saturating_add(entry_bytes)
                 > self.max_soft_mask_cache_bytes
             {
-                self.soft_mask_planes.clear();
-                self.soft_mask_cache_bytes = 0;
+                self.clear_soft_mask_cache();
+                (entry_bytes, new_inline_ptrs) =
+                    Self::soft_mask_retained_bytes(mask, &self.soft_mask_inline_ptrs, base_bytes);
             }
-            self.soft_mask_planes.insert(
-                key,
-                (
-                    Arc::clone(&mask.commands),
-                    mask.transfer.clone(),
-                    Arc::clone(&base),
-                ),
-            );
-            self.soft_mask_cache_bytes = self.soft_mask_cache_bytes.saturating_add(base_bytes);
+            if entry_bytes <= self.max_soft_mask_cache_bytes {
+                self.soft_mask_planes.insert(
+                    key,
+                    (
+                        Arc::clone(&mask.commands),
+                        mask.transfer.clone(),
+                        Arc::clone(&base),
+                    ),
+                );
+                self.soft_mask_inline_ptrs.extend(new_inline_ptrs);
+                self.soft_mask_cache_bytes = self.soft_mask_cache_bytes.saturating_add(entry_bytes);
+            }
         }
         let plane = if dx == 0 && dy == 0 {
             base
@@ -5615,6 +5631,65 @@ impl<'a> CpuRenderer<'a> {
         };
         self.tock(t, |s| &mut s.soft_mask_ns);
         Some(plane)
+    }
+
+    /// Compute retained memory bytes for caching `mask` in `soft_mask_planes`:
+    /// coverage-plane bytes plus command-list storage and any newly-retained
+    /// `Arc<InlineImage>` pixel buffers not already held by the cache.
+    fn soft_mask_retained_bytes(
+        mask: &SoftMask,
+        already_retained_inlines: &std::collections::HashSet<usize>,
+        plane_bytes: u64,
+    ) -> (u64, Vec<usize>) {
+        let mut bytes = plane_bytes;
+        let mut seen_dls = std::collections::HashSet::new();
+        let mut seen_inlines = std::collections::HashSet::new();
+        let mut new_inlines = Vec::new();
+        let mut stack: Vec<(&DisplayList, u8)> = vec![(&mask.commands, 0)];
+        while let Some((dl, depth)) = stack.pop() {
+            if depth > 8 || !seen_dls.insert(dl as *const DisplayList as usize) {
+                continue;
+            }
+            bytes = bytes.saturating_add(
+                (dl.commands.len() as u64)
+                    .saturating_mul(std::mem::size_of::<RenderCommand>() as u64),
+            );
+            for cmd in &dl.commands {
+                match cmd {
+                    RenderCommand::DrawInlineImage(draw) => {
+                        let ptr = Arc::as_ptr(&draw.image) as usize;
+                        if seen_inlines.insert(ptr) && !already_retained_inlines.contains(&ptr) {
+                            bytes = bytes.saturating_add(draw.image.data.len() as u64);
+                            new_inlines.push(ptr);
+                        }
+                    }
+                    RenderCommand::PushBlendGroup {
+                        mask: Some(sub), ..
+                    } => {
+                        stack.push((&sub.commands, depth + 1));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (bytes, new_inlines)
+    }
+
+    fn current_page_bounds(&self) -> Option<Rect> {
+        let p = self.pixmap.as_ref()?;
+        if !self.scale.is_finite()
+            || !self.scale_y.is_finite()
+            || self.scale <= 0.0
+            || self.scale_y <= 0.0
+        {
+            return None;
+        }
+        let x0 = self.rect_x0 as f64 + self.dev_origin_x as f64 / self.scale as f64;
+        let x1 = x0 + p.width() as f64 / self.scale as f64;
+        let y1 = self.rect_y1 as f64 - self.dev_origin_y as f64 / self.scale_y as f64;
+        let y0 = y1 - p.height() as f64 / self.scale_y as f64;
+        (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+            .then(|| Rect::new(x0, y0, x1, y1))
     }
 
     /// Render a soft mask's group commands offscreen (same page geometry as
@@ -5688,6 +5763,7 @@ impl<'a> CpuRenderer<'a> {
             deadline: self.deadline,
             over_budget: self.over_budget,
             soft_mask_planes: HashMap::new(),
+            soft_mask_inline_ptrs: std::collections::HashSet::new(),
             soft_mask_cache_bytes: 0,
             // The mask belongs to the group currently being pushed, so carry
             // both enclosing mask depth and live page-group depth into the
@@ -6559,9 +6635,10 @@ impl<'a> CpuRenderer<'a> {
             );
             let resolve_glyph_img = |id: ImageId| program.inline_images.get(&id).cloned();
             let device_scale = self.scale.max(self.scale_y);
+            let page_bounds = self.current_page_bounds();
             let transform_mask_stroke =
-                |path: &Path, style: &StrokeStyle, m: &zpdf_core::Matrix| {
-                    transform_stroke_to_page(path, style, m, device_scale)
+                |path: &Path, style: &StrokeStyle, m: &zpdf_core::Matrix, clip: Option<Rect>| {
+                    transform_stroke_to_page(path, style, m, clip, page_bounds, device_scale)
                 };
             let mut seg_start = 0usize;
             let mut glyph_clip_depth = 0usize;
@@ -6690,9 +6767,11 @@ impl<'a> CpuRenderer<'a> {
         let glyph_images = &program.images;
         let resolve_glyph_img = |id: ImageId| program.inline_images.get(&id).cloned();
         let device_scale = self.scale.max(self.scale_y);
-        let transform_mask_stroke = |path: &Path, style: &StrokeStyle, m: &zpdf_core::Matrix| {
-            transform_stroke_to_page(path, style, m, device_scale)
-        };
+        let page_bounds = self.current_page_bounds();
+        let transform_mask_stroke =
+            |path: &Path, style: &StrokeStyle, m: &zpdf_core::Matrix, clip: Option<Rect>| {
+                transform_stroke_to_page(path, style, m, clip, page_bounds, device_scale)
+            };
         let glyph_to_page = Self::type3_glyph_to_page(tm, glyph, font_size, h_scale, &font_matrix);
         let mut glyph_clip_depth = 0usize;
         let mut glyph_blend_depth = 0usize;
@@ -7407,6 +7486,8 @@ impl<'a> Default for CpuRenderer<'a> {
 /// Build shared `Arc<InlineImage>` wrappers once per Type 3 glyph program for
 /// every glyph-local `ImageId` referenced inside its soft masks so repeated
 /// glyph placements share one decoded pixel buffer instead of cloning per draw.
+/// Shared nested mask `Arc<DisplayList>` references already visited at an equal
+/// or shallower depth are skipped to avoid redundant traversal of mask DAGs.
 pub fn collect_type3_mask_inline_images(
     list: &DisplayList,
     images: &ImageCache,
@@ -7415,6 +7496,7 @@ pub fn collect_type3_mask_inline_images(
         commands: &[RenderCommand],
         in_mask: bool,
         depth: u8,
+        min_depth: &mut HashMap<*const DisplayList, u8>,
         ids: &mut std::collections::HashSet<ImageId>,
     ) {
         if depth > 8 {
@@ -7426,7 +7508,13 @@ pub fn collect_type3_mask_inline_images(
                     ids.insert(draw.image_id);
                 }
                 RenderCommand::PushBlendGroup { mask: Some(m), .. } => {
-                    visit(&m.commands.commands, true, depth + 1, ids);
+                    let next_depth = depth + 1;
+                    let ptr = Arc::as_ptr(&m.commands);
+                    if min_depth.get(&ptr).is_some_and(|&d| d <= next_depth) {
+                        continue;
+                    }
+                    min_depth.insert(ptr, next_depth);
+                    visit(&m.commands.commands, true, next_depth, min_depth, ids);
                 }
                 _ => {}
             }
@@ -7434,7 +7522,8 @@ pub fn collect_type3_mask_inline_images(
     }
 
     let mut ids = std::collections::HashSet::new();
-    visit(&list.commands, false, 0, &mut ids);
+    let mut min_depth = HashMap::new();
+    visit(&list.commands, false, 0, &mut min_depth, &mut ids);
     let mut out = HashMap::with_capacity(ids.len());
     for id in ids {
         if let Some(img) = images.get(id) {
@@ -7454,16 +7543,225 @@ pub fn collect_type3_mask_inline_images(
     out
 }
 
+fn clip_segment_to_rect(a: Point, b: Point, r: Rect) -> Option<(f64, f64)> {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let mut t0 = 0.0f64;
+    let mut t1 = 1.0f64;
+    for (p, q) in [
+        (-dx, a.x - r.x0),
+        (dx, r.x1 - a.x),
+        (-dy, a.y - r.y0),
+        (dy, r.y1 - a.y),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                if t > t1 {
+                    return None;
+                }
+                if t > t0 {
+                    t0 = t;
+                }
+            } else {
+                if t < t0 {
+                    return None;
+                }
+                if t < t1 {
+                    t1 = t;
+                }
+            }
+        }
+    }
+    (t0 <= t1).then_some((t0, t1))
+}
+
+fn split_cubic_half(p0: Point, c1: Point, c2: Point, p3: Point) -> ([Point; 4], [Point; 4]) {
+    let mid = |a: Point, b: Point| Point::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y));
+    let m01 = mid(p0, c1);
+    let m12 = mid(c1, c2);
+    let m23 = mid(c2, p3);
+    let m012 = mid(m01, m12);
+    let m123 = mid(m12, m23);
+    let m = mid(m012, m123);
+    ([p0, m01, m012, m], [m, m123, m23, p3])
+}
+
+fn cubic_arc_length(p0: Point, c1: Point, c2: Point, p3: Point, tol: f64) -> Option<f64> {
+    fn gl5(p0: Point, c1: Point, c2: Point, p3: Point) -> f64 {
+        const T: [f64; 5] = [
+            0.04691007703066802,
+            0.23076534494715845,
+            0.5,
+            0.7692346550528415,
+            0.9530899229693319,
+        ];
+        const W: [f64; 5] = [
+            0.11846344252809454,
+            0.23931433524968324,
+            0.28444444444444444,
+            0.23931433524968324,
+            0.11846344252809454,
+        ];
+        let mut sum = 0.0;
+        for (&t, &w) in T.iter().zip(W.iter()) {
+            let u = 1.0 - t;
+            let dx =
+                3.0 * (u * u * (c1.x - p0.x) + 2.0 * u * t * (c2.x - c1.x) + t * t * (p3.x - c2.x));
+            let dy =
+                3.0 * (u * u * (c1.y - p0.y) + 2.0 * u * t * (c2.y - c1.y) + t * t * (p3.y - c2.y));
+            sum += w * dx.hypot(dy);
+        }
+        sum
+    }
+    fn rec(
+        p0: Point,
+        c1: Point,
+        c2: Point,
+        p3: Point,
+        tol: f64,
+        depth: u8,
+        budget: &mut usize,
+    ) -> Option<f64> {
+        let chord = (p3.x - p0.x).hypot(p3.y - p0.y);
+        let poly = (c1.x - p0.x).hypot(c1.y - p0.y)
+            + (c2.x - c1.x).hypot(c2.y - c1.y)
+            + (p3.x - c2.x).hypot(p3.y - c2.y);
+        if !poly.is_finite() {
+            return None;
+        }
+        if poly - chord <= tol || depth >= 16 || *budget == 0 {
+            return Some(gl5(p0, c1, c2, p3));
+        }
+        *budget -= 1;
+        let (l, r) = split_cubic_half(p0, c1, c2, p3);
+        let half_tol = tol * 0.5;
+        Some(
+            rec(l[0], l[1], l[2], l[3], half_tol, depth + 1, budget)?
+                + rec(r[0], r[1], r[2], r[3], half_tol, depth + 1, budget)?,
+        )
+    }
+    let mut budget = 1024usize;
+    rec(p0, c1, c2, p3, tol.max(1e-9), 0, &mut budget)
+}
+
+/// Join a dashed closed subpath's final and initial open contours when both
+/// meet at the subpath start corner `(0, 0)` so a dash straddling the closing
+/// corner keeps its join instead of splitting into two end caps.
+fn join_dashed_closing_contours_skia(dashed: &tiny_skia::Path) -> Option<tiny_skia::Path> {
+    #[derive(Clone, Copy)]
+    enum Seg {
+        Line(tiny_skia::Point),
+        Quad(tiny_skia::Point, tiny_skia::Point),
+        Cubic(tiny_skia::Point, tiny_skia::Point, tiny_skia::Point),
+    }
+    struct Contour {
+        start: tiny_skia::Point,
+        end: tiny_skia::Point,
+        segs: Vec<Seg>,
+        closed: bool,
+    }
+    let mut contours: Vec<Contour> = Vec::new();
+    let mut cur: Option<Contour> = None;
+    for seg in dashed.segments() {
+        match seg {
+            tiny_skia::PathSegment::MoveTo(p) => {
+                if let Some(c) = cur.take() {
+                    if !c.segs.is_empty() || c.closed {
+                        contours.push(c);
+                    }
+                }
+                cur = Some(Contour {
+                    start: p,
+                    end: p,
+                    segs: Vec::new(),
+                    closed: false,
+                });
+            }
+            tiny_skia::PathSegment::LineTo(p) => {
+                if let Some(ref mut c) = cur {
+                    c.segs.push(Seg::Line(p));
+                    c.end = p;
+                }
+            }
+            tiny_skia::PathSegment::QuadTo(p1, p2) => {
+                if let Some(ref mut c) = cur {
+                    c.segs.push(Seg::Quad(p1, p2));
+                    c.end = p2;
+                }
+            }
+            tiny_skia::PathSegment::CubicTo(p1, p2, p3) => {
+                if let Some(ref mut c) = cur {
+                    c.segs.push(Seg::Cubic(p1, p2, p3));
+                    c.end = p3;
+                }
+            }
+            tiny_skia::PathSegment::Close => {
+                if let Some(mut c) = cur.take() {
+                    c.closed = true;
+                    c.end = c.start;
+                    contours.push(c);
+                }
+            }
+        }
+    }
+    if let Some(c) = cur.take() {
+        if !c.segs.is_empty() || c.closed {
+            contours.push(c);
+        }
+    }
+    if contours.len() < 2 {
+        return None;
+    }
+    let tol = 1e-2f32;
+    let at_origin = |p: tiny_skia::Point| p.x.abs() <= tol && p.y.abs() <= tol;
+    let first = &contours[0];
+    let last = contours.last()?;
+    if first.closed || last.closed || !at_origin(first.start) || !at_origin(last.end) {
+        return None;
+    }
+    let mut pb = tiny_skia::PathBuilder::new();
+    let emit_segs = |pb: &mut tiny_skia::PathBuilder, segs: &[Seg]| {
+        for &s in segs {
+            match s {
+                Seg::Line(p) => pb.line_to(p.x, p.y),
+                Seg::Quad(p1, p2) => pb.quad_to(p1.x, p1.y, p2.x, p2.y),
+                Seg::Cubic(p1, p2, p3) => pb.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y),
+            }
+        }
+    };
+    pb.move_to(last.start.x, last.start.y);
+    emit_segs(&mut pb, &last.segs);
+    emit_segs(&mut pb, &first.segs);
+    for c in &contours[1..contours.len() - 1] {
+        pb.move_to(c.start.x, c.start.y);
+        emit_segs(&mut pb, &c.segs);
+        if c.closed {
+            pb.close();
+        }
+    }
+    pb.finish()
+}
+
 /// Map a local-space stroke (`StrokePath` or `PushClipStroke`) through `matrix`
 /// into destination coordinates while preserving directional stroke widths,
-/// elliptical caps/joins, and directional dash lengths under nonuniform scales
-/// and shears.
+/// elliptical caps/joins, and clipped dash patterns (carrying dash phase
+/// through clipped-off spans) under nonuniform scales and shears.
 pub fn transform_stroke_to_page(
     path: &Path,
     style: &StrokeStyle,
     matrix: &zpdf_core::Matrix,
+    local_clip: Option<Rect>,
+    page_rect: Option<Rect>,
     device_scale: f32,
 ) -> zpdf_display_list::TransformedStroke {
+    const MAX_NORM_COORD: f32 = 1e7;
+    const MAX_DASH_REPEATS: f64 = 100_000.0;
+
     let sx = matrix.a.hypot(matrix.b);
     let sy = matrix.c.hypot(matrix.d);
     let max_scale = CpuRenderer::max_linear_scale_2x2(matrix.a, matrix.b, matrix.c, matrix.d);
@@ -7472,8 +7770,7 @@ pub fn transform_stroke_to_page(
     }
     let dot = matrix.a * matrix.c + matrix.b * matrix.d;
     let is_uniform = (sx - sy).abs() <= 1e-5 * sx.max(sy).max(1.0) && dot.abs() <= 1e-5 * sx * sy;
-    if is_uniform {
-        let s = sx as f32;
+    let fallback_stroked = |s: f32| {
         let scaled = StrokeStyle {
             width: if style.width > 0.0 && style.width.is_finite() {
                 style.width * s
@@ -7488,158 +7785,779 @@ pub fn transform_stroke_to_page(
                 phase: d.phase * s,
             }),
         };
-        return zpdf_display_list::TransformedStroke::Stroked(
+        zpdf_display_list::TransformedStroke::Stroked(
             path.map_points(|p| p.transform(matrix)),
             scaled,
-        );
+        )
+    };
+    if is_uniform {
+        return fallback_stroked(sx as f32);
     }
 
-    // Normalize local geometry by `norm` to page-point magnitude so tiny
-    // glyph coordinates scaled up by a large matrix keep full stroking accuracy.
-    let mut max_coord = 0.0_f64;
-    for p in path.points() {
-        if !p.x.is_finite() || !p.y.is_finite() {
-            return zpdf_display_list::TransformedStroke::Empty;
-        }
-        max_coord = max_coord.max(p.x.abs()).max(p.y.abs());
+    #[derive(Clone, Copy)]
+    enum UserSeg {
+        Line(Point),
+        Cubic(Point, Point, Point),
     }
-    let norm = if max_coord * max_scale <= 1e7 && (style.width as f64) * max_scale <= 1e7 {
-        max_scale
-    } else {
-        1.0
-    };
-    let norm_f32 = norm as f32;
-    let mut pb = tiny_skia::PathBuilder::new();
+    struct UserSubpath {
+        start: Point,
+        segments: Vec<UserSeg>,
+        closed: bool,
+    }
+    struct ClippedRun {
+        start: Point,
+        segments: Vec<UserSeg>,
+        start_phase_user: f64,
+        starts_at_subpath_start: bool,
+        ends_at_subpath_start: bool,
+        closed: bool,
+    }
+
+    let mut subpaths: Vec<UserSubpath> = Vec::new();
+    let mut cur_sp: Option<UserSubpath> = None;
+    let mut after_close_start: Option<Point> = None;
     for elem in path {
         match elem {
-            PathElement::MoveTo(p) => pb.move_to((p.x * norm) as f32, (p.y * norm) as f32),
-            PathElement::LineTo(p) => pb.line_to((p.x * norm) as f32, (p.y * norm) as f32),
-            PathElement::CurveTo(c1, c2, end) => pb.cubic_to(
-                (c1.x * norm) as f32,
-                (c1.y * norm) as f32,
-                (c2.x * norm) as f32,
-                (c2.y * norm) as f32,
-                (end.x * norm) as f32,
-                (end.y * norm) as f32,
-            ),
-            PathElement::Close => pb.close(),
+            PathElement::MoveTo(p) => {
+                if !p.x.is_finite() || !p.y.is_finite() {
+                    return zpdf_display_list::TransformedStroke::Empty;
+                }
+                if let Some(sp) = cur_sp.take() {
+                    if !sp.segments.is_empty() || sp.closed {
+                        subpaths.push(sp);
+                    }
+                }
+                cur_sp = Some(UserSubpath {
+                    start: p,
+                    segments: Vec::new(),
+                    closed: false,
+                });
+                after_close_start = None;
+            }
+            PathElement::LineTo(p) => {
+                if !p.x.is_finite() || !p.y.is_finite() {
+                    return zpdf_display_list::TransformedStroke::Empty;
+                }
+                if cur_sp.is_none() {
+                    if let Some(s) = after_close_start.take() {
+                        cur_sp = Some(UserSubpath {
+                            start: s,
+                            segments: Vec::new(),
+                            closed: false,
+                        });
+                    }
+                }
+                if let Some(ref mut sp) = cur_sp {
+                    sp.segments.push(UserSeg::Line(p));
+                }
+            }
+            PathElement::CurveTo(c1, c2, end) => {
+                if ![c1.x, c1.y, c2.x, c2.y, end.x, end.y]
+                    .iter()
+                    .all(|v| v.is_finite())
+                {
+                    return zpdf_display_list::TransformedStroke::Empty;
+                }
+                if cur_sp.is_none() {
+                    if let Some(s) = after_close_start.take() {
+                        cur_sp = Some(UserSubpath {
+                            start: s,
+                            segments: Vec::new(),
+                            closed: false,
+                        });
+                    }
+                }
+                if let Some(ref mut sp) = cur_sp {
+                    sp.segments.push(UserSeg::Cubic(c1, c2, end));
+                }
+            }
+            PathElement::Close => {
+                if let Some(mut sp) = cur_sp.take() {
+                    sp.closed = true;
+                    after_close_start = Some(sp.start);
+                    subpaths.push(sp);
+                }
+            }
         }
     }
-    let Some(norm_path) = pb.finish() else {
+    if let Some(sp) = cur_sp.take() {
+        if !sp.segments.is_empty() || sp.closed {
+            subpaths.push(sp);
+        }
+    }
+    if subpaths.is_empty() {
         return zpdf_display_list::TransformedStroke::Empty;
+    }
+
+    let is_positive_width = style.width.is_finite() && style.width > 0.0;
+    let dash_user = style
+        .dash
+        .as_ref()
+        .filter(|d| {
+            !d.array.is_empty()
+                && d.phase.is_finite()
+                && d.array.iter().all(|v| v.is_finite() && *v >= 0.0)
+                && d.array.iter().any(|&v| v > 0.0)
+        })
+        .map(|d| {
+            let mut arr: Vec<f64> = d.array.iter().map(|&v| v as f64).collect();
+            if arr.len() % 2 == 1 {
+                let len = arr.len();
+                arr.reserve(len);
+                for i in 0..len {
+                    arr.push(arr[i]);
+                }
+            }
+            let period_user: f64 = arr.iter().sum();
+            let phase_user = if period_user.is_finite() && period_user > 0.0 {
+                (d.phase as f64).rem_euclid(period_user)
+            } else {
+                0.0
+            };
+            (arr, period_user, phase_user)
+        });
+
+    let mut norm_scale = max_scale;
+    if let Some((_, period_user, _)) = dash_user {
+        if period_user.is_finite() && period_user > 0.0 && period_user * norm_scale < 1e-2 {
+            let max_for_width = if is_positive_width {
+                (MAX_NORM_COORD as f64) / (style.width as f64).max(1e-12)
+            } else {
+                MAX_NORM_COORD as f64
+            };
+            let boosted = (1.0 / period_user).min(max_for_width);
+            if boosted.is_finite() && boosted > norm_scale {
+                norm_scale = boosted;
+            }
+        }
+    }
+    let avg_scale = (0.5 * (sx + sy)) as f32;
+    if is_positive_width {
+        let w_norm = (style.width as f64 * norm_scale) as f32;
+        if !w_norm.is_finite() || w_norm <= 0.0 || w_norm > MAX_NORM_COORD {
+            return fallback_stroked(avg_scale);
+        }
+    }
+    let dash_spec = match dash_user {
+        Some((user_array, period_user, phase_user)) => {
+            if !period_user.is_finite() || period_user <= 0.0 {
+                return fallback_stroked(avg_scale);
+            }
+            let norm_array: Vec<f32> = user_array
+                .iter()
+                .map(|&v| (v * norm_scale) as f32)
+                .collect();
+            let period_norm: f64 = norm_array.iter().map(|&v| v as f64).sum();
+            if !period_norm.is_finite()
+                || period_norm <= 1e-4
+                || !norm_array.iter().all(|v| v.is_finite())
+            {
+                return fallback_stroked(avg_scale);
+            }
+            Some((norm_array, period_norm, period_user, phase_user))
+        }
+        None => None,
     };
+
     let dev = if device_scale.is_finite() && device_scale > 0.0 {
         device_scale
     } else {
         1.0
     };
-    let res_scale = ((max_scale / norm) as f32 * dev).clamp(1.0, 1024.0);
-    let post_matrix = zpdf_core::Matrix {
-        a: matrix.a / norm,
-        b: matrix.b / norm,
-        c: matrix.c / norm,
-        d: matrix.d / norm,
-        e: matrix.e,
-        f: matrix.f,
+    let res_scale = ((max_scale / norm_scale) as f32 * dev).clamp(1.0, 1024.0);
+    let inv_norm = 1.0 / norm_scale;
+    if !inv_norm.is_finite() {
+        return fallback_stroked(avg_scale);
+    }
+    let mut glyph_stroke = CpuRenderer::skia_stroke(style, norm_scale as f32, 0.0);
+    glyph_stroke.dash = None;
+    let make_post = |origin: Point| -> zpdf_core::Matrix {
+        zpdf_core::Matrix::new(
+            matrix.a * inv_norm,
+            matrix.b * inv_norm,
+            matrix.c * inv_norm,
+            matrix.d * inv_norm,
+            matrix.a * origin.x + matrix.c * origin.y + matrix.e,
+            matrix.b * origin.x + matrix.d * origin.y + matrix.f,
+        )
     };
-
-    let safe_dash = style.dash.as_ref().and_then(|d| {
-        let period: f64 = d
-            .array
-            .iter()
-            .filter(|v| v.is_finite() && **v >= 0.0)
-            .map(|&v| v as f64)
-            .sum();
-        if !period.is_finite() || period <= 0.0 {
+    let to_norm = |p: Point, origin: Point| -> Option<(f32, f32)> {
+        let nx = ((p.x - origin.x) * norm_scale) as f32;
+        let ny = ((p.y - origin.y) * norm_scale) as f32;
+        if !nx.is_finite()
+            || !ny.is_finite()
+            || nx.abs() > MAX_NORM_COORD
+            || ny.abs() > MAX_NORM_COORD
+        {
             return None;
         }
-        let mut chord_len = 0.0_f64;
-        let mut start = zpdf_core::Point::new(0.0, 0.0);
-        let mut cur = start;
-        for elem in path {
-            match elem {
-                PathElement::MoveTo(p) => {
-                    start = p;
-                    cur = p;
+        Some((nx, ny))
+    };
+    let build_skia_path = |origin: Point,
+                           start: Point,
+                           segs: &[UserSeg],
+                           closed: bool|
+     -> Result<Option<tiny_skia::Path>, ()> {
+        let Some((sx0, sy0)) = to_norm(start, origin) else {
+            return Err(());
+        };
+        let mut pb = tiny_skia::PathBuilder::new();
+        pb.move_to(sx0, sy0);
+        for &seg in segs {
+            match seg {
+                UserSeg::Line(p) => {
+                    let Some((nx, ny)) = to_norm(p, origin) else {
+                        return Err(());
+                    };
+                    pb.line_to(nx, ny);
                 }
-                PathElement::LineTo(p) => {
-                    chord_len += (p.x - cur.x).hypot(p.y - cur.y);
-                    cur = p;
-                }
-                PathElement::CurveTo(c1, c2, end) => {
-                    chord_len += (c1.x - cur.x).hypot(c1.y - cur.y)
-                        + (c2.x - c1.x).hypot(c2.y - c1.y)
-                        + (end.x - c2.x).hypot(end.y - c2.y);
-                    cur = end;
-                }
-                PathElement::Close => {
-                    chord_len += (start.x - cur.x).hypot(start.y - cur.y);
-                    cur = start;
+                UserSeg::Cubic(c1, c2, end) => {
+                    let (Some((x1, y1)), Some((x2, y2)), Some((xe, ye))) = (
+                        to_norm(c1, origin),
+                        to_norm(c2, origin),
+                        to_norm(end, origin),
+                    ) else {
+                        return Err(());
+                    };
+                    pb.cubic_to(x1, y1, x2, y2, xe, ye);
                 }
             }
         }
-        let repeats = if d.array.len() % 2 == 1 {
-            chord_len / (2.0 * period)
-        } else {
-            chord_len / period
-        };
-        if !repeats.is_finite() || repeats > 100_000.0 {
-            return None;
+        if closed {
+            pb.close();
         }
-        CpuRenderer::stroke_dash(style, norm_f32)
-    });
+        Ok(pb.finish())
+    };
+    let make_skia_dash = |phase_user: f64| -> Option<tiny_skia::StrokeDash> {
+        let (ref norm_array, period_norm, _, _) = dash_spec.as_ref()?;
+        let mut phase = (phase_user * norm_scale).rem_euclid(*period_norm) as f32;
+        if !phase.is_finite() || phase >= *period_norm as f32 {
+            phase = 0.0;
+        }
+        tiny_skia::StrokeDash::new(norm_array.clone(), phase)
+    };
+    let emit_norm_path = |src: &tiny_skia::Path, origin: Point, out: &mut Path| {
+        let post = make_post(origin);
+        if is_positive_width {
+            if let Some(stroked) = src.stroke(&glyph_stroke, res_scale) {
+                append_skia_path_transformed(&stroked, &post, out);
+            }
+        } else {
+            append_skia_path_transformed(src, &post, out);
+        }
+    };
 
-    if style.width.is_finite() && style.width > 0.0 {
-        let mut glyph_stroke = CpuRenderer::skia_stroke(style, norm_f32, 0.0);
-        glyph_stroke.dash = None;
-        let dashed;
-        let source = if let Some(ref dash) = safe_dash {
-            let Some(d) = norm_path.dash(dash, res_scale) else {
-                return zpdf_display_list::TransformedStroke::Empty;
-            };
-            dashed = d;
-            &dashed
-        } else {
-            &norm_path
-        };
-        let Some(stroked) = source.stroke(&glyph_stroke, res_scale) else {
-            return zpdf_display_list::TransformedStroke::Empty;
-        };
-        zpdf_display_list::TransformedStroke::Filled(skia_path_to_dl_transformed(
-            &stroked,
-            &post_matrix,
-        ))
+    // Visible local-space window combining active local clip (e.g. mask Form
+    // /BBox) and inverse-mapped page rect, padded for stroke half-width & joins.
+    let reach = match style.join {
+        LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0) as f64,
+        _ => std::f64::consts::SQRT_2,
+    };
+    let width_local = if is_positive_width {
+        style.width as f64
     } else {
-        // 0-width PDF hairline: always 1 device pixel wide, while dashes still
-        // follow glyph-space directional lengths under `matrix`.
-        let hairline_style = StrokeStyle {
-            width: 0.0,
-            cap: style.cap,
-            join: style.join,
-            miter_limit: style.miter_limit,
-            dash: None,
-        };
-        if let Some(ref dash) = safe_dash {
-            let Some(dashed) = norm_path.dash(dash, res_scale) else {
-                return zpdf_display_list::TransformedStroke::Empty;
-            };
-            zpdf_display_list::TransformedStroke::Stroked(
-                skia_path_to_dl_transformed(&dashed, &post_matrix),
-                hairline_style,
-            )
-        } else {
-            zpdf_display_list::TransformedStroke::Stroked(
-                path.map_points(|p| p.transform(matrix)),
-                hairline_style,
-            )
+        1.0 / max_scale.max(1e-9)
+    };
+    let pad_local = width_local * 0.5 * reach.max(std::f64::consts::SQRT_2) + 2.0 / max_scale;
+    let vis_local: Option<Rect> = {
+        let page_local = page_rect.and_then(|pr| {
+            let inv = matrix.inverse()?;
+            let pr = pr.normalize();
+            let page_pad =
+                width_local * max_scale * 0.5 * reach.max(std::f64::consts::SQRT_2) + 2.0;
+            let padded = Rect::new(
+                pr.x0 - page_pad,
+                pr.y0 - page_pad,
+                pr.x1 + page_pad,
+                pr.y1 + page_pad,
+            );
+            let corners = [
+                Point::new(padded.x0, padded.y0).transform(&inv),
+                Point::new(padded.x1, padded.y0).transform(&inv),
+                Point::new(padded.x0, padded.y1).transform(&inv),
+                Point::new(padded.x1, padded.y1).transform(&inv),
+            ];
+            let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+            let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for c in corners {
+                if !c.x.is_finite() || !c.y.is_finite() {
+                    return None;
+                }
+                x0 = x0.min(c.x);
+                y0 = y0.min(c.y);
+                x1 = x1.max(c.x);
+                y1 = y1.max(c.y);
+            }
+            Some(Rect::new(x0, y0, x1, y1))
+        });
+        let clip_local = local_clip.map(|c| {
+            let c = c.normalize();
+            if c.x1 <= c.x0 || c.y1 <= c.y0 {
+                Rect::new(0.0, 0.0, 0.0, 0.0)
+            } else {
+                Rect::new(
+                    c.x0 - pad_local,
+                    c.y0 - pad_local,
+                    c.x1 + pad_local,
+                    c.y1 + pad_local,
+                )
+            }
+        });
+        match (clip_local, page_local) {
+            (Some(a), Some(b)) => {
+                if a.x1 <= a.x0 || a.y1 <= a.y0 {
+                    return zpdf_display_list::TransformedStroke::Empty;
+                }
+                let x0 = a.x0.max(b.x0);
+                let y0 = a.y0.max(b.y0);
+                let x1 = a.x1.min(b.x1);
+                let y1 = a.y1.min(b.y1);
+                if x1 <= x0 || y1 <= y0 {
+                    return zpdf_display_list::TransformedStroke::Empty;
+                }
+                Some(Rect::new(x0, y0, x1, y1))
+            }
+            (Some(a), None) => {
+                if a.x1 <= a.x0 || a.y1 <= a.y0 {
+                    return zpdf_display_list::TransformedStroke::Empty;
+                }
+                Some(a)
+            }
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
         }
+    };
+
+    let mut out = Path::new();
+    let mut cumulative_dashes = 0.0f64;
+
+    for sp in &subpaths {
+        let mut pb = tiny_skia::PathBuilder::new();
+        pb.move_to(0.0, 0.0);
+        let mut cur = sp.start;
+        let mut upper_len = 0.0f64;
+        let mut exceeded_norm = false;
+        for &seg in &sp.segments {
+            match seg {
+                UserSeg::Line(p) => {
+                    let Some((nx, ny)) = to_norm(p, sp.start) else {
+                        exceeded_norm = true;
+                        break;
+                    };
+                    upper_len += (p.x - cur.x).hypot(p.y - cur.y);
+                    pb.line_to(nx, ny);
+                    cur = p;
+                }
+                UserSeg::Cubic(c1, c2, end) => {
+                    let (Some((x1, y1)), Some((x2, y2)), Some((xe, ye))) = (
+                        to_norm(c1, sp.start),
+                        to_norm(c2, sp.start),
+                        to_norm(end, sp.start),
+                    ) else {
+                        exceeded_norm = true;
+                        break;
+                    };
+                    upper_len += (c1.x - cur.x).hypot(c1.y - cur.y)
+                        + (c2.x - c1.x).hypot(c2.y - c1.y)
+                        + (end.x - c2.x).hypot(end.y - c2.y);
+                    pb.cubic_to(x1, y1, x2, y2, xe, ye);
+                    cur = end;
+                }
+            }
+        }
+        if !exceeded_norm && sp.closed {
+            upper_len += (sp.start.x - cur.x).hypot(sp.start.y - cur.y);
+            pb.close();
+        }
+        let sp_dashes = dash_spec
+            .as_ref()
+            .map(|&(_, _, pu, _)| upper_len / pu)
+            .unwrap_or(0.0);
+        let fits_fast = !exceeded_norm
+            && upper_len.is_finite()
+            && (dash_spec.is_none()
+                || (sp_dashes.is_finite() && cumulative_dashes + sp_dashes <= MAX_DASH_REPEATS));
+        let try_clip = !fits_fast || (dash_spec.is_some() && sp_dashes > 1024.0);
+
+        let vis_for_sp = if try_clip {
+            match vis_local {
+                Some(r) => Some(r),
+                None if fits_fast => None,
+                None => return fallback_stroked(avg_scale),
+            }
+        } else {
+            None
+        };
+
+        let Some(vis_rect) = vis_for_sp else {
+            cumulative_dashes += sp_dashes;
+            let Some(norm_path) = pb.finish() else {
+                continue;
+            };
+            if let Some((_, _, _, phase_user)) = dash_spec {
+                let Some(skia_dash) = make_skia_dash(phase_user) else {
+                    return fallback_stroked(avg_scale);
+                };
+                let Some(dashed) = norm_path.dash(&skia_dash, res_scale) else {
+                    continue;
+                };
+                emit_norm_path(&dashed, sp.start, &mut out);
+            } else {
+                emit_norm_path(&norm_path, sp.start, &mut out);
+            }
+            continue;
+        };
+
+        // Whole-subpath convex-hull culling.
+        let (mut bx0, mut by0, mut bx1, mut by1) = (sp.start.x, sp.start.y, sp.start.x, sp.start.y);
+        for &seg in &sp.segments {
+            match seg {
+                UserSeg::Line(p) => {
+                    bx0 = bx0.min(p.x);
+                    by0 = by0.min(p.y);
+                    bx1 = bx1.max(p.x);
+                    by1 = by1.max(p.y);
+                }
+                UserSeg::Cubic(c1, c2, end) => {
+                    for p in [c1, c2, end] {
+                        bx0 = bx0.min(p.x);
+                        by0 = by0.min(p.y);
+                        bx1 = bx1.max(p.x);
+                        by1 = by1.max(p.y);
+                    }
+                }
+            }
+        }
+        if bx1 < vis_rect.x0 || bx0 > vis_rect.x1 || by1 < vis_rect.y0 || by0 > vis_rect.y1 {
+            continue;
+        }
+
+        let period_user = dash_spec.as_ref().map(|&(_, _, pu, _)| pu);
+        let initial_phase = dash_spec.as_ref().map(|&(_, _, _, ph)| ph).unwrap_or(0.0);
+        let phase_tol = period_user.map_or(1.0, |p| (p * 1e-4).max(1e-9));
+
+        struct ClipCtx<'a> {
+            vis: Rect,
+            period_user: Option<f64>,
+            phase_tol: f64,
+            max_dash_repeats: f64,
+            phase: f64,
+            cumulative_dashes: &'a mut f64,
+            any_clipped: bool,
+            at_subpath_start: bool,
+            active_run: Option<ClippedRun>,
+            visible_runs: Vec<ClippedRun>,
+        }
+        impl<'a> ClipCtx<'a> {
+            fn push_line(&mut self, a: Point, b: Point) -> Result<(), ()> {
+                let seg_len = (b.x - a.x).hypot(b.y - a.y);
+                if !seg_len.is_finite() {
+                    return Err(());
+                }
+                if let Some((t0, t1)) = clip_segment_to_rect(a, b, self.vis) {
+                    if t0 > 0.0 || t1 < 1.0 {
+                        self.any_clipped = true;
+                    }
+                    let p0 = Point::new(a.x + t0 * (b.x - a.x), a.y + t0 * (b.y - a.y));
+                    let p1 = Point::new(a.x + t1 * (b.x - a.x), a.y + t1 * (b.y - a.y));
+                    if let Some(pu) = self.period_user {
+                        *self.cumulative_dashes += ((t1 - t0) * seg_len) / pu;
+                        if !self.cumulative_dashes.is_finite()
+                            || *self.cumulative_dashes > self.max_dash_repeats
+                        {
+                            return Err(());
+                        }
+                    }
+                    if t0 > 0.0 || self.active_run.is_none() {
+                        if let Some(prev) = self.active_run.take() {
+                            self.visible_runs.push(prev);
+                        }
+                        let start_phase = match self.period_user {
+                            Some(pu) => (self.phase + t0 * seg_len).rem_euclid(pu),
+                            None => 0.0,
+                        };
+                        self.active_run = Some(ClippedRun {
+                            start: p0,
+                            segments: vec![UserSeg::Line(p1)],
+                            start_phase_user: start_phase,
+                            starts_at_subpath_start: self.at_subpath_start && t0 == 0.0,
+                            ends_at_subpath_start: false,
+                            closed: false,
+                        });
+                    } else if let Some(ref mut run) = self.active_run {
+                        run.segments.push(UserSeg::Line(p1));
+                    }
+                    if t1 < 1.0 {
+                        if let Some(prev) = self.active_run.take() {
+                            self.visible_runs.push(prev);
+                        }
+                    }
+                } else {
+                    self.any_clipped = true;
+                    if let Some(prev) = self.active_run.take() {
+                        self.visible_runs.push(prev);
+                    }
+                }
+                self.at_subpath_start = false;
+                if let Some(pu) = self.period_user {
+                    self.phase = (self.phase + seg_len).rem_euclid(pu);
+                }
+                Ok(())
+            }
+
+            fn push_cubic(
+                &mut self,
+                p0: Point,
+                c1: Point,
+                c2: Point,
+                p3: Point,
+                depth: u8,
+                nodes_left: &mut usize,
+            ) -> Result<(), ()> {
+                let min_x = p0.x.min(c1.x).min(c2.x).min(p3.x);
+                let max_x = p0.x.max(c1.x).max(c2.x).max(p3.x);
+                let min_y = p0.y.min(c1.y).min(c2.y).min(p3.y);
+                let max_y = p0.y.max(c1.y).max(c2.y).max(p3.y);
+                if max_x < self.vis.x0
+                    || min_x > self.vis.x1
+                    || max_y < self.vis.y0
+                    || min_y > self.vis.y1
+                {
+                    self.any_clipped = true;
+                    if let Some(prev) = self.active_run.take() {
+                        self.visible_runs.push(prev);
+                    }
+                    self.at_subpath_start = false;
+                    if let Some(pu) = self.period_user {
+                        let len = cubic_arc_length(p0, c1, c2, p3, self.phase_tol).ok_or(())?;
+                        self.phase = (self.phase + len).rem_euclid(pu);
+                    }
+                    return Ok(());
+                }
+                if min_x >= self.vis.x0
+                    && max_x <= self.vis.x1
+                    && min_y >= self.vis.y0
+                    && max_y <= self.vis.y1
+                {
+                    let len = if let Some(pu) = self.period_user {
+                        let l = cubic_arc_length(p0, c1, c2, p3, self.phase_tol).ok_or(())?;
+                        *self.cumulative_dashes += l / pu;
+                        if !self.cumulative_dashes.is_finite()
+                            || *self.cumulative_dashes > self.max_dash_repeats
+                        {
+                            return Err(());
+                        }
+                        Some((l, pu))
+                    } else {
+                        None
+                    };
+                    if let Some(ref mut run) = self.active_run {
+                        run.segments.push(UserSeg::Cubic(c1, c2, p3));
+                    } else {
+                        self.active_run = Some(ClippedRun {
+                            start: p0,
+                            segments: vec![UserSeg::Cubic(c1, c2, p3)],
+                            start_phase_user: self.phase,
+                            starts_at_subpath_start: self.at_subpath_start,
+                            ends_at_subpath_start: false,
+                            closed: false,
+                        });
+                    }
+                    self.at_subpath_start = false;
+                    if let Some((l, pu)) = len {
+                        self.phase = (self.phase + l).rem_euclid(pu);
+                    }
+                    return Ok(());
+                }
+                if depth < 20 && *nodes_left > 0 {
+                    *nodes_left -= 1;
+                    let (l, r) = split_cubic_half(p0, c1, c2, p3);
+                    self.push_cubic(l[0], l[1], l[2], l[3], depth + 1, nodes_left)?;
+                    self.push_cubic(r[0], r[1], r[2], r[3], depth + 1, nodes_left)
+                } else {
+                    self.push_line(p0, p3)
+                }
+            }
+        }
+
+        let mut ctx = ClipCtx {
+            vis: vis_rect,
+            period_user,
+            phase_tol,
+            max_dash_repeats: MAX_DASH_REPEATS,
+            phase: initial_phase,
+            cumulative_dashes: &mut cumulative_dashes,
+            any_clipped: false,
+            at_subpath_start: true,
+            active_run: None,
+            visible_runs: Vec::new(),
+        };
+        let mut cur_pt = sp.start;
+        for &seg in &sp.segments {
+            match seg {
+                UserSeg::Line(p) => {
+                    if ctx.push_line(cur_pt, p).is_err() {
+                        return fallback_stroked(avg_scale);
+                    }
+                    cur_pt = p;
+                }
+                UserSeg::Cubic(c1, c2, end) => {
+                    let mut nodes_left = 2048usize;
+                    if ctx
+                        .push_cubic(cur_pt, c1, c2, end, 0, &mut nodes_left)
+                        .is_err()
+                    {
+                        return fallback_stroked(avg_scale);
+                    }
+                    cur_pt = end;
+                }
+            }
+        }
+        if sp.closed {
+            let needs_closing = cur_pt.x != sp.start.x || cur_pt.y != sp.start.y;
+            if needs_closing && ctx.push_line(cur_pt, sp.start).is_err() {
+                return fallback_stroked(avg_scale);
+            }
+            if let Some(ref mut run) = ctx.active_run {
+                if !ctx.any_clipped && run.starts_at_subpath_start {
+                    run.closed = true;
+                } else {
+                    run.ends_at_subpath_start = true;
+                }
+            }
+        }
+        if let Some(last) = ctx.active_run.take() {
+            ctx.visible_runs.push(last);
+        }
+
+        // If a partially clipped closed contour ends at `sp.start` AND its first
+        // run starts at `sp.start`, merge the tail run into the head run when
+        // undashed or join the dashed contours around the corner so the closing
+        // join stays intact.
+        let mut runs = ctx.visible_runs;
+        if sp.closed && runs.len() >= 2 && runs[0].starts_at_subpath_start {
+            if let Some(tail) = runs.pop_if(|last| last.ends_at_subpath_start) {
+                if dash_spec.is_none() {
+                    let head = runs.remove(0);
+                    let mut merged = tail.segments;
+                    merged.extend(head.segments);
+                    runs.insert(
+                        0,
+                        ClippedRun {
+                            start: tail.start,
+                            segments: merged,
+                            start_phase_user: tail.start_phase_user,
+                            starts_at_subpath_start: false,
+                            ends_at_subpath_start: false,
+                            closed: false,
+                        },
+                    );
+                } else {
+                    let head = runs.remove(0);
+                    let Ok(Some(tail_sk)) =
+                        build_skia_path(sp.start, tail.start, &tail.segments, false)
+                    else {
+                        return fallback_stroked(avg_scale);
+                    };
+                    let Ok(Some(head_sk)) =
+                        build_skia_path(sp.start, head.start, &head.segments, false)
+                    else {
+                        return fallback_stroked(avg_scale);
+                    };
+                    let (Some(d_tail), Some(d_head)) = (
+                        make_skia_dash(tail.start_phase_user),
+                        make_skia_dash(head.start_phase_user),
+                    ) else {
+                        return fallback_stroked(avg_scale);
+                    };
+                    let dashed_tail = tail_sk.dash(&d_tail, res_scale);
+                    let dashed_head = head_sk.dash(&d_head, res_scale);
+                    match (dashed_head, dashed_tail) {
+                        (Some(dh), Some(dt)) => {
+                            let mut combined = tiny_skia::PathBuilder::new();
+                            for src in [&dh, &dt] {
+                                for s in src.segments() {
+                                    match s {
+                                        tiny_skia::PathSegment::MoveTo(p) => {
+                                            combined.move_to(p.x, p.y)
+                                        }
+                                        tiny_skia::PathSegment::LineTo(p) => {
+                                            combined.line_to(p.x, p.y)
+                                        }
+                                        tiny_skia::PathSegment::QuadTo(p1, p2) => {
+                                            combined.quad_to(p1.x, p1.y, p2.x, p2.y)
+                                        }
+                                        tiny_skia::PathSegment::CubicTo(p1, p2, p3) => {
+                                            combined.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y)
+                                        }
+                                        tiny_skia::PathSegment::Close => combined.close(),
+                                    }
+                                }
+                            }
+                            if let Some(merged_sk) = combined.finish() {
+                                let joined = join_dashed_closing_contours_skia(&merged_sk);
+                                emit_norm_path(
+                                    joined.as_ref().unwrap_or(&merged_sk),
+                                    sp.start,
+                                    &mut out,
+                                );
+                            }
+                        }
+                        (Some(dh), None) => emit_norm_path(&dh, sp.start, &mut out),
+                        (None, Some(dt)) => emit_norm_path(&dt, sp.start, &mut out),
+                        (None, None) => {}
+                    }
+                }
+            }
+        }
+
+        for run in &runs {
+            let Ok(maybe_sk) = build_skia_path(run.start, run.start, &run.segments, run.closed)
+            else {
+                return fallback_stroked(avg_scale);
+            };
+            let Some(sk) = maybe_sk else {
+                continue;
+            };
+            if dash_spec.is_some() {
+                let Some(skia_dash) = make_skia_dash(run.start_phase_user) else {
+                    return fallback_stroked(avg_scale);
+                };
+                let Some(dashed) = sk.dash(&skia_dash, res_scale) else {
+                    continue;
+                };
+                let joined = if run.closed {
+                    join_dashed_closing_contours_skia(&dashed)
+                } else {
+                    None
+                };
+                emit_norm_path(joined.as_ref().unwrap_or(&dashed), run.start, &mut out);
+            } else {
+                emit_norm_path(&sk, run.start, &mut out);
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return zpdf_display_list::TransformedStroke::Empty;
+    }
+    if is_positive_width {
+        zpdf_display_list::TransformedStroke::Filled(out)
+    } else {
+        zpdf_display_list::TransformedStroke::Stroked(
+            out,
+            StrokeStyle {
+                width: 0.0,
+                cap: style.cap,
+                join: style.join,
+                miter_limit: style.miter_limit,
+                dash: None,
+            },
+        )
     }
 }
 
-/// Convert a `tiny_skia::Path` (e.g. a pattern-space stroked outline) into a
-/// [`Path`] transformed by `ctm` into page space.
-fn skia_path_to_dl_transformed(src: &tiny_skia::Path, ctm: &zpdf_core::Matrix) -> Path {
-    let mut out = Path::new();
+fn append_skia_path_transformed(src: &tiny_skia::Path, ctm: &zpdf_core::Matrix, out: &mut Path) {
     let mut cur = zpdf_core::Point::new(0.0, 0.0);
     for seg in src.segments() {
         match seg {
@@ -7675,6 +8593,13 @@ fn skia_path_to_dl_transformed(src: &tiny_skia::Path, ctm: &zpdf_core::Matrix) -
             tiny_skia::PathSegment::Close => out.close(),
         }
     }
+}
+
+/// Convert a `tiny_skia::Path` (e.g. a pattern-space stroked outline) into a
+/// [`Path`] transformed by `ctm` into page space.
+fn skia_path_to_dl_transformed(src: &tiny_skia::Path, ctm: &zpdf_core::Matrix) -> Path {
+    let mut out = Path::new();
+    append_skia_path_transformed(src, ctm, &mut out);
     out
 }
 
@@ -8153,8 +9078,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.mask_pool.clear();
         self.over_budget = false;
         self.soft_mask_depth = 0;
-        self.soft_mask_planes.clear();
-        self.soft_mask_cache_bytes = 0;
+        self.clear_soft_mask_cache();
         self.tiling_depth = 0;
         self.tiling_cache.clear();
         self.tiling_cache_bytes = 0;
@@ -8347,8 +9271,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.clip_bounds = None;
         self.clip_mask_bytes = 0;
         self.mask_pool.clear();
-        self.soft_mask_planes.clear();
-        self.soft_mask_cache_bytes = 0;
+        self.clear_soft_mask_cache();
         self.tiling_cache.clear();
         self.tiling_cache_bytes = 0;
         self.tiling_backdrop_cache.clear();
@@ -12096,7 +13019,9 @@ mod tests {
         let mapped = src_mask.transform_with_images(
             &zpdf_core::Matrix::scale(0.5, 1.0),
             &|_| None,
-            &|p, s, m| transform_stroke_to_page(p, s, m, 1.0),
+            &|p, s, m, c| {
+                transform_stroke_to_page(p, s, m, c, Some(Rect::new(0.0, 0.0, 60.0, 80.0)), 1.0)
+            },
         );
         let mut clip_dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 80.0));
         clip_dl.push(RenderCommand::PushBlendGroup {
@@ -12131,5 +13056,338 @@ mod tests {
         assert!(cpx(24, 60)[0] > 240 && cpx(24, 60)[1] > 240);
         assert!(cpx(10, 45)[0] > 240 && cpx(10, 45)[1] < 15);
         assert!(cpx(10, 47)[0] > 240 && cpx(10, 47)[1] > 240);
+    }
+
+    #[test]
+    fn collect_type3_mask_inline_images_deduplicates_shared_nested_mask_dag() {
+        let mut images = ImageCache::new();
+        let img_id = images.insert(zpdf_image::DecodedImage {
+            width: 2,
+            height: 2,
+            data: vec![255; 16],
+            has_alpha: true,
+            is_image_mask: false,
+            premultiplied: true,
+        });
+        let mut leaf = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        leaf.push(RenderCommand::DrawImage(ImageDraw {
+            image_id: img_id,
+            transform: zpdf_core::Matrix::identity(),
+            alpha: 1.0,
+            is_image_mask: false,
+        }));
+        let mut level = Arc::new(leaf);
+        for _ in 0..6 {
+            let mut parent = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+            for _ in 0..2 {
+                parent.push(RenderCommand::PushBlendGroup {
+                    blend_mode: BlendMode::Normal,
+                    isolated: true,
+                    knockout: false,
+                    bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                    alpha: 1.0,
+                    mask: Some(SoftMask {
+                        kind: SoftMaskKind::Luminosity,
+                        commands: Arc::clone(&level),
+                        offset: (0.0, 0.0),
+                        backdrop_luma: 0.0,
+                        transfer: None,
+                    }),
+                });
+                parent.push(RenderCommand::PopBlendGroup);
+            }
+            level = Arc::new(parent);
+        }
+        let collected = collect_type3_mask_inline_images(&level, &images);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[&img_id].data.len(), 16);
+    }
+
+    #[test]
+    fn cpu_uncached_type3_mask_images_stay_within_soft_mask_cache_budget() {
+        use zpdf_font::{
+            LoadedFont, PdfFontType, Type3FormXObject, Type3ImageXObject, Type3Resources,
+            Type3SoftMask, Type3XObject,
+        };
+
+        // 32x32 grayscale bitmap mask: left half white (255), right half black (0).
+        // Decoded RGBA size is 32*32*4 = 4096 bytes per uncached glyph interpretation.
+        let mut gray = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..16 {
+                gray[y * 32 + x] = 255;
+            }
+        }
+        let mut img_dict = zpdf_core::PdfDict::new();
+        img_dict.insert(
+            zpdf_core::PdfName::new("Width"),
+            zpdf_core::PdfObject::Integer(32),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("Height"),
+            zpdf_core::PdfObject::Integer(32),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("BitsPerComponent"),
+            zpdf_core::PdfObject::Integer(8),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceGray")),
+        );
+        let mask_img = Arc::new(Type3ImageXObject {
+            dict: img_dict,
+            data: Arc::from(gray),
+            smask: None,
+            mask_stream: None,
+        });
+        let mut form_res = Type3Resources::default();
+        form_res
+            .xobjects
+            .insert("MImg".into(), Type3XObject::Image(mask_img));
+        let mut form_dict = zpdf_core::PdfDict::new();
+        form_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(20.0),
+                zpdf_core::PdfObject::Real(20.0),
+            ]),
+        );
+        let group = Arc::new(Type3FormXObject {
+            dict: form_dict,
+            data: Arc::from(&b"q 20 0 0 20 0 0 cm /MImg Do Q"[..]),
+            resources: Some(Arc::new(form_res)),
+        });
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_state_smasks.insert(
+            "GSImg".into(),
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group,
+                backdrop_luma: 0.0,
+                transfer: None,
+            },
+        );
+        let charproc = b"20 0 d0 /GSImg gs 1 0 0 rg 0 0 20 20 re f";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![20.0],
+                first_char: 0,
+            },
+            "UncachedMaskImgCpu".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(20.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let glyphs: Vec<PositionedGlyph> = (0..10)
+            .map(|i| PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: (i * 20) as f32,
+                y: 0.0,
+                advance: 20.0,
+            })
+            .collect();
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 20.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        // Budget smaller than 3 uncached placements' combined planes + 4096-byte
+        // InlineImage payloads (10 placements would retain >80 KB if unaccounted).
+        let budget = 20_000u64;
+        let mut renderer = CpuRenderer::new().with_fonts(&fonts);
+        renderer.max_soft_mask_cache_bytes = budget;
+
+        let info = PageRenderInfo {
+            page_rect: dl.page_rect,
+            scale: 1.0,
+            background: Color::white(),
+        };
+        renderer.begin_page(&info).expect("begin_page");
+        // Simulate full glyph cache after `begin_page` resets page-scoped caches
+        // so every placement re-interprets the glyph.
+        renderer.type3_glyph_commands = MAX_CACHED_TYPE3_COMMANDS;
+        for cmd in &dl.commands {
+            renderer.execute(cmd).expect("execute");
+        }
+        assert!(
+            renderer.type3_glyphs.is_empty(),
+            "glyph cache admission must remain denied"
+        );
+        assert!(
+            renderer.soft_mask_cache_bytes <= budget,
+            "accounted soft-mask cache bytes {} exceeded budget {budget}",
+            renderer.soft_mask_cache_bytes
+        );
+        // Independently sum actual coverage-plane bytes + distinct retained
+        // InlineImage pixel buffers reachable from `soft_mask_planes`.
+        let mut seen_inlines = std::collections::HashSet::new();
+        let mut actual_retained: u64 = 0;
+        for (dl_arc, _, plane) in renderer.soft_mask_planes.values() {
+            actual_retained += plane.len() as u64;
+            for cmd in &dl_arc.commands {
+                if let RenderCommand::DrawInlineImage(d) = cmd {
+                    if seen_inlines.insert(Arc::as_ptr(&d.image) as usize) {
+                        actual_retained += d.image.data.len() as u64;
+                    }
+                }
+            }
+        }
+        assert!(
+            actual_retained <= budget,
+            "actual retained mask plane + inline-image bytes {actual_retained} exceeded budget {budget}"
+        );
+
+        let page = renderer.end_page().expect("end_page");
+        let px = |x: u32, y: u32| -> [u8; 3] {
+            let idx = ((y * page.width + x) * 4) as usize;
+            [page.data[idx], page.data[idx + 1], page.data[idx + 2]]
+        };
+        for i in 0..10u32 {
+            let left = px(i * 20 + 4, 10);
+            let right = px(i * 20 + 16, 10);
+            assert!(
+                left[0] > 240 && left[1] < 15 && left[2] < 15,
+                "placement {i} left half must be red, got {left:?}"
+            );
+            assert!(
+                right[0] > 240 && right[1] > 240 && right[2] > 240,
+                "placement {i} right half must be white, got {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_type3_soft_mask_long_clipped_dashed_stroke_preserves_dash_gaps() {
+        use zpdf_font::{LoadedFont, PdfFontType, Type3FormXObject, Type3Resources, Type3SoftMask};
+
+        // 4,000,000-unit dashed line with period 32 -> 125,000 dash repeats,
+        // exceeding the naive full-path MAX_DASH_REPEATS (100,000) guard,
+        // clipped to a small [0 0 80 20] mask Form BBox.
+        // Under h_scale=0.5:
+        //   glyph 'A' (-2,000,000..2,000,000): dashes at glyph [0..16], [32..48], [64..80]
+        //     -> page x=[0..8], [16..24], [32..40]; gaps at page x=[8..16], [24..32].
+        //   glyph 'B' (-2,000,016..2,000,000): shifted by half period (16) -> swapped!
+        let make_mask = |start_x: i64| -> Type3SoftMask {
+            let stream = format!("1 G 10 w [16 16] 0 d {start_x} 10 m 2000000 10 l S");
+            let mut form_dict = zpdf_core::PdfDict::new();
+            form_dict.insert(
+                zpdf_core::PdfName::new("BBox"),
+                zpdf_core::PdfObject::Array(vec![
+                    zpdf_core::PdfObject::Real(0.0),
+                    zpdf_core::PdfObject::Real(0.0),
+                    zpdf_core::PdfObject::Real(80.0),
+                    zpdf_core::PdfObject::Real(20.0),
+                ]),
+            );
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group: Arc::new(Type3FormXObject {
+                    dict: form_dict,
+                    data: Arc::from(stream.into_bytes()),
+                    resources: None,
+                }),
+                backdrop_luma: 0.0,
+                transfer: None,
+            }
+        };
+        let mut t3_res = Type3Resources::default();
+        t3_res
+            .ext_g_state_smasks
+            .insert("GSDashA".into(), make_mask(-2_000_000));
+        t3_res
+            .ext_g_state_smasks
+            .insert("GSDashB".into(), make_mask(-2_000_016));
+        let charproc_a = b"80 0 d0 /GSDashA gs 1 0 0 rg 0 0 80 20 re f";
+        let charproc_b = b"80 0 d0 /GSDashB gs 1 0 0 rg 0 0 80 20 re f";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), Arc::<[u8]>::from(&charproc_a[..])),
+                    ("B".into(), Arc::<[u8]>::from(&charproc_b[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![80.0, 80.0],
+                first_char: 0,
+            },
+            "LongClippedDashMaskCpu".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(80.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let render_glyph = |glyph_id: u16| {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 20.0));
+            dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+                font_id,
+                font_size: 1.0,
+                glyphs: vec![PositionedGlyph {
+                    glyph_id,
+                    code_len: 1,
+                    code: b'A' as u32 + glyph_id as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 80.0,
+                }],
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::identity(),
+                h_scale: 0.5,
+            }));
+            CpuRenderer::new()
+                .with_fonts(&fonts)
+                .render_display_list(&dl, 1.0)
+                .expect("render")
+        };
+
+        let page_a = render_glyph(0);
+        let page_b = render_glyph(1);
+        let is_red = |page: &crate::RenderedPage, x: u32| {
+            let idx = ((10 * page.width + x) * 4) as usize;
+            page.data[idx] > 240 && page.data[idx + 1] < 15 && page.data[idx + 2] < 15
+        };
+        let is_white = |page: &crate::RenderedPage, x: u32| {
+            let idx = ((10 * page.width + x) * 4) as usize;
+            page.data[idx] > 240 && page.data[idx + 1] > 240 && page.data[idx + 2] > 240
+        };
+
+        for x in [4u32, 20, 36] {
+            assert!(is_red(&page_a, x), "glyph A x={x} must be red dash");
+            assert!(
+                is_white(&page_b, x),
+                "glyph B (shifted half period) x={x} must be white gap"
+            );
+        }
+        for x in [12u32, 28] {
+            assert!(
+                is_white(&page_a, x),
+                "glyph A x={x} must be white dash gap (not solid)"
+            );
+            assert!(
+                is_red(&page_b, x),
+                "glyph B (shifted half period) x={x} must be red dash"
+            );
+        }
     }
 }

@@ -4653,3 +4653,148 @@ fn gpu_type3_image_mask_remaps_private_image_id_without_page_collision() {
         Err(e) => panic!("GPU Type 3 mask image ID test failed: {e}"),
     }
 }
+
+#[test]
+fn type3_luminosity_mask_named_shading_matches_live_on_cpu_and_gpu() {
+    use zpdf::display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
+    use zpdf_core::{Matrix, Rect};
+
+    // Full PDF with a Type 3 font whose CharProc applies a luminosity soft mask
+    // (`/GSFade gs`) whose `/G` transparency group paints an axial grayscale
+    // gradient via `/Fade sh` (`0` at x=0 -> `1` at x=80) over a red rectangle.
+    let page_content = b"BT /F1 1 Tf (A) Tj ET";
+    let charproc = b"80 0 d0 /GSFade gs 1 0 0 rg 0 0 80 20 re f";
+    let mask_group_stream = b"/Fade sh";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 20] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", page_content),                  // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 80 20] \
+          /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A] >> \
+          /FirstChar 65 /LastChar 65 /Widths [80] \
+          /Resources << /ExtGState << /GSFade 7 0 R >> >> >>"
+            .to_vec(), // 5
+        stream_obj("", charproc),                      // 6
+        b"<< /Type /ExtGState /SMask << /S /Luminosity /G 8 0 R >> >>".to_vec(), // 7
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 80 20] \
+             /Group << /Type /Group /S /Transparency /CS /DeviceGray >> \
+             /Resources << /Shading << /Fade 9 0 R >> >>",
+            mask_group_stream,
+        ), // 8
+        b"<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 80 0] \
+          /Function 10 0 R /Extend [true true] >>"
+            .to_vec(), // 9
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>".to_vec(), // 10
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut live_images = ImageCache::new();
+    let live_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut live_images)
+        .interpret(&content);
+    assert!(
+        !live_dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, RenderCommand::DrawGlyphRun(_))),
+        "live document interpretation should inline Type 3 glyph rather than emit DrawGlyphRun"
+    );
+    let live_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&live_images)
+        .render_display_list(&live_dl, 1.0)
+        .expect("live CPU render");
+
+    // Standalone `DrawGlyphRun` replay using ONLY the loaded `FontCache` (no
+    // live `PdfFile` and no page `ImageCache`).
+    let (font_id, _) = fonts.get_by_name("F1").expect("loaded F1 font id");
+    let mut standalone_dl = DisplayList::new(Rect::new(0.0, 0.0, 80.0, 20.0));
+    standalone_dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 80.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    let standalone_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&standalone_dl, 1.0)
+        .expect("standalone CPU render");
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let assert_fade = |label: &str, data: &[u8], w: u32| {
+        let left = px(data, w, 2, 10);
+        let mid = px(data, w, 40, 10);
+        let right = px(data, w, 78, 10);
+        assert!(
+            left[0] > 240 && left[1] > 235 && left[2] > 235,
+            "{label}: left edge must fade to white, got {left:?}"
+        );
+        assert!(
+            mid[0] > 240 && mid[1].abs_diff(128) <= 8 && mid[2].abs_diff(128) <= 8,
+            "{label}: midpoint must be ~half-red, got {mid:?}"
+        );
+        assert!(
+            right[0] > 240 && right[1] < 20 && right[2] < 20,
+            "{label}: right edge must be solid red, got {right:?}"
+        );
+    };
+    assert_fade("live CPU", &live_cpu.data, live_cpu.width);
+    assert_fade("standalone CPU", &standalone_cpu.data, standalone_cpu.width);
+
+    let cpu_max_diff = live_cpu
+        .data
+        .iter()
+        .zip(standalone_cpu.data.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        cpu_max_diff <= 3,
+        "standalone CPU Type 3 shading mask must match live CPU within 3 LSB, max_diff={cpu_max_diff}"
+    );
+
+    match render_gpu_shared(&standalone_dl, Some(&fonts), None, 1.0) {
+        Ok(standalone_gpu) => {
+            assert_fade("standalone GPU", &standalone_gpu.data, standalone_gpu.width);
+            let gpu_max_diff = live_cpu
+                .data
+                .iter()
+                .zip(standalone_gpu.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                gpu_max_diff <= 3,
+                "standalone GPU Type 3 shading mask must match live CPU within 3 LSB, max_diff={gpu_max_diff}"
+            );
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU Type 3 shading mask test (no adapter)");
+        }
+        Err(e) => panic!("GPU Type 3 shading mask test failed: {e}"),
+    }
+}

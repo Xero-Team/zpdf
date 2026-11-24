@@ -1639,6 +1639,51 @@ impl<'a> ContentInterpreter<'a> {
             .and_then(|res| res.color_spaces.get(name).cloned())
     }
 
+    fn lookup_type3_shading(&self, name: &str) -> Option<std::sync::Arc<zpdf_font::Type3Shading>> {
+        for res in self.type3_resource_stack.iter().rev() {
+            if let Some(sh) = res.shadings.get(name) {
+                return Some(std::sync::Arc::clone(sh));
+            }
+        }
+        self.type3_resources
+            .and_then(|res| res.shadings.get(name).cloned())
+    }
+
+    fn parse_type3_function(func: &zpdf_font::Type3Function) -> Option<zpdf_color::PdfFunction> {
+        fn flatten(
+            f: &zpdf_font::Type3Function,
+            table: &mut Vec<(zpdf_core::PdfDict, Option<std::sync::Arc<[u8]>>)>,
+        ) -> (zpdf_core::PdfDict, Option<std::sync::Arc<[u8]>>) {
+            match f {
+                zpdf_font::Type3Function::Stream { dict, data } => {
+                    (dict.clone(), Some(std::sync::Arc::clone(data)))
+                }
+                zpdf_font::Type3Function::Dict { dict, children } => {
+                    let mut out = dict.clone();
+                    if !children.is_empty() {
+                        let mut refs = Vec::with_capacity(children.len());
+                        for child in children {
+                            let entry = flatten(child, table);
+                            let idx = table.len() as u32;
+                            table.push(entry);
+                            refs.push(PdfObject::Ref(ObjectId(idx, 0)));
+                        }
+                        out.insert(zpdf_core::PdfName::new("Functions"), PdfObject::Array(refs));
+                    }
+                    (out, None)
+                }
+            }
+        }
+        let mut table = Vec::new();
+        let (root_dict, root_data) = flatten(func, &mut table);
+        let mut resolve = |id: ObjectId| {
+            table
+                .get(id.0 as usize)
+                .map(|(d, b)| (PdfObject::Dict(d.clone()), b.as_ref().map(|s| s.to_vec())))
+        };
+        zpdf_color::PdfFunction::parse(&root_dict, root_data.as_deref(), &mut resolve)
+    }
+
     fn lookup_type3_ext_gstate(
         &self,
         name: &str,
@@ -3898,6 +3943,96 @@ impl<'a> ContentInterpreter<'a> {
         })
     }
 
+    fn build_type3_shading(
+        &mut self,
+        shading: &zpdf_font::Type3Shading,
+        to_page: Matrix,
+    ) -> Option<crate::shading::ShadingDef> {
+        use crate::shading::{ShadingDef, ShadingKind};
+        let dict = &shading.dict;
+        let shading_type = dict.get_i64("ShadingType").ok()?;
+        let funcs: Vec<zpdf_color::PdfFunction> = shading
+            .functions
+            .iter()
+            .filter_map(Self::parse_type3_function)
+            .collect();
+        if matches!(shading_type, 4..=7) {
+            let data = shading.stream_data.as_deref()?;
+            return self.build_mesh_shading_from_decoded(dict, data, &funcs, shading_type, to_page);
+        }
+        if funcs.is_empty() {
+            return None;
+        }
+        let coords: Vec<f64> = dict
+            .get_array("Coords")
+            .ok()?
+            .iter()
+            .filter_map(|o| o.as_f64().ok())
+            .collect();
+        let kind = match shading_type {
+            2 if coords.len() >= 4 => ShadingKind::Axial {
+                x0: coords[0],
+                y0: coords[1],
+                x1: coords[2],
+                y1: coords[3],
+            },
+            3 if coords.len() >= 6 => ShadingKind::Radial {
+                x0: coords[0],
+                y0: coords[1],
+                r0: coords[2],
+                x1: coords[3],
+                y1: coords[4],
+                r1: coords[5],
+            },
+            other => {
+                tracing::debug!("unsupported Type 3 shading type {other}");
+                return None;
+            }
+        };
+        let cs = dict
+            .get("ColorSpace")
+            .map(|o| self.resolve_color_space_obj(o, 0))
+            .unwrap_or(ActiveColorSpace::DeviceRGB);
+        let domain = dict
+            .get_array("Domain")
+            .ok()
+            .and_then(|a| {
+                let v: Vec<f64> = a.iter().filter_map(|o| o.as_f64().ok()).collect();
+                (v.len() >= 2).then(|| [v[0], v[1]])
+            })
+            .unwrap_or([0.0, 1.0]);
+        let mut lut = Vec::with_capacity(256);
+        for i in 0..256 {
+            let t = domain[0] + (i as f64 / 255.0) * (domain[1] - domain[0]);
+            let mut comps: Vec<f64> = Vec::new();
+            if funcs.len() == 1 {
+                comps = funcs[0].eval(&[t]).unwrap_or_default();
+            } else {
+                for f in &funcs {
+                    comps.push(f.eval(&[t]).and_then(|v| v.first().copied()).unwrap_or(0.0));
+                }
+            }
+            let c = self.components_to_rgb(&cs, &comps);
+            lut.push([c.r, c.g, c.b]);
+        }
+        let (extend_start, extend_end) = dict
+            .get_array("Extend")
+            .ok()
+            .map(|a| {
+                let b = |i: usize| matches!(a.get(i), Some(PdfObject::Bool(true)));
+                (b(0), b(1))
+            })
+            .unwrap_or((false, false));
+
+        Some(ShadingDef {
+            kind,
+            lut,
+            extend_start,
+            extend_end,
+            to_page,
+        })
+    }
+
     /// Build a mesh shading (types 4–7) from its stream. Decodes the packed
     /// vertex/patch bit-stream, resolves each vertex colour to RGB (applying any
     /// `/Function` then the colour space), tessellates patches, and transforms
@@ -3910,8 +4045,6 @@ impl<'a> ContentInterpreter<'a> {
         shading_type: i64,
         to_page: Matrix,
     ) -> Option<crate::shading::ShadingDef> {
-        use crate::shading::{MeshTriangle, MeshVertex, ShadingDef, ShadingKind};
-
         // Mesh shadings are stream objects; get the decoded bytes.
         let resolved = self.resolve_plain(obj);
         let PdfObject::Stream(stream) = &resolved else {
@@ -3925,21 +4058,6 @@ impl<'a> ContentInterpreter<'a> {
                 .ok()?,
             _ => decode_stream_for_file(self.file, &stream.data, &stream.dict).ok()?,
         };
-
-        let bits_coord = dict.get_i64("BitsPerCoordinate").ok()? as u32;
-        let bits_comp = dict.get_i64("BitsPerComponent").ok()? as u32;
-        let bits_flag = dict.get_i64("BitsPerFlag").unwrap_or(8) as u32;
-        if !(1..=32).contains(&bits_coord) || !(1..=16).contains(&bits_comp) {
-            return None;
-        }
-        let vertices_per_row = dict.get_i64("VerticesPerRow").unwrap_or(0).max(0) as usize;
-
-        // Colour space and optional /Function (all the `&mut self` / `&self`
-        // resolution happens before the resolver closure borrows `self`).
-        let cs = dict
-            .get("ColorSpace")
-            .map(|o| self.resolve_color_space_obj(o, 0))
-            .unwrap_or(ActiveColorSpace::DeviceRGB);
         let funcs: Vec<zpdf_color::PdfFunction> = match dict.get("Function") {
             Some(f) => match self.resolve_plain(f) {
                 PdfObject::Array(arr) => {
@@ -3949,6 +4067,31 @@ impl<'a> ContentInterpreter<'a> {
             },
             None => Vec::new(),
         };
+        self.build_mesh_shading_from_decoded(dict, &data, &funcs, shading_type, to_page)
+    }
+
+    fn build_mesh_shading_from_decoded(
+        &mut self,
+        dict: &zpdf_core::PdfDict,
+        data: &[u8],
+        funcs: &[zpdf_color::PdfFunction],
+        shading_type: i64,
+        to_page: Matrix,
+    ) -> Option<crate::shading::ShadingDef> {
+        use crate::shading::{MeshTriangle, MeshVertex, ShadingDef, ShadingKind};
+
+        let bits_coord = dict.get_i64("BitsPerCoordinate").ok()? as u32;
+        let bits_comp = dict.get_i64("BitsPerComponent").ok()? as u32;
+        let bits_flag = dict.get_i64("BitsPerFlag").unwrap_or(8) as u32;
+        if !(1..=32).contains(&bits_coord) || !(1..=16).contains(&bits_comp) {
+            return None;
+        }
+        let vertices_per_row = dict.get_i64("VerticesPerRow").unwrap_or(0).max(0) as usize;
+
+        let cs = dict
+            .get("ColorSpace")
+            .map(|o| self.resolve_color_space_obj(o, 0))
+            .unwrap_or(ActiveColorSpace::DeviceRGB);
         // One parametric value per vertex with a /Function, else N colour comps.
         let n_color = if funcs.is_empty() { cs.components() } else { 1 };
         if n_color == 0 || n_color > 32 {
@@ -3997,7 +4140,7 @@ impl<'a> ContentInterpreter<'a> {
             [c.r, c.g, c.b]
         };
 
-        let tris = crate::mesh::decode_mesh(shading_type, &data, &params, &mut resolve);
+        let tris = crate::mesh::decode_mesh(shading_type, data, &params, &mut resolve);
         if tris.is_empty() {
             return None;
         }
@@ -4332,6 +4475,28 @@ impl<'a> ContentInterpreter<'a> {
         if self.skip_images || (self.image_cache.is_none() && self.active_type3_glyphs.is_empty()) {
             return;
         }
+        if self.file.is_none() {
+            let Some(t3_shading) = self.lookup_type3_shading(name) else {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
+                tracing::debug!("Type 3 shading {name} not found in resources");
+                return;
+            };
+            let region = self.shading_region();
+            if region.width() <= 0.0 || region.height() <= 0.0 {
+                return;
+            }
+            let Some(def) = self.build_type3_shading(&t3_shading, self.current.ctm) else {
+                self.stats.diagnostics.unsupported_features = self
+                    .stats
+                    .diagnostics
+                    .unsupported_features
+                    .saturating_add(1);
+                return;
+            };
+            self.emit_shading_image(&def, region);
+            return;
+        }
         let (sh_obj, cache_id) = match self.lookup_res(|r| {
             r.shadings_inline
                 .get(name)
@@ -4407,8 +4572,16 @@ impl<'a> ContentInterpreter<'a> {
                 (region.width(), region.height())
             };
         // Resolution: smooth gradients upscale cleanly; cap the long side.
+        // In standalone Type 3 glyph replay (`self.file.is_none()`), glyph
+        // coordinates can be small (e.g. unit-square `[0..1]`) before `font_size`
+        // scaling, so rasterize at least 256 px along the long edge to preserve
+        // smooth gradients when enlarged on the page.
         let long = eff_w.max(eff_h);
-        let scale = (768.0 / long).min(2.0);
+        let scale = if self.file.is_none() {
+            (256.0 / long).max(2.0).min(768.0 / long)
+        } else {
+            (768.0 / long).min(2.0)
+        };
         let w = ((eff_w * scale).ceil() as u32).clamp(1, 2048);
         let h = ((eff_h * scale).ceil() as u32).clamp(1, 2048);
         // Gradient/mesh evaluation is CPU work here, and the result reaches a
@@ -5141,8 +5314,10 @@ impl<'a> ContentInterpreter<'a> {
         self.current.fill_alpha = 1.0;
         self.current.stroke_alpha = 1.0;
         // The detached mask display list starts unclipped; clear inherited
-        // clip_elision_bounds so clips inside /G are never elided against the
-        // outer page's clip (which is not pushed onto mask_dl).
+        // clip bounds and clip_elision_bounds so clips and shadings inside /G
+        // are never clipped or elided against the outer page's clip (which is
+        // not pushed onto mask_dl).
+        self.current.clip_bounds = None;
         self.current.clip_elision_bounds = None;
         // A soft mask's /G group *is* a form, drawn into a detached command
         // list — attributed as form work, which is where a mask-heavy page's
@@ -5213,8 +5388,39 @@ impl<'a> ContentInterpreter<'a> {
         } else {
             SoftMaskKind::Luminosity
         };
-        let page_rect = self.display_list.page_rect;
-        let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
+        let mut mask_page_rect = self.display_list.page_rect.normalize();
+        if let Ok(arr) = group.dict.get_array("BBox") {
+            let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+            if v.len() == 4 && v.iter().all(|c| c.is_finite()) {
+                let form_matrix = group
+                    .dict
+                    .get_array("Matrix")
+                    .ok()
+                    .and_then(|a| {
+                        let m: Vec<f64> = a.iter().filter_map(|o| o.as_f64().ok()).collect();
+                        (m.len() == 6).then(|| Matrix::new(m[0], m[1], m[2], m[3], m[4], m[5]))
+                    })
+                    .unwrap_or_else(Matrix::identity);
+                let combined = self.current.ctm.concat(&form_matrix);
+                let mut bbox_path = Path::new();
+                bbox_path.rect(Rect::new(
+                    v[0].min(v[2]),
+                    v[1].min(v[3]),
+                    v[0].max(v[2]),
+                    v[1].max(v[3]),
+                ));
+                let mapped = bbox_path.map_points(|p| p.transform(&combined));
+                if let Some(b) = Self::path_bounds(&mapped) {
+                    mask_page_rect = Rect::new(
+                        mask_page_rect.x0.min(b.x0),
+                        mask_page_rect.y0.min(b.y0),
+                        mask_page_rect.x1.max(b.x1),
+                        mask_page_rect.y1.max(b.y1),
+                    );
+                }
+            }
+        }
+        let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(mask_page_rect));
         let saved_state = self.current.clone();
         let saved_oc_hidden = self.oc_hidden_from.take();
         let saved_text_sink = self.text_sink.take();
@@ -5229,6 +5435,7 @@ impl<'a> ContentInterpreter<'a> {
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
         self.current.stroke_alpha = 1.0;
+        self.current.clip_bounds = None;
         self.current.clip_elision_bounds = None;
 
         let work = self.start_work(Some(Work::Form));
@@ -6360,6 +6567,7 @@ impl<'a> ContentInterpreter<'a> {
                     bbox_path.rect(Rect::new(x0, y0, x1, y1));
                     let page_path = self.transform_path_to_page_space(&bbox_path);
                     bbox_bounds = Self::path_bounds(&page_path);
+                    self.intersect_clip_bounds(bbox_bounds);
                     self.display_list.push(RenderCommand::PushClip {
                         path: page_path,
                         rule: FillRule::NonZero,

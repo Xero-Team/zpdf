@@ -16,7 +16,7 @@
 //! soft-mask `/TR` transfer functions are ignored.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
@@ -259,16 +259,25 @@ struct SvgWriter<'a> {
     /// image is PNG-encoded and embedded once, not once per draw.
     image_defs: HashMap<ImageDefKey, Option<u32>>,
     /// Retains `Arc<InlineImage>` allocations keyed by address in `image_defs`
-    /// (`ImageDefKey::Inline`) so freed temporary inline images (e.g. from
-    /// transformed Type 3 soft masks) cannot alias a later image.
+    /// (`ImageDefKey::Inline`) so freed temporary inline images cannot alias a
+    /// later image, bounded by `max_retained_inline_image_bytes`.
     retained_inline_images: Vec<std::sync::Arc<zpdf_display_list::InlineImage>>,
+    retained_inline_image_bytes: u64,
+    max_retained_inline_image_bytes: u64,
     /// Soft-mask defs already written. A soft mask the interpreter reuses
     /// (one `gs` applied to many objects shares one mask list) is written
     /// once and referenced by every group it masks. Retains the keyed
     /// `Arc<DisplayList>` so raw pointer keys can never alias freed temporary
-    /// allocations (such as uncached Type 3 glyph masks or nested transformed
-    /// soft masks).
+    /// allocations, bounded by `max_retained_mask_bytes`.
     mask_defs: HashMap<MaskDefKey, (std::sync::Arc<DisplayList>, u32)>,
+    retained_mask_bytes: u64,
+    max_retained_mask_bytes: u64,
+    retained_mask_list_ptrs: HashSet<usize>,
+    retained_mask_inline_ptrs: HashSet<usize>,
+    /// Private image cache active while emitting a Type 3 glyph's soft mask so
+    /// mask `DrawImage` commands reuse `(font_id, glyph_id, image_id)` directly
+    /// without allocating or retaining per-placement `InlineImage` copies.
+    active_type3_mask_images: Option<(FontId, u16, Rc<Type3Glyph>)>,
     /// Tiling-pattern `<pattern>` defs already written, deduplicated per page.
     /// Retains each source `Arc<DisplayList>` so pointer keys never alias freed
     /// allocations (e.g. temporary lifted nested cells from `blend_segments()`).
@@ -287,12 +296,17 @@ struct SvgWriter<'a> {
     type3_glyph_image_bytes: u64,
 }
 
-/// What an `<image>` def holds: a page image, or a Type 3 stencil glyph's
-/// image tinted with the text colour (RGBA bits).
+/// What an `<image>` def holds: a page image, a retained inline image, a Type 3
+/// mask image, or a Type 3 stencil glyph's image tinted with the text colour.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ImageDefKey {
     Page(ImageId),
     Inline(usize),
+    Type3MaskImage {
+        font: FontId,
+        glyph: u16,
+        image: ImageId,
+    },
     Type3Stencil {
         font: FontId,
         glyph: u16,
@@ -598,12 +612,9 @@ struct TilingPatternGeometry {
 /// An interpreted Type 3 glyph procedure.
 struct Type3Glyph {
     list: DisplayList,
-    /// Images the procedure draws (stencil glyphs), by the ids in `list`.
+    /// Images the procedure draws (stencil/colored glyphs and soft-mask images),
+    /// keyed by the ids in `list`.
     images: ImageCache,
-    /// Shared `Arc<InlineImage>` wrappers for glyph-local `ImageId`s referenced
-    /// inside soft masks so repeated placements reuse one decoded image and one
-    /// SVG `<image>` def.
-    inline_images: HashMap<ImageId, std::sync::Arc<zpdf_display_list::InlineImage>>,
     font_matrix: [f64; 6],
 }
 
@@ -660,7 +671,14 @@ impl<'a> SvgWriter<'a> {
             warned_transfer: false,
             image_defs: HashMap::new(),
             retained_inline_images: Vec::new(),
+            retained_inline_image_bytes: 0,
+            max_retained_inline_image_bytes: MAX_CACHED_TYPE3_IMAGE_BYTES,
             mask_defs: HashMap::new(),
+            retained_mask_bytes: 0,
+            max_retained_mask_bytes: MAX_CACHED_TYPE3_IMAGE_BYTES,
+            retained_mask_list_ptrs: HashSet::new(),
+            retained_mask_inline_ptrs: HashSet::new(),
+            active_type3_mask_images: None,
             pattern_defs: HashMap::new(),
             tiling_backdrop_cache: HashMap::new(),
             glyph_outlines: HashMap::new(),
@@ -1318,6 +1336,7 @@ impl<'a> SvgWriter<'a> {
         let saved_h = self.page_height;
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
+        let saved_type3_mask_images = self.active_type3_mask_images.take();
         let (saved_clip, saved_mask, saved_clip_bounds) = (
             self.clip.take(),
             self.stroke_mask.take(),
@@ -1371,6 +1390,7 @@ impl<'a> SvgWriter<'a> {
         self.page_height = saved_h;
         self.blend_depth = saved_blend_depth;
         self.isolated_depth = saved_isolated_depth;
+        self.active_type3_mask_images = saved_type3_mask_images;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
         self.clip_bounds = saved_clip_bounds;
@@ -1507,6 +1527,7 @@ impl<'a> SvgWriter<'a> {
         let saved_h = self.page_height;
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
+        let saved_type3_mask_images = self.active_type3_mask_images.take();
         let (saved_clip, saved_mask, saved_clip_bounds) = (
             self.clip.take(),
             self.stroke_mask.take(),
@@ -1547,6 +1568,7 @@ impl<'a> SvgWriter<'a> {
         self.page_height = saved_h;
         self.blend_depth = saved_blend_depth;
         self.isolated_depth = saved_isolated_depth;
+        self.active_type3_mask_images = saved_type3_mask_images;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
         self.clip_bounds = saved_clip_bounds;
@@ -1670,6 +1692,7 @@ impl<'a> SvgWriter<'a> {
         let saved_h = self.page_height;
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
+        let saved_type3_mask_images = self.active_type3_mask_images.take();
         let (saved_clip, saved_mask, saved_clip_bounds) = (
             self.clip.take(),
             self.stroke_mask.take(),
@@ -1716,6 +1739,7 @@ impl<'a> SvgWriter<'a> {
         self.page_height = saved_h;
         self.blend_depth = saved_blend_depth;
         self.isolated_depth = saved_isolated_depth;
+        self.active_type3_mask_images = saved_type3_mask_images;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
         self.clip_bounds = saved_clip_bounds;
@@ -4655,23 +4679,107 @@ impl<'a> SvgWriter<'a> {
     /// Emit a Type 3 glyph-local soft mask placed at `placement`, keyed by the
     /// retained source mask and placement transform so separate glyph positions
     /// get distinct `<mask>` defs while identical placements deduplicate.
-    fn emit_transformed_soft_mask_def<F>(
+    /// Installs `glyph_images` while emitting the mask commands so glyph-local
+    /// `DrawImage` commands share stable `(font, glyph, image)` `<image>` defs
+    /// without allocating or retaining per-placement `InlineImage` buffers.
+    fn emit_transformed_soft_mask_def(
         &mut self,
         source: &SoftMask,
         placement: &zpdf_core::Matrix,
-        resolve_image: &F,
+        glyph_images: Option<(FontId, u16, &Rc<Type3Glyph>)>,
         depth: EmitDepth,
-    ) -> Option<u32>
-    where
-        F: Fn(ImageId) -> Option<std::sync::Arc<zpdf_display_list::InlineImage>>,
-    {
+    ) -> Option<u32> {
         let stroke_scale = (self.scale as f32).max(4.0);
-        let transform_stroke = |path: &Path, style: &StrokeStyle, m: &zpdf_core::Matrix| {
-            zpdf_render_cpu::transform_stroke_to_page(path, style, m, stroke_scale)
+        let page_rect = self.page_rect;
+        let transform_stroke =
+            |path: &Path,
+             style: &StrokeStyle,
+             m: &zpdf_core::Matrix,
+             local_clip: Option<zpdf_core::Rect>| {
+                zpdf_render_cpu::transform_stroke_to_page(
+                    path,
+                    style,
+                    m,
+                    local_clip,
+                    Some(page_rect),
+                    stroke_scale,
+                )
+            };
+        let saved_t3_mask_images = self.active_type3_mask_images.take();
+        self.active_type3_mask_images = glyph_images
+            .map(|(font_id, glyph_id, program)| (font_id, glyph_id, Rc::clone(program)));
+        let mask_id =
+            self.emit_soft_mask_def_inner(source, Some(matrix_key_bits(placement)), depth, || {
+                Some(source.transform_with_images(placement, &|_| None, &transform_stroke))
+            });
+        self.active_type3_mask_images = saved_t3_mask_images;
+        mask_id
+    }
+
+    fn estimate_new_mask_retention_bytes(
+        &self,
+        list: &std::sync::Arc<DisplayList>,
+    ) -> (u64, Vec<usize>, Vec<usize>) {
+        struct WalkState<'a> {
+            retained_lists: &'a HashSet<usize>,
+            retained_inlines: &'a HashSet<usize>,
+            seen_lists: HashSet<usize>,
+            seen_inlines: HashSet<usize>,
+            new_lists: Vec<usize>,
+            new_inlines: Vec<usize>,
+            bytes: u64,
+        }
+        fn walk(list: &std::sync::Arc<DisplayList>, depth: u8, st: &mut WalkState<'_>) {
+            if depth >= MAX_MASK_DEPTH {
+                return;
+            }
+            let ptr = std::sync::Arc::as_ptr(list) as usize;
+            if !st.seen_lists.insert(ptr) {
+                return;
+            }
+            if !st.retained_lists.contains(&ptr) {
+                st.new_lists.push(ptr);
+                let list_bytes = (std::mem::size_of::<DisplayList>() as u64).saturating_add(
+                    (list.commands.len() as u64)
+                        .saturating_mul(std::mem::size_of::<RenderCommand>() as u64),
+                );
+                st.bytes = st.bytes.saturating_add(list_bytes);
+            }
+            for cmd in &list.commands {
+                match cmd {
+                    RenderCommand::DrawInlineImage(draw) => {
+                        let iptr = std::sync::Arc::as_ptr(&draw.image) as usize;
+                        if st.seen_inlines.insert(iptr) && !st.retained_inlines.contains(&iptr) {
+                            st.new_inlines.push(iptr);
+                            let img_bytes =
+                                (draw.image.data.len() as u64).saturating_add(std::mem::size_of::<
+                                    zpdf_display_list::InlineImage,
+                                >(
+                                )
+                                    as u64);
+                            st.bytes = st.bytes.saturating_add(img_bytes);
+                        }
+                    }
+                    RenderCommand::PushBlendGroup {
+                        mask: Some(sub), ..
+                    } => {
+                        walk(&sub.commands, depth + 1, st);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut st = WalkState {
+            retained_lists: &self.retained_mask_list_ptrs,
+            retained_inlines: &self.retained_mask_inline_ptrs,
+            seen_lists: HashSet::new(),
+            seen_inlines: HashSet::new(),
+            new_lists: Vec::new(),
+            new_inlines: Vec::new(),
+            bytes: 0,
         };
-        self.emit_soft_mask_def_inner(source, Some(matrix_key_bits(placement)), depth, || {
-            Some(source.transform_with_images(placement, resolve_image, &transform_stroke))
-        })
+        walk(list, 0, &mut st);
+        (st.bytes, st.new_lists, st.new_inlines)
     }
 
     fn emit_soft_mask_def_inner(
@@ -4681,6 +4789,8 @@ impl<'a> SvgWriter<'a> {
         depth: EmitDepth,
         materialize: impl FnOnce() -> Option<SoftMask>,
     ) -> Option<u32> {
+        const MASK_DEF_ENTRY_OVERHEAD: u64 = 128;
+
         if depth.mask >= MAX_MASK_DEPTH {
             tracing::warn!("soft-mask nesting exceeds depth budget; mask dropped");
             return None;
@@ -4708,8 +4818,17 @@ impl<'a> SvgWriter<'a> {
             return Some(id);
         }
         let id = self.fresh_id();
-        self.mask_defs
-            .insert(key, (std::sync::Arc::clone(&source.commands), id));
+        let (added_payload_bytes, new_lists, new_inlines) =
+            self.estimate_new_mask_retention_bytes(&source.commands);
+        let added_bytes = added_payload_bytes.saturating_add(MASK_DEF_ENTRY_OVERHEAD);
+        let next_mask_bytes = self.retained_mask_bytes.saturating_add(added_bytes);
+        if next_mask_bytes <= self.max_retained_mask_bytes {
+            self.retained_mask_bytes = next_mask_bytes;
+            self.retained_mask_list_ptrs.extend(new_lists);
+            self.retained_mask_inline_ptrs.extend(new_inlines);
+            self.mask_defs
+                .insert(key, (std::sync::Arc::clone(&source.commands), id));
+        }
 
         let transformed = materialize();
         let mask = transformed.as_ref().unwrap_or(source);
@@ -5274,17 +5393,23 @@ impl<'a> SvgWriter<'a> {
                 .sum()
         }
 
-        fn parts_have_non_isolated_backdrop_group(
+        fn parts_need_non_isolated_backdrop_fallback(
             parts: &[Type3TilingPart],
             plan_is_backdrop: bool,
-            in_non_isolated: bool,
+            in_non_isolated_with_backdrop: bool,
+            has_prior_marks: &mut bool,
         ) -> bool {
             for part in parts {
                 match part {
                     Type3TilingPart::InheritedShape { .. } => {
-                        if in_non_isolated && plan_is_backdrop {
+                        if in_non_isolated_with_backdrop && plan_is_backdrop {
                             return true;
                         }
+                        *has_prior_marks = true;
+                    }
+                    Type3TilingPart::ColoredImage { .. }
+                    | Type3TilingPart::ColoredVector { .. } => {
+                        *has_prior_marks = true;
                     }
                     Type3TilingPart::BlendGroup {
                         blend_mode,
@@ -5292,19 +5417,35 @@ impl<'a> SvgWriter<'a> {
                         children,
                         ..
                     } => {
-                        if in_non_isolated && *blend_mode != BlendMode::Normal {
+                        if in_non_isolated_with_backdrop && *blend_mode != BlendMode::Normal {
                             return true;
                         }
-                        if parts_have_non_isolated_backdrop_group(
-                            children,
-                            plan_is_backdrop,
-                            !*isolated,
-                        ) {
-                            return true;
+                        if *isolated {
+                            let mut inner_marks = false;
+                            if parts_need_non_isolated_backdrop_fallback(
+                                children,
+                                plan_is_backdrop,
+                                false,
+                                &mut inner_marks,
+                            ) {
+                                return true;
+                            }
+                            *has_prior_marks |= inner_marks;
+                        } else {
+                            let group_has_backdrop =
+                                in_non_isolated_with_backdrop || *has_prior_marks;
+                            let mut inner_marks = *has_prior_marks;
+                            if parts_need_non_isolated_backdrop_fallback(
+                                children,
+                                plan_is_backdrop,
+                                group_has_backdrop,
+                                &mut inner_marks,
+                            ) {
+                                return true;
+                            }
+                            *has_prior_marks = inner_marks;
                         }
                     }
-                    Type3TilingPart::ColoredImage { .. }
-                    | Type3TilingPart::ColoredVector { .. } => {}
                 }
             }
             false
@@ -5459,7 +5600,6 @@ impl<'a> SvgWriter<'a> {
             }
             let mut glyph_clips: Vec<(Option<u32>, Option<u32>, Option<SvgRect>)> = Vec::new();
             let mut glyph_blends: Vec<Type3BlendFrame> = Vec::new();
-            let resolve_glyph_img = |id: ImageId| program.inline_images.get(&id).cloned();
 
             for cmd in &program.list.commands {
                 if self.check_over_budget() {
@@ -5516,7 +5656,7 @@ impl<'a> SvgWriter<'a> {
                             self.emit_transformed_soft_mask_def(
                                 m,
                                 &glyph_to_page,
-                                &resolve_glyph_img,
+                                Some((run.font_id, glyph.glyph_id, &program)),
                                 depth,
                             )
                         });
@@ -5859,9 +5999,14 @@ impl<'a> SvgWriter<'a> {
             (None, None) => self.full_page_rect(),
         };
         if !parts_have_inherited(&parts) {
+            let mut has_prior_marks = self.pending_backdrop.is_some() || !self.out.is_empty();
             if depth.is_top_level()
-                && (self.pending_backdrop.is_some() || !self.out.is_empty())
-                && parts_have_non_isolated_backdrop_group(&parts, false, false)
+                && parts_need_non_isolated_backdrop_fallback(
+                    &parts,
+                    false,
+                    false,
+                    &mut has_prior_marks,
+                )
                 && self.emit_raster_backdrop_tiling_fallback(run_affected)
             {
                 return;
@@ -5879,9 +6024,14 @@ impl<'a> SvgWriter<'a> {
                 _ => true,
             },
         };
+        let mut has_prior_marks = self.pending_backdrop.is_some() || !self.out.is_empty();
         if depth.is_top_level()
-            && (self.pending_backdrop.is_some() || !self.out.is_empty())
-            && parts_have_non_isolated_backdrop_group(&parts, plan_is_backdrop, false)
+            && parts_need_non_isolated_backdrop_fallback(
+                &parts,
+                plan_is_backdrop,
+                false,
+                &mut has_prior_marks,
+            )
             && self.emit_raster_backdrop_tiling_fallback(run_affected)
         {
             return;
@@ -6339,25 +6489,14 @@ impl<'a> SvgWriter<'a> {
                     interp = interp.with_deadline(deadline);
                 }
                 let list = interp.interpret(stream);
-                let inline_images =
-                    zpdf_render_cpu::collect_type3_mask_inline_images(&list, &images);
                 Rc::new(Type3Glyph {
                     list,
                     images,
-                    inline_images,
                     font_matrix,
                 })
             });
         let (commands, image_bytes) = glyph.as_ref().map_or((1, 0), |g| {
-            let inline_bytes: u64 = g
-                .inline_images
-                .values()
-                .map(|img| img.data.len() as u64)
-                .sum();
-            (
-                g.list.commands.len().max(1),
-                g.images.bytes_used().saturating_add(inline_bytes),
-            )
+            (g.list.commands.len().max(1), g.images.bytes_used())
         });
         let total_commands = self.type3_glyph_commands.saturating_add(commands);
         let total_image_bytes = self.type3_glyph_image_bytes.saturating_add(image_bytes);
@@ -6393,7 +6532,6 @@ impl<'a> SvgWriter<'a> {
             let glyph_to_page = Self::type3_glyph_to_page(run, glyph, &font_matrix);
             let mut glyph_clips: Vec<(Option<u32>, Option<u32>, Option<SvgRect>)> = Vec::new();
             let mut glyph_blends: Vec<(BlendMode, bool, f32, Option<u32>, String)> = Vec::new();
-            let resolve_glyph_img = |id: ImageId| program.inline_images.get(&id).cloned();
 
             for cmd in &program.list.commands {
                 if self.check_over_budget() {
@@ -6440,7 +6578,7 @@ impl<'a> SvgWriter<'a> {
                             self.emit_transformed_soft_mask_def(
                                 m,
                                 &glyph_to_page,
-                                &resolve_glyph_img,
+                                Some((run.font_id, glyph.glyph_id, &program)),
                                 depth,
                             )
                         });
@@ -6604,6 +6742,27 @@ impl<'a> SvgWriter<'a> {
         if alpha <= 0.0 {
             return;
         }
+        if let Some((font_id, glyph_id, program)) = self.active_type3_mask_images.clone() {
+            let Some(image) = program.images.get(draw.image_id) else {
+                tracing::warn!(
+                    image_id = draw.image_id,
+                    "Type 3 soft-mask image draw references unknown image"
+                );
+                return;
+            };
+            self.place_image(
+                ImageDefKey::Type3MaskImage {
+                    font: font_id,
+                    glyph: glyph_id,
+                    image: draw.image_id,
+                },
+                image,
+                None,
+                &draw.transform,
+                alpha,
+            );
+            return;
+        }
         let Some(image) = self.images.get(draw.image_id) else {
             tracing::warn!(
                 image_id = draw.image_id,
@@ -6630,9 +6789,24 @@ impl<'a> SvgWriter<'a> {
             return;
         }
         let key = ImageDefKey::Inline(std::sync::Arc::as_ptr(&draw.image) as usize);
-        let was_cached = self.image_defs.contains_key(&key);
+        if self.image_defs.contains_key(&key) {
+            self.place_rgba_image(
+                Some(key),
+                draw.image.width,
+                draw.image.height,
+                &draw.image.data,
+                draw.image.premultiplied,
+                None,
+                &draw.transform,
+                alpha,
+            );
+            return;
+        }
+        let img_bytes = draw.image.data.len() as u64;
+        let next_bytes = self.retained_inline_image_bytes.saturating_add(img_bytes);
+        let cache_key = (next_bytes <= self.max_retained_inline_image_bytes).then_some(key);
         self.place_rgba_image(
-            key,
+            cache_key,
             draw.image.width,
             draw.image.height,
             &draw.image.data,
@@ -6641,7 +6815,8 @@ impl<'a> SvgWriter<'a> {
             &draw.transform,
             alpha,
         );
-        if !was_cached && self.image_defs.contains_key(&key) {
+        if cache_key.is_some() && self.image_defs.contains_key(&key) {
+            self.retained_inline_image_bytes = next_bytes;
             self.retained_inline_images
                 .push(std::sync::Arc::clone(&draw.image));
         }
@@ -6659,7 +6834,7 @@ impl<'a> SvgWriter<'a> {
         alpha: f32,
     ) {
         self.place_rgba_image(
-            key,
+            Some(key),
             image.width,
             image.height,
             &image.data,
@@ -6673,7 +6848,7 @@ impl<'a> SvgWriter<'a> {
     #[allow(clippy::too_many_arguments)]
     fn place_rgba_image(
         &mut self,
-        key: ImageDefKey,
+        key: Option<ImageDefKey>,
         width: u32,
         height: u32,
         data: &[u8],
@@ -6708,8 +6883,8 @@ impl<'a> SvgWriter<'a> {
             return;
         }
 
-        let id = match self.image_defs.get(&key) {
-            Some(id) => *id,
+        let id = match key.and_then(|k| self.image_defs.get(&k).copied()) {
+            Some(id) => id,
             None => {
                 let png = match tint {
                     Some(color) => {
@@ -6732,7 +6907,9 @@ impl<'a> SvgWriter<'a> {
                 if id.is_none() {
                     tracing::warn!("skipping unencodable image");
                 }
-                self.image_defs.insert(key, id);
+                if let Some(k) = key {
+                    self.image_defs.insert(k, id);
+                }
                 id
             }
         };
@@ -7341,7 +7518,6 @@ mod tests {
                 Some(Rc::new(Type3Glyph {
                     list,
                     images: ImageCache::new(),
-                    inline_images: HashMap::new(),
                     font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
                 })),
             );
@@ -12906,5 +13082,473 @@ mod tests {
         assert!(px(24, 60)[0] > 240 && px(24, 60)[1] > 240, "{svg}");
         assert!(px(10, 45)[0] > 240 && px(10, 45)[1] < 15, "{svg}");
         assert!(px(10, 47)[0] > 240 && px(10, 47)[1] > 240, "{svg}");
+    }
+
+    #[test]
+    fn svg_uncached_type3_mask_images_stay_bounded_and_deduplicate_image_defs() {
+        use std::sync::Arc;
+        use zpdf_font::{
+            Type3FormXObject, Type3ImageXObject, Type3Resources, Type3SoftMask, Type3XObject,
+        };
+
+        let mut gray = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..16 {
+                gray[y * 32 + x] = 255;
+            }
+        }
+        let mut img_dict = zpdf_core::PdfDict::new();
+        img_dict.insert(
+            zpdf_core::PdfName::new("Width"),
+            zpdf_core::PdfObject::Integer(32),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("Height"),
+            zpdf_core::PdfObject::Integer(32),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("BitsPerComponent"),
+            zpdf_core::PdfObject::Integer(8),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceGray")),
+        );
+        let mask_img = Arc::new(Type3ImageXObject {
+            dict: img_dict,
+            data: Arc::from(gray),
+            smask: None,
+            mask_stream: None,
+        });
+        let mut form_res = Type3Resources::default();
+        form_res
+            .xobjects
+            .insert("MImg".into(), Type3XObject::Image(mask_img));
+        let mut form_dict = zpdf_core::PdfDict::new();
+        form_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(20.0),
+                zpdf_core::PdfObject::Real(20.0),
+            ]),
+        );
+        let group = Arc::new(Type3FormXObject {
+            dict: form_dict,
+            data: Arc::from(&b"q 20 0 0 20 0 0 cm /MImg Do Q"[..]),
+            resources: Some(Arc::new(form_res)),
+        });
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_state_smasks.insert(
+            "GSImg".into(),
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group,
+                backdrop_luma: 0.0,
+                transfer: None,
+            },
+        );
+        let charproc = b"20 0 d0 /GSImg gs 1 0 0 rg 0 0 20 20 re f";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![20.0],
+                first_char: 0,
+            },
+            "UncachedMaskImgSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(20.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let glyphs: Vec<PositionedGlyph> = (0..10)
+            .map(|i| PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: (i * 20) as f32,
+                y: 0.0,
+                advance: 20.0,
+            })
+            .collect();
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 20.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let images = ImageCache::new();
+        let options = SvgOptions::default();
+        let mut writer = SvgWriter::new(
+            dl.page_rect,
+            200.0,
+            20.0,
+            &dl.commands,
+            &fonts,
+            &images,
+            &options,
+        );
+        // Deny glyph-program cache admission and cap retained mask metadata tightly.
+        writer.type3_glyph_commands = MAX_CACHED_TYPE3_COMMANDS;
+        writer.max_retained_mask_bytes = 2048;
+        writer.max_retained_inline_image_bytes = 2048;
+        if let Some(bg) = options.background {
+            writer
+                .out
+                .push_str("<rect width=\"200\" height=\"20\" fill=\"");
+            writer.out.push_str(&hex_color(&bg));
+            writer.out.push_str("\"/>\n");
+        }
+        writer.emit_commands(&dl.commands, EmitDepth::default());
+        assert!(
+            writer.type3_glyphs.is_empty(),
+            "glyph cache admission must remain denied"
+        );
+        assert!(
+            writer.retained_inline_images.is_empty() && writer.retained_inline_image_bytes == 0,
+            "Type 3 mask images must not retain per-placement InlineImage pixel copies"
+        );
+        assert!(
+            writer.retained_mask_bytes <= writer.max_retained_mask_bytes,
+            "retained mask bytes {} exceeded cap {}",
+            writer.retained_mask_bytes,
+            writer.max_retained_mask_bytes
+        );
+
+        writer.flush_pending_backdrop();
+        writer.flush_disjoint_backdrop();
+        let svg = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200pt\" height=\"20pt\" viewBox=\"0 0 200 20\">\n\
+             <defs>\n{}</defs>\n{}</svg>\n",
+            writer.defs, writer.out
+        );
+        assert_eq!(
+            svg.matches("<image id=\"i").count(),
+            1,
+            "all 10 uncached placements must share one <image> def: {svg}"
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(200, 20).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(
+                200.0 / tree.size().width(),
+                20.0 / tree.size().height(),
+            ),
+            &mut pixmap.as_mut(),
+        );
+        for i in 0..10u32 {
+            let l = pixmap.pixel(i * 20 + 4, 10).expect("left");
+            let r = pixmap.pixel(i * 20 + 16, 10).expect("right");
+            assert!(
+                l.red() > 240 && l.green() < 15 && l.blue() < 15,
+                "placement {i} left must be red, got {l:?}"
+            );
+            assert!(
+                r.red() > 240 && r.green() > 240 && r.blue() > 240,
+                "placement {i} right must be white, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn svg_type3_soft_mask_long_clipped_dashed_stroke_preserves_dash_gaps() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3FormXObject, Type3Resources, Type3SoftMask};
+
+        let make_mask = |start_x: i64| -> Type3SoftMask {
+            let stream = format!("1 G 10 w [16 16] 0 d {start_x} 10 m 2000000 10 l S");
+            let mut form_dict = zpdf_core::PdfDict::new();
+            form_dict.insert(
+                zpdf_core::PdfName::new("BBox"),
+                zpdf_core::PdfObject::Array(vec![
+                    zpdf_core::PdfObject::Real(0.0),
+                    zpdf_core::PdfObject::Real(0.0),
+                    zpdf_core::PdfObject::Real(80.0),
+                    zpdf_core::PdfObject::Real(20.0),
+                ]),
+            );
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group: Arc::new(Type3FormXObject {
+                    dict: form_dict,
+                    data: Arc::from(stream.into_bytes()),
+                    resources: None,
+                }),
+                backdrop_luma: 0.0,
+                transfer: None,
+            }
+        };
+        let mut t3_res = Type3Resources::default();
+        t3_res
+            .ext_g_state_smasks
+            .insert("GSDashA".into(), make_mask(-2_000_000));
+        t3_res
+            .ext_g_state_smasks
+            .insert("GSDashB".into(), make_mask(-2_000_016));
+        let charproc_a = b"80 0 d0 /GSDashA gs 1 0 0 rg 0 0 80 20 re f";
+        let charproc_b = b"80 0 d0 /GSDashB gs 1 0 0 rg 0 0 80 20 re f";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), Arc::<[u8]>::from(&charproc_a[..])),
+                    ("B".into(), Arc::<[u8]>::from(&charproc_b[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![80.0, 80.0],
+                first_char: 0,
+            },
+            "LongClippedDashMaskSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(80.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let rasterize_glyph = |glyph_id: u16| {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 20.0));
+            dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+                font_id,
+                font_size: 1.0,
+                glyphs: vec![PositionedGlyph {
+                    glyph_id,
+                    code_len: 1,
+                    code: b'A' as u32 + glyph_id as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 80.0,
+                }],
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::identity(),
+                h_scale: 0.5,
+            }));
+            let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+            let tree =
+                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+                    .expect("valid SVG");
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(40, 20).expect("pixmap");
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(
+                    40.0 / tree.size().width(),
+                    20.0 / tree.size().height(),
+                ),
+                &mut pixmap.as_mut(),
+            );
+            (pixmap, svg)
+        };
+
+        let (pix_a, svg_a) = rasterize_glyph(0);
+        let (pix_b, svg_b) = rasterize_glyph(1);
+        for x in [4u32, 20, 36] {
+            let pa = pix_a.pixel(x, 10).expect("a");
+            let pb = pix_b.pixel(x, 10).expect("b");
+            assert!(
+                pa.red() > 240 && pa.green() < 15 && pa.blue() < 15,
+                "SVG glyph A x={x} must be red dash, got {pa:?}: {svg_a}"
+            );
+            assert!(
+                pb.red() > 240 && pb.green() > 240 && pb.blue() > 240,
+                "SVG glyph B x={x} must be white gap, got {pb:?}: {svg_b}"
+            );
+        }
+        for x in [12u32, 28] {
+            let pa = pix_a.pixel(x, 10).expect("a");
+            let pb = pix_b.pixel(x, 10).expect("b");
+            assert!(
+                pa.red() > 240 && pa.green() > 240 && pa.blue() > 240,
+                "SVG glyph A x={x} must be white gap (not solid), got {pa:?}: {svg_a}"
+            );
+            assert!(
+                pb.red() > 240 && pb.green() < 15 && pb.blue() < 15,
+                "SVG glyph B x={x} must be red dash, got {pb:?}: {svg_b}"
+            );
+        }
+    }
+
+    #[test]
+    fn svg_transparent_tiling_type3_earlier_mark_blends_into_non_isolated_group() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3FormXObject, Type3Resources, Type3XObject};
+
+        // Non-isolated transparency Form painting a red Multiply rectangle over [0..20].
+        let mut mul_gs = zpdf_core::PdfDict::new();
+        mul_gs.insert(
+            zpdf_core::PdfName::new("BM"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Multiply")),
+        );
+        let mut form_res = Type3Resources::default();
+        form_res.ext_g_states.insert("Mul".into(), mul_gs);
+        let mut group_dict = zpdf_core::PdfDict::new();
+        group_dict.insert(
+            zpdf_core::PdfName::new("S"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Transparency")),
+        );
+        group_dict.insert(
+            zpdf_core::PdfName::new("I"),
+            zpdf_core::PdfObject::Bool(false),
+        );
+        let mut form_dict = zpdf_core::PdfDict::new();
+        form_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(20.0),
+                zpdf_core::PdfObject::Real(20.0),
+            ]),
+        );
+        form_dict.insert(
+            zpdf_core::PdfName::new("Group"),
+            zpdf_core::PdfObject::Dict(group_dict),
+        );
+        let non_iso_form = Arc::new(Type3FormXObject {
+            dict: form_dict,
+            data: Arc::from(&b"/Mul gs 1 0 0 rg 0 0 20 20 re f"[..]),
+            resources: Some(Arc::new(form_res)),
+        });
+
+        let mut half_alpha_gs = zpdf_core::PdfDict::new();
+        half_alpha_gs.insert(
+            zpdf_core::PdfName::new("ca"),
+            zpdf_core::PdfObject::Real(0.5),
+        );
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_states.insert("G05".into(), half_alpha_gs);
+        t3_res
+            .xobjects
+            .insert("NonIsoMul".into(), Type3XObject::Form(non_iso_form));
+
+        // Glyph A (colored-only branch: `!parts_have_inherited`): green fill
+        // followed by 0.5-opacity non-isolated Form containing red Multiply fill.
+        // Glyph B (inherited branch: `parts_have_inherited`): green inherited
+        // tiling fill (initial fill before color ops in a Type 3 CharProc uses
+        // `Paint::Inherited`) followed by the same 0.5-opacity non-isolated Form.
+        let charproc_a = b"20 0 d0 0 1 0 rg 0 0 20 20 re f /G05 gs /NonIsoMul Do";
+        let charproc_b = b"20 0 d0 0 0 20 20 re f /G05 gs /NonIsoMul Do";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), Arc::<[u8]>::from(&charproc_a[..])),
+                    ("B".into(), Arc::<[u8]>::from(&charproc_b[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![20.0, 20.0],
+                first_char: 0,
+            },
+            "TransparentType3NonIsoBackdrop".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(20.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut tile_dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        tile_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(zpdf_display_list::TilingPattern {
+            commands: Arc::new(tile_dl),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        for (label, glyph_id) in [("colored-only", 0u16), ("inherited+colored", 1u16)] {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+            dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+                font_id,
+                font_size: 1.0,
+                glyphs: vec![PositionedGlyph {
+                    glyph_id,
+                    code_len: 1,
+                    code: b'A' as u32 + glyph_id as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 20.0,
+                }],
+                paint: Paint::Tiling(Arc::clone(&tiling)),
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::identity(),
+                h_scale: 1.0,
+            }));
+
+            let mut cpu_renderer = CpuRenderer::new().with_fonts(&fonts);
+            let info = PageRenderInfo {
+                page_rect: dl.page_rect,
+                scale: 1.0,
+                background: Color::rgba(0.0, 0.0, 0.0, 0.0),
+            };
+            cpu_renderer.begin_page(&info).expect("begin_page");
+            for cmd in &dl.commands {
+                cpu_renderer.execute(cmd).expect("execute");
+            }
+            let cpu = cpu_renderer.end_page().expect("end_page");
+
+            let options = SvgOptions {
+                background: None,
+                ..SvgOptions::default()
+            };
+            let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &options);
+            let tree =
+                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+                    .expect("valid SVG");
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(20, 20).expect("pixmap");
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(
+                    20.0 / tree.size().width(),
+                    20.0 / tree.size().height(),
+                ),
+                &mut pixmap.as_mut(),
+            );
+
+            let s = pixmap.pixel(10, 10).expect("svg pixel");
+            let svg_rgba = [s.red(), s.green(), s.blue(), s.alpha()];
+            let idx = ((10 * cpu.width + 10) * 4) as usize;
+            let cpu_rgba = [
+                cpu.data[idx],
+                cpu.data[idx + 1],
+                cpu.data[idx + 2],
+                cpu.data[idx + 3],
+            ];
+            // Multiply(red, green) = black; at group alpha 0.5 over green => [0, 128, 0, 255].
+            assert!(
+                cpu_rgba[0] <= 2 && cpu_rgba[1].abs_diff(128) <= 2 && cpu_rgba[3] == 255,
+                "{label}: unexpected CPU reference {cpu_rgba:?}"
+            );
+            for ch in 0..4 {
+                assert!(
+                    svg_rgba[ch].abs_diff(cpu_rgba[ch]) <= 2,
+                    "{label}: transparent SVG {svg_rgba:?} must match CPU {cpu_rgba:?}: {svg}"
+                );
+            }
+        }
     }
 }

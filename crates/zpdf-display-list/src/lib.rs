@@ -299,8 +299,10 @@ impl SoftMask {
     /// Map a soft mask's commands, bounds, and offset by `matrix` (e.g. from
     /// Type 3 glyph coordinates into page space), embedding any referenced
     /// `ImageId` via `resolve_image` and mapping stroked paths / stroke clips
-    /// via `transform_stroke` so directional stroke widths and dashes are
-    /// preserved under nonuniform transforms.
+    /// via `transform_stroke` (given the active local-space clip bounds) so
+    /// directional stroke widths and clipped dashes are preserved under
+    /// nonuniform transforms. Shared nested mask `Arc<DisplayList>` references
+    /// at the same depth reuse one transformed allocation.
     pub fn transform_with_images<F, S>(
         &self,
         matrix: &Matrix,
@@ -309,9 +311,10 @@ impl SoftMask {
     ) -> Self
     where
         F: Fn(ImageId) -> Option<std::sync::Arc<InlineImage>>,
-        S: Fn(&Path, &StrokeStyle, &Matrix) -> TransformedStroke,
+        S: Fn(&Path, &StrokeStyle, &Matrix, Option<Rect>) -> TransformedStroke,
     {
-        self.transform_with_images_depth(matrix, resolve_image, transform_stroke, 0)
+        let mut memo = std::collections::HashMap::new();
+        self.transform_with_images_depth(matrix, resolve_image, transform_stroke, 0, &mut memo)
     }
 
     fn transform_with_images_depth<F, S>(
@@ -320,10 +323,11 @@ impl SoftMask {
         resolve_image: &F,
         transform_stroke: &S,
         depth: u8,
+        memo: &mut std::collections::HashMap<(*const DisplayList, u8), std::sync::Arc<DisplayList>>,
     ) -> Self
     where
         F: Fn(ImageId) -> Option<std::sync::Arc<InlineImage>>,
-        S: Fn(&Path, &StrokeStyle, &Matrix) -> TransformedStroke,
+        S: Fn(&Path, &StrokeStyle, &Matrix, Option<Rect>) -> TransformedStroke,
     {
         fn transform_rect(r: Rect, m: &Matrix) -> Rect {
             let corners = [
@@ -346,6 +350,35 @@ impl SoftMask {
                 r
             }
         }
+        fn path_local_bounds(path: &Path) -> Option<Rect> {
+            let mut x0 = f64::INFINITY;
+            let mut y0 = f64::INFINITY;
+            let mut x1 = f64::NEG_INFINITY;
+            let mut y1 = f64::NEG_INFINITY;
+            for p in path.points() {
+                if !p.x.is_finite() || !p.y.is_finite() {
+                    return None;
+                }
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+                .then(|| Rect::new(x0, y0, x1, y1))
+        }
+        fn intersect_clip(cur: Option<Rect>, next: Rect) -> Rect {
+            let n = next.normalize();
+            match cur {
+                Some(c) => {
+                    let c = c.normalize();
+                    let x0 = c.x0.max(n.x0);
+                    let y0 = c.y0.max(n.y0);
+                    Rect::new(x0, y0, c.x1.min(n.x1).max(x0), c.y1.min(n.y1).max(y0))
+                }
+                None => n,
+            }
+        }
         fn transform_paint(paint: &Paint, m: &Matrix) -> Paint {
             match paint {
                 Paint::Tiling(t) => Paint::Tiling(std::sync::Arc::new(TilingPattern {
@@ -360,8 +393,23 @@ impl SoftMask {
             }
         }
 
+        let ox = matrix.a * self.offset.0 as f64 + matrix.c * self.offset.1 as f64;
+        let oy = matrix.b * self.offset.0 as f64 + matrix.d * self.offset.1 as f64;
+        let memo_key = (std::sync::Arc::as_ptr(&self.commands), depth);
+        if let Some(cached) = memo.get(&memo_key) {
+            return SoftMask {
+                kind: self.kind,
+                commands: std::sync::Arc::clone(cached),
+                offset: (ox as f32, oy as f32),
+                backdrop_luma: self.backdrop_luma,
+                transfer: self.transfer.clone(),
+            };
+        }
+
         let mut dl = DisplayList::new(transform_rect(self.commands.page_rect, matrix));
         if depth < 8 {
+            let mut clip_stack: Vec<Option<Rect>> = Vec::new();
+            let mut cur_clip: Option<Rect> = None;
             for cmd in &self.commands.commands {
                 match cmd {
                     RenderCommand::FillPath {
@@ -383,7 +431,7 @@ impl SoftMask {
                         paint,
                         alpha,
                         overprint,
-                    } => match transform_stroke(path, style, matrix) {
+                    } => match transform_stroke(path, style, matrix, cur_clip) {
                         TransformedStroke::Filled(outline) => dl.push(RenderCommand::FillPath {
                             path: outline,
                             rule: FillRule::NonZero,
@@ -402,12 +450,34 @@ impl SoftMask {
                         }
                         TransformedStroke::Empty => {}
                     },
-                    RenderCommand::PushClip { path, rule } => dl.push(RenderCommand::PushClip {
-                        path: path.map_points(|p| p.transform(matrix)),
-                        rule: *rule,
-                    }),
+                    RenderCommand::PushClip { path, rule } => {
+                        clip_stack.push(cur_clip);
+                        if let Some(b) = path_local_bounds(path) {
+                            cur_clip = Some(intersect_clip(cur_clip, b));
+                        }
+                        dl.push(RenderCommand::PushClip {
+                            path: path.map_points(|p| p.transform(matrix)),
+                            rule: *rule,
+                        });
+                    }
                     RenderCommand::PushClipStroke { path, style } => {
-                        match transform_stroke(path, style, matrix) {
+                        clip_stack.push(cur_clip);
+                        let mapped = transform_stroke(path, style, matrix, cur_clip);
+                        if let Some(b) = path_local_bounds(path) {
+                            let reach = match style.join {
+                                LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0) as f64,
+                                _ => std::f64::consts::SQRT_2,
+                            };
+                            let w = if style.width.is_finite() && style.width > 0.0 {
+                                style.width as f64
+                            } else {
+                                1.0
+                            };
+                            let pad = w * 0.5 * reach.max(std::f64::consts::SQRT_2) + 1.0;
+                            let padded = Rect::new(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad);
+                            cur_clip = Some(intersect_clip(cur_clip, padded));
+                        }
+                        match mapped {
                             TransformedStroke::Filled(outline) => {
                                 dl.push(RenderCommand::PushClip {
                                     path: outline,
@@ -426,7 +496,10 @@ impl SoftMask {
                             }),
                         }
                     }
-                    RenderCommand::PopClip => dl.push(RenderCommand::PopClip),
+                    RenderCommand::PopClip => {
+                        cur_clip = clip_stack.pop().flatten();
+                        dl.push(RenderCommand::PopClip);
+                    }
                     RenderCommand::DrawImage(draw) => {
                         if let Some(image) = resolve_image(draw.image_id) {
                             dl.push(RenderCommand::DrawInlineImage(InlineImageDraw {
@@ -475,6 +548,7 @@ impl SoftMask {
                                 resolve_image,
                                 transform_stroke,
                                 depth + 1,
+                                memo,
                             )
                         }),
                     }),
@@ -482,11 +556,11 @@ impl SoftMask {
                 }
             }
         }
-        let ox = matrix.a * self.offset.0 as f64 + matrix.c * self.offset.1 as f64;
-        let oy = matrix.b * self.offset.0 as f64 + matrix.d * self.offset.1 as f64;
+        let commands = std::sync::Arc::new(dl);
+        memo.insert(memo_key, std::sync::Arc::clone(&commands));
         SoftMask {
             kind: self.kind,
-            commands: std::sync::Arc::new(dl),
+            commands,
             offset: (ox as f32, oy as f32),
             backdrop_luma: self.backdrop_luma,
             transfer: self.transfer.clone(),
@@ -3008,5 +3082,87 @@ mod tiling_backdrop_tests {
             segs[0].intersects_period(&pat, -1, 0),
             "copy reaching miter tip must intersect period"
         );
+    }
+
+    #[test]
+    fn soft_mask_transform_preserves_shared_nested_mask_allocation() {
+        let mut inner_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        inner_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let inner_arc = Arc::new(inner_dl);
+
+        let make_nested = || SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::clone(&inner_arc),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let mut outer_dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        for x in [0.0, 10.0] {
+            outer_dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(x, 0.0, x + 10.0, 10.0),
+                alpha: 1.0,
+                mask: Some(make_nested()),
+            });
+            outer_dl.push(RenderCommand::FillPath {
+                path: rect_path(x, 0.0, x + 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            outer_dl.push(RenderCommand::PopBlendGroup);
+        }
+
+        let outer_mask = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::new(outer_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+        let mapped = outer_mask.transform_with_images(
+            &Matrix::translate(15.0, 25.0),
+            &|_| None,
+            &|path, style, m, _| {
+                TransformedStroke::Stroked(path.map_points(|p| p.transform(m)), style.clone())
+            },
+        );
+        let nested_masks: Vec<&SoftMask> = mapped
+            .commands
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCommand::PushBlendGroup {
+                    mask: Some(sub), ..
+                } => Some(sub),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nested_masks.len(), 2);
+        assert!(
+            Arc::ptr_eq(&nested_masks[0].commands, &nested_masks[1].commands),
+            "two references to the same nested mask must share one transformed Arc<DisplayList>"
+        );
+        assert!(
+            !Arc::ptr_eq(&nested_masks[0].commands, &inner_arc),
+            "transformed nested mask must be distinct from the untransformed source"
+        );
+        let Some(RenderCommand::FillPath { path, .. }) = nested_masks[0].commands.commands.first()
+        else {
+            panic!("expected FillPath inside transformed nested mask");
+        };
+        let first_pt = path.points().first().expect("translated point");
+        assert!((first_pt.x - 15.0).abs() < 1e-6 && (first_pt.y - 25.0).abs() < 1e-6);
     }
 }
