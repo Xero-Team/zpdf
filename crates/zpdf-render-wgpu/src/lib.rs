@@ -1429,16 +1429,19 @@ fn record_dl_commands_at(
                         glyph_id,
                         images: cache,
                         placement_bounds,
-                    }) => (
-                        cache.get(draw.image_id),
-                        Some(record::Type3ImageKey {
-                            font_id,
-                            glyph_id,
-                            image_id: draw.image_id,
-                            stencil_tint: None,
-                            placement_bounds,
-                        }),
-                    ),
+                    }) => {
+                        let (is_dep, slot) = cache.type3_image_slot(draw.image_id);
+                        (
+                            cache.get(draw.image_id),
+                            Some(record::Type3ImageKey {
+                                font_id,
+                                glyph_id,
+                                image_id: slot,
+                                stencil_tint: None,
+                                placement_bounds: is_dep.then_some(placement_bounds).flatten(),
+                            }),
+                        )
+                    }
                     None => (None, None),
                 };
                 if let Some(img) = img.filter(|img| image::is_valid_decoded_image(img)) {
@@ -5024,6 +5027,209 @@ mod resource_tests {
             "second run quad must carry its own 0.25 opacity, got {}",
             last_v.color[3]
         );
+    }
+
+    #[test]
+    fn type3_repeated_glyph_shares_fixed_bitmap_while_keeping_unbounded_gradients_distinct() {
+        use std::sync::Arc;
+        use zpdf_core::{PdfDict, PdfName, PdfObject};
+        use zpdf_font::{
+            Type3Function, Type3ImageXObject, Type3Resources, Type3Shading, Type3XObject,
+        };
+
+        // Build a d0 CharProc with `/FontBBox [0 0 0 0]` painting BOTH an
+        // unbounded extended axial shading `/Fade sh` AND a fixed 512×512
+        // DeviceGray bitmap `/Im Do` (1 MiB RGBA texture). Across 3 distinct x
+        // placements, a 3 MiB texture quota fits 1 shared fixed bitmap (1 MiB)
+        // + 3 distinct gradient rasters (~1.4 MiB) ≈ 2.4 MiB, but NOT 3 copies
+        // of the fixed bitmap (~4.4 MiB).
+        let mut func_dict = PdfDict::new();
+        func_dict.insert(PdfName::new("FunctionType"), PdfObject::Integer(2));
+        func_dict.insert(
+            PdfName::new("Domain"),
+            PdfObject::Array(vec![PdfObject::Real(0.0), PdfObject::Real(1.0)]),
+        );
+        func_dict.insert(
+            PdfName::new("C0"),
+            PdfObject::Array(vec![
+                PdfObject::Real(1.0),
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.0),
+            ]),
+        );
+        func_dict.insert(
+            PdfName::new("C1"),
+            PdfObject::Array(vec![
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.0),
+                PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(PdfName::new("N"), PdfObject::Real(1.0));
+
+        let mut sh_dict = PdfDict::new();
+        sh_dict.insert(PdfName::new("ShadingType"), PdfObject::Integer(2));
+        sh_dict.insert(
+            PdfName::new("ColorSpace"),
+            PdfObject::Name(PdfName::new("DeviceRGB")),
+        );
+        sh_dict.insert(
+            PdfName::new("Coords"),
+            PdfObject::Array(vec![
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.0),
+                PdfObject::Real(500.0),
+                PdfObject::Real(0.0),
+            ]),
+        );
+        sh_dict.insert(
+            PdfName::new("Extend"),
+            PdfObject::Array(vec![PdfObject::Bool(true), PdfObject::Bool(true)]),
+        );
+
+        let mut im_dict = PdfDict::new();
+        im_dict.insert(
+            PdfName::new("Subtype"),
+            PdfObject::Name(PdfName::new("Image")),
+        );
+        im_dict.insert(PdfName::new("Width"), PdfObject::Integer(512));
+        im_dict.insert(PdfName::new("Height"), PdfObject::Integer(512));
+        im_dict.insert(PdfName::new("BitsPerComponent"), PdfObject::Integer(8));
+        im_dict.insert(
+            PdfName::new("ColorSpace"),
+            PdfObject::Name(PdfName::new("DeviceGray")),
+        );
+        let im_xobj = Arc::new(Type3ImageXObject {
+            dict: im_dict,
+            data: Arc::from(vec![128u8; 512 * 512]),
+            smask: None,
+            mask_stream: None,
+        });
+
+        let mut t3_res = Type3Resources::default();
+        t3_res.shadings.insert(
+            "Fade".into(),
+            Arc::new(Type3Shading {
+                dict: sh_dict,
+                stream_data: None,
+                functions: vec![Arc::new(Type3Function::Dict {
+                    dict: func_dict,
+                    children: Vec::new(),
+                })],
+            }),
+        );
+        t3_res
+            .xobjects
+            .insert("Im".into(), Type3XObject::Image(im_xobj));
+
+        let charproc = b"2500 0 d0 /Fade sh q 100 0 0 100 0 0 cm /Im Do Q";
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.04, 0.0, 0.0, 0.04, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    Arc::<[u8]>::from(&charproc[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![2500.0],
+                first_char: 0,
+            },
+            "Type3MixedGradientAndBitmap".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(2500.0),
+        )
+        .with_type3_resources(Arc::new(t3_res))
+        .with_type3_font_bbox(Rect::new(0.0, 0.0, 0.0, 0.0));
+        let mut fonts = zpdf_font::FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let glyphs: Vec<_> = [10.0f32, 40.0, 70.0]
+            .into_iter()
+            .map(|x| zpdf_display_list::PositionedGlyph {
+                glyph_id: 0,
+                x,
+                y: 0.0,
+                code: b'A' as u32,
+                code_len: 1,
+                advance: 30.0,
+            })
+            .collect();
+        let run = zpdf_display_list::GlyphRun {
+            font_id,
+            font_size: 1.0,
+            transform: zpdf_core::Matrix::identity(),
+            glyphs,
+            paint: Paint::Solid(zpdf_display_list::Color::black()),
+            alpha: 1.0,
+            h_scale: 1.0,
+            overprint: None,
+        };
+
+        let limits = zpdf_core::ParseLimits {
+            max_gpu_texture_bytes: 3 * 1024 * 1024, // fits 1×1 MiB bitmap + 3×~462 KiB gradients, NOT 3×1 MiB bitmaps
+            ..Default::default()
+        };
+        let page_rect = Rect::new(0.0, 0.0, 100.0, 20.0);
+        let map = PageMap::new(page_rect, 1.0);
+        let mut rec = PageRecorder::default()
+            .with_limits(&limits)
+            .with_page_rect(page_rect);
+        glyph::render_glyph_run(&mut rec, &fonts, &map, &run);
+        assert!(
+            rec.ensure_within_budget().is_ok(),
+            "3 placements sharing 1 fixed 512×512 bitmap + 3 distinct gradients must fit 3 MiB quota"
+        );
+        assert_eq!(
+            rec.type3_images.len(),
+            4,
+            "expected 1 shared fixed bitmap + 3 distinct gradient textures, got {}",
+            rec.type3_images.len()
+        );
+        let fixed_indices: Vec<usize> = rec
+            .type3_images
+            .iter()
+            .enumerate()
+            .filter_map(|(i, img)| (img.width == 512 && img.height == 512).then_some(i))
+            .collect();
+        assert_eq!(
+            fixed_indices.len(),
+            1,
+            "fixed 512×512 bitmap must be stored exactly once, got {fixed_indices:?}"
+        );
+        let fixed_key =
+            record::ImageKey::Cache(record::TYPE3_IMAGE_ID_BASE + fixed_indices[0] as u32);
+        let image_ops: Vec<record::ImageKey> = rec
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                record::PageOp::Image { image_id, .. } => Some(*image_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(image_ops.len(), 6, "3 placements × (1 gradient + 1 bitmap)");
+        let bitmap_draws = image_ops.iter().filter(|&&id| id == fixed_key).count();
+        assert_eq!(
+            bitmap_draws, 3,
+            "all 3 placements must reference the single shared fixed bitmap texture"
+        );
+        let gradient_keys: std::collections::HashSet<record::ImageKey> = image_ops
+            .iter()
+            .copied()
+            .filter(|&id| id != fixed_key)
+            .collect();
+        assert_eq!(
+            gradient_keys.len(),
+            3,
+            "all 3 gradient placements must retain distinct texture IDs"
+        );
+        let grad_imgs: Vec<&zpdf_image::DecodedImage> = rec
+            .type3_images
+            .iter()
+            .enumerate()
+            .filter_map(|(i, img)| (i != fixed_indices[0]).then_some(img))
+            .collect();
+        assert_ne!(grad_imgs[0].data, grad_imgs[1].data);
+        assert_ne!(grad_imgs[1].data, grad_imgs[2].data);
     }
 
     #[test]

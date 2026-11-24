@@ -16,6 +16,9 @@ pub struct ImageCache {
     images: HashMap<ImageId, DecodedImage>,
     next_id: ImageId,
     bytes_used: u64,
+    /// Image IDs whose pixel contents depended on placement bounds (e.g.
+    /// standalone Type 3 unclipped unbounded shadings with all-zero `/FontBBox`).
+    placement_dependent: Vec<ImageId>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,11 +40,43 @@ impl ImageCache {
             images: HashMap::new(),
             next_id: 0,
             bytes_used: 0,
+            placement_dependent: Vec::new(),
         }
     }
 
     pub fn get(&self, id: ImageId) -> Option<&DecodedImage> {
         self.images.get(&id)
+    }
+
+    /// Mark `id` as placement-dependent (e.g. a standalone Type 3 shading
+    /// rasterized against inverse-mapped destination bounds).
+    pub fn mark_placement_dependent(&mut self, id: ImageId) {
+        if !self.placement_dependent.contains(&id) {
+            self.placement_dependent.push(id);
+        }
+    }
+
+    /// True when `id` was marked placement-dependent.
+    pub fn is_placement_dependent(&self, id: ImageId) -> bool {
+        self.placement_dependent.contains(&id)
+    }
+
+    /// Return `(is_placement_dependent, category_ordinal)` for `id` within a
+    /// freshly interpreted Type 3 glyph `ImageCache`. Invariant bitmaps and
+    /// placement-dependent shading rasters are numbered independently (`0, 1,
+    /// ...`), so fixed bitmaps keep stable cache keys across placements even
+    /// when an unbounded shading is present in the same CharProc or skipped at
+    /// another placement.
+    pub fn type3_image_slot(&self, id: ImageId) -> (bool, u32) {
+        if self.placement_dependent.is_empty() {
+            return (false, id);
+        }
+        if let Some(pos) = self.placement_dependent.iter().position(|&p| p == id) {
+            (true, pos as u32)
+        } else {
+            let prior_dep = self.placement_dependent.iter().filter(|&&p| p < id).count() as u32;
+            (false, id.saturating_sub(prior_dep))
+        }
     }
 
     /// Remove and return an image from the cache.
@@ -52,6 +87,7 @@ impl ImageCache {
     /// unusable after this call.
     pub fn remove(&mut self, id: ImageId) -> Option<DecodedImage> {
         let image = self.images.remove(&id)?;
+        self.placement_dependent.retain(|&p| p != id);
         self.bytes_used = self
             .bytes_used
             .saturating_sub(u64::try_from(image.data.capacity()).unwrap_or(u64::MAX));

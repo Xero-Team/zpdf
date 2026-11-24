@@ -5450,12 +5450,18 @@ fn type3_unclipped_charproc_radial_shading_past_1000_units_matches_live() {
             "{label}: extended axial shading past x=1000 must be solid blue, got {far_right:?}"
         );
     }
-    if let Ok(axial_gpu) = render_gpu_shared(&axial_standalone_dl, Some(&axial_fonts), None, 1.0) {
-        let far_right = px(&axial_gpu.data, axial_gpu.width, 80, 10);
-        assert!(
-            far_right[0] < 15 && far_right[1] < 15 && far_right[2] > 240,
-            "axial standalone GPU: extended axial shading past x=1000 must be solid blue, got {far_right:?}"
-        );
+    match render_gpu_shared(&axial_standalone_dl, Some(&axial_fonts), None, 1.0) {
+        Ok(axial_gpu) => {
+            let far_right = px(&axial_gpu.data, axial_gpu.width, 80, 10);
+            assert!(
+                far_right[0] < 15 && far_right[1] < 15 && far_right[2] > 240,
+                "axial standalone GPU: extended axial shading past x=1000 must be solid blue, got {far_right:?}"
+            );
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU extended axial shading test (no adapter)");
+        }
+        Err(e) => panic!("GPU extended axial shading test failed: {e}"),
     }
 }
 
@@ -5840,11 +5846,17 @@ fn type3_all_zero_bbox_axial_two_placements_and_zero_scale_prefix_matches_live()
         cpu_far[0] < 15 && cpu_far[1] < 15 && cpu_far[2] > 240,
         "standalone CPU visible glyph after zero-scale occurrence must paint blue past x=1000, got {cpu_far:?}"
     );
-    if let Ok(gpu_zero) = render_gpu_shared(&standalone_zero, Some(&fonts), None, 1.0) {
-        let gpu_far = px(&gpu_zero.data, gpu_zero.width, 80, 10);
-        assert!(
-            gpu_far[0] < 15 && gpu_far[1] < 15 && gpu_far[2] > 240,
-            "standalone GPU visible glyph after zero-scale occurrence must paint blue past x=1000, got {gpu_far:?}"
-        );
+    match render_gpu_shared(&standalone_zero, Some(&fonts), None, 1.0) {
+        Ok(gpu_zero) => {
+            let gpu_far = px(&gpu_zero.data, gpu_zero.width, 80, 10);
+            assert!(
+                gpu_far[0] < 15 && gpu_far[1] < 15 && gpu_far[2] > 240,
+                "standalone GPU visible glyph after zero-scale occurrence must paint blue past x=1000, got {gpu_far:?}"
+            );
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU zero-scale prefix test (no adapter)");
+        }
+        Err(e) => panic!("GPU zero-scale prefix test failed: {e}"),
     }
 }

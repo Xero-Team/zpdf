@@ -5837,12 +5837,15 @@ impl<'a> SvgWriter<'a> {
                             max_x = max_x.max(ix1);
                             max_y = max_y.max(iy1);
                             let tint = [white.r, white.g, white.b, white.a].map(f32::to_bits);
+                            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
                             let key = ImageDefKey::Type3Stencil {
                                 font: run.font_id,
                                 glyph: glyph.glyph_id,
-                                image: draw.image_id,
+                                image: slot,
                                 tint,
-                                placement_bounds: program.placement_bounds,
+                                placement_bounds: is_dep
+                                    .then_some(program.placement_bounds)
+                                    .flatten(),
                             };
                             self.place_image(key, image, Some(&white), &transform, alpha);
                         } else {
@@ -5856,12 +5859,15 @@ impl<'a> SvgWriter<'a> {
                                 &mut max_y,
                                 &mut cur_pad,
                             );
+                            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
                             let key = ImageDefKey::Type3Stencil {
                                 font: run.font_id,
                                 glyph: glyph.glyph_id,
-                                image: draw.image_id,
+                                image: slot,
                                 tint: [u32::MAX; 4],
-                                placement_bounds: program.placement_bounds,
+                                placement_bounds: is_dep
+                                    .then_some(program.placement_bounds)
+                                    .flatten(),
                             };
                             let bounds = SvgRect::from_bounds_clamped(
                                 ix0,
@@ -6672,23 +6678,29 @@ impl<'a> SvgWriter<'a> {
                             // The glyph interpreter paints stencils in its
                             // default black; the text colour is the paint.
                             let tint = [color.r, color.g, color.b, color.a].map(f32::to_bits);
+                            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
                             let key = ImageDefKey::Type3Stencil {
                                 font: run.font_id,
                                 glyph: glyph.glyph_id,
-                                image: draw.image_id,
+                                image: slot,
                                 tint,
-                                placement_bounds: program.placement_bounds,
+                                placement_bounds: is_dep
+                                    .then_some(program.placement_bounds)
+                                    .flatten(),
                             };
                             self.place_image(key, image, Some(color), &transform, alpha * opacity);
                         } else {
                             // A coloured (`d0`) glyph's image keeps its own
                             // colours; cache it per glyph like a stencil.
+                            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
                             let key = ImageDefKey::Type3Stencil {
                                 font: run.font_id,
                                 glyph: glyph.glyph_id,
-                                image: draw.image_id,
+                                image: slot,
                                 tint: [u32::MAX; 4],
-                                placement_bounds: program.placement_bounds,
+                                placement_bounds: is_dep
+                                    .then_some(program.placement_bounds)
+                                    .flatten(),
                             };
                             self.place_image(key, image, None, &transform, alpha * opacity);
                         }
@@ -6743,12 +6755,13 @@ impl<'a> SvgWriter<'a> {
                 );
                 return;
             };
+            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
             self.place_image(
                 ImageDefKey::Type3MaskImage {
                     font: font_id,
                     glyph: glyph_id,
-                    image: draw.image_id,
-                    placement_bounds: program.placement_bounds,
+                    image: slot,
+                    placement_bounds: is_dep.then_some(program.placement_bounds).flatten(),
                 },
                 image,
                 None,
@@ -14526,6 +14539,223 @@ mod tests {
         assert!(
             far_right.red() < 15 && far_right.green() < 15 && far_right.blue() > 240,
             "SVG visible occurrence after zero-scale glyph must paint blue past x=1000, got {far_right:?}"
+        );
+    }
+
+    #[test]
+    fn svg_type3_mixed_fixed_bitmap_and_unbounded_axial_shares_bitmap_def() {
+        use std::sync::Arc;
+        use zpdf_font::{
+            Type3Function, Type3ImageXObject, Type3Resources, Type3Shading, Type3XObject,
+        };
+
+        let mut func_dict = zpdf_core::PdfDict::new();
+        func_dict.insert(
+            zpdf_core::PdfName::new("FunctionType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("Domain"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C0"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(1.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C1"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("N"),
+            zpdf_core::PdfObject::Real(1.0),
+        );
+        let mut sh_dict = zpdf_core::PdfDict::new();
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ShadingType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Coords"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(500.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Extend"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Bool(true),
+                zpdf_core::PdfObject::Bool(true),
+            ]),
+        );
+        let mut im_dict = zpdf_core::PdfDict::new();
+        im_dict.insert(
+            zpdf_core::PdfName::new("Subtype"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Image")),
+        );
+        im_dict.insert(
+            zpdf_core::PdfName::new("Width"),
+            zpdf_core::PdfObject::Integer(4),
+        );
+        im_dict.insert(
+            zpdf_core::PdfName::new("Height"),
+            zpdf_core::PdfObject::Integer(4),
+        );
+        im_dict.insert(
+            zpdf_core::PdfName::new("BitsPerComponent"),
+            zpdf_core::PdfObject::Integer(8),
+        );
+        im_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+        );
+        let green_rgb: Vec<u8> = [0u8, 255, 0].into_iter().cycle().take(4 * 4 * 3).collect();
+        let im_xobj = Arc::new(Type3ImageXObject {
+            dict: im_dict,
+            data: Arc::from(green_rgb),
+            smask: None,
+            mask_stream: None,
+        });
+
+        let mut t3_res = Type3Resources::default();
+        t3_res.shadings.insert(
+            "Fade".into(),
+            Arc::new(Type3Shading {
+                dict: sh_dict,
+                stream_data: None,
+                functions: vec![Arc::new(Type3Function::Dict {
+                    dict: func_dict,
+                    children: Vec::new(),
+                })],
+            }),
+        );
+        t3_res
+            .xobjects
+            .insert("Im".into(), Type3XObject::Image(im_xobj));
+
+        // Paint unbounded axial shading plus a small green bitmap badge at glyph [0..100, 0..100]
+        // (4×4 page units at glyph origin).
+        let charproc = b"2500 0 d0 /Fade sh q 100 0 0 100 0 0 cm /Im Do Q";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.04, 0.0, 0.0, 0.04, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![2500.0],
+                first_char: 0,
+            },
+            "MixedGradientBitmapSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(2500.0),
+        )
+        .with_type3_resources(Arc::new(t3_res))
+        .with_type3_font_bbox(Rect::new(0.0, 0.0, 0.0, 0.0));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        dl.push(RenderCommand::PushClip {
+            path: rect_path(0.0, 0.0, 40.0, 20.0),
+            rule: FillRule::NonZero,
+        });
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 10.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        dl.push(RenderCommand::PopClip);
+        dl.push(RenderCommand::PushClip {
+            path: rect_path(50.0, 0.0, 100.0, 20.0),
+            rule: FillRule::NonZero,
+        });
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 70.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        dl.push(RenderCommand::PopClip);
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        // 1 shared PNG def for `/Im Do` + 2 distinct PNG defs for the two gradient placements.
+        let image_def_count = svg.matches("<image id=\"").count();
+        assert_eq!(
+            image_def_count, 3,
+            "SVG must share 1 fixed bitmap <image> def while keeping 2 distinct gradient defs, got {image_def_count}"
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(100, 20).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(
+                100.0 / tree.size().width(),
+                20.0 / tree.size().height(),
+            ),
+            &mut pixmap.as_mut(),
+        );
+        // Both green badges at y = 18 (page y = 2, inside [0..4]): x = 12 and x = 72.
+        let badge1 = pixmap.pixel(12, 18).expect("badge1");
+        let badge2 = pixmap.pixel(72, 18).expect("badge2");
+        assert!(
+            badge1.green() > 240 && badge1.red() < 15 && badge1.blue() < 15,
+            "placement 1 fixed bitmap badge must be green, got {badge1:?}"
+        );
+        assert!(
+            badge2.green() > 240 && badge2.red() < 15 && badge2.blue() < 15,
+            "placement 2 fixed bitmap badge must be green, got {badge2:?}"
+        );
+        // Gradient colors on placement 2: x = 55 must be red, x = 95 must be blue.
+        let p2_red = pixmap.pixel(55, 10).expect("p2_red");
+        let p2_blue = pixmap.pixel(95, 10).expect("p2_blue");
+        assert!(
+            p2_red.red() > 240 && p2_red.blue() < 15,
+            "placement 2 left gradient must remain red, got {p2_red:?}"
+        );
+        assert!(
+            p2_blue.red() < 15 && p2_blue.blue() > 240,
+            "placement 2 right gradient must remain blue, got {p2_blue:?}"
         );
     }
 }

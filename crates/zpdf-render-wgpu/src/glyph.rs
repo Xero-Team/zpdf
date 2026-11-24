@@ -627,12 +627,13 @@ fn render_type3(
                             eff_alpha,
                         );
                         if crate::image::is_safe_quad(&quad) {
+                            let (is_dep, slot) = glyph_images.type3_image_slot(draw.image_id);
                             let key = Type3ImageKey {
                                 font_id: run.font_id,
                                 glyph_id: g.glyph_id,
-                                image_id: draw.image_id,
+                                image_id: slot,
                                 stencil_tint: Some([r_s.to_bits(), g_s.to_bits(), b_s.to_bits()]),
-                                placement_bounds,
+                                placement_bounds: is_dep.then_some(placement_bounds).flatten(),
                             };
                             rec.add_type3_image_cached(key, quad, || {
                                 let mut tinted = src_img.clone();
@@ -665,12 +666,13 @@ fn render_type3(
                             eff_alpha,
                         );
                         if crate::image::is_safe_quad(&quad) {
+                            let (is_dep, slot) = glyph_images.type3_image_slot(draw.image_id);
                             let key = Type3ImageKey {
                                 font_id: run.font_id,
                                 glyph_id: g.glyph_id,
-                                image_id: draw.image_id,
+                                image_id: slot,
                                 stencil_tint: None,
-                                placement_bounds,
+                                placement_bounds: is_dep.then_some(placement_bounds).flatten(),
                             };
                             rec.add_type3_image_cached(key, quad, || src_img.clone());
                         }
@@ -1044,12 +1046,13 @@ pub fn render_type3_tiling_transformed(
                                 max_px = max_px.max(v.pos[0]);
                                 max_py = max_py.max(v.pos[1]);
                             }
+                            let (is_dep, slot) = glyph_images.type3_image_slot(draw.image_id);
                             let key = Type3ImageKey {
                                 font_id: run.font_id,
                                 glyph_id: g.glyph_id,
-                                image_id: draw.image_id,
+                                image_id: slot,
                                 stencil_tint: white_tint,
-                                placement_bounds,
+                                placement_bounds: is_dep.then_some(placement_bounds).flatten(),
                             };
                             if rec.record_subops_clipped_into(&mut mask_ops, |r| {
                                 r.add_type3_image_cached(key, quad, || {
@@ -1086,12 +1089,13 @@ pub fn render_type3_tiling_transformed(
                             eff_alpha,
                         );
                         if crate::image::is_safe_quad(&quad) {
+                            let (is_dep, slot) = glyph_images.type3_image_slot(draw.image_id);
                             let key = Type3ImageKey {
                                 font_id: run.font_id,
                                 glyph_id: g.glyph_id,
-                                image_id: draw.image_id,
+                                image_id: slot,
                                 stencil_tint: None,
-                                placement_bounds,
+                                placement_bounds: is_dep.then_some(placement_bounds).flatten(),
                             };
                             rec.add_type3_image_cached(key, quad, || src_img.clone());
                         }

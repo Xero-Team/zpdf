@@ -4631,6 +4631,7 @@ impl<'a> ContentInterpreter<'a> {
                     .saturating_add(1);
                 return;
             };
+            let mut used_dest_bounds = false;
             let mut region = if self.current.clip_bounds.is_some() {
                 self.shading_region()
             } else if let Some(sb) = def.bbox {
@@ -4647,12 +4648,14 @@ impl<'a> ContentInterpreter<'a> {
                 self.shading_region()
             } else if let Some(dest) = self.type3_fallback_bounds {
                 self.stats.type3_used_dest_bounds = true;
+                used_dest_bounds = true;
                 dest
             } else {
                 // Unresolved shading extent (unknown `/FontBBox` with no finite
                 // geometry, `/BBox`, or invertible destination bounds): keep
                 // this provisional program out of placement-independent caches.
                 self.stats.type3_used_dest_bounds = true;
+                used_dest_bounds = true;
                 let base = self.display_list.page_rect.normalize();
                 match def.coords_bounds() {
                     Some(cb) => Rect::new(
@@ -4680,7 +4683,7 @@ impl<'a> ContentInterpreter<'a> {
             if region.width() <= 0.0 || region.height() <= 0.0 {
                 return;
             }
-            self.emit_shading_image(&def, region);
+            self.emit_shading_image_with_placement(&def, region, used_dest_bounds);
             return;
         }
         let (sh_obj, cache_id) = match self.lookup_res(|r| {
@@ -4744,6 +4747,15 @@ impl<'a> ContentInterpreter<'a> {
     /// detail while placing the image in cell coordinates. Returns `true` when
     /// an image command was emitted.
     fn emit_shading_image(&mut self, def: &crate::shading::ShadingDef, region: Rect) -> bool {
+        self.emit_shading_image_with_placement(def, region, false)
+    }
+
+    fn emit_shading_image_with_placement(
+        &mut self,
+        def: &crate::shading::ShadingDef,
+        region: Rect,
+        placement_dependent: bool,
+    ) -> bool {
         if self.skip_images || region.width() <= 0.0 || region.height() <= 0.0 {
             return false;
         }
@@ -4842,6 +4854,11 @@ impl<'a> ContentInterpreter<'a> {
         let Some(image_id) = self.admit_image(image) else {
             return false;
         };
+        if placement_dependent {
+            if let Some(cache) = self.image_cache.as_deref_mut() {
+                cache.mark_placement_dependent(image_id);
+            }
+        }
         if let Some(clip_path) = bbox_clip_path {
             self.display_list.push(RenderCommand::PushClip {
                 path: clip_path,
