@@ -875,9 +875,8 @@ fn type3_inline_image_ordinal_advances_across_oc_hidden_images() {
 
 #[test]
 fn type3_bitmap_stencil_renders_when_caller_supplies_only_fonts() {
-    // Bitmap Type 3 glyph (/IM true stencil). Callers that pass only
-    // `with_fonts` (omitting `with_images`) must still preserve the stencil
-    // via a DrawGlyphRun fallback so CpuRenderer's private cache paints it.
+    // 1. Pure bitmap Type 3 glyph (/IM true stencil) with only `with_fonts`
+    //    (omitting both `with_images` and `with_document`).
     let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
         800 0 0 800 0 0 cm\n\
         BI /IM true /W 1 /H 1 /BPC 1 ID "
@@ -915,8 +914,14 @@ fn type3_bitmap_stencil_renders_when_caller_supplies_only_fonts() {
     assert!(
         dl.commands
             .iter()
+            .any(|c| matches!(c, zpdf::display_list::RenderCommand::DrawInlineImage(_))),
+        "bitmap Type 3 glyph without image_cache must emit DrawInlineImage"
+    );
+    assert!(
+        !dl.commands
+            .iter()
             .any(|c| matches!(c, zpdf::display_list::RenderCommand::DrawGlyphRun(_))),
-        "bitmap Type 3 glyph without image_cache must fall back to DrawGlyphRun"
+        "bitmap Type 3 glyph must not fall back to DrawGlyphRun"
     );
     let rendered = zpdf::cpu::CpuRenderer::new()
         .with_fonts(&fonts)
@@ -925,6 +930,122 @@ fn type3_bitmap_stencil_renders_when_caller_supplies_only_fonts() {
 
     assert_eq!(px(&rendered, 35, 35), [255, 0, 0], "first bitmap stencil");
     assert_eq!(px(&rendered, 85, 35), [255, 0, 0], "second bitmap stencil");
+
+    // 2. Mixed glyphs with `with_fonts` + `with_document` (still omitting
+    //    `with_images`): each CharProc paints both a Form XObject from the
+    //    Type 3 font's `/Resources` and an overlapping inline `/ImageMask`
+    //    stencil, in both paint orders (`Form -> stencil` and `stencil -> Form`).
+    //    Both marks must be preserved in exact paint order.
+    let mut glyph_form_then_stencil = b"1000 0 d0\n\
+        /FmGreen Do\n\
+        q 700 0 0 1000 300 0 cm BI /IM true /W 1 /H 1 /BPC 1 ID "
+        .to_vec();
+    glyph_form_then_stencil.push(0x00);
+    glyph_form_then_stencil.extend_from_slice(b"\nEI Q");
+
+    let mut glyph_stencil_then_form = b"1000 0 d0\n\
+        q 700 0 0 1000 0 0 cm BI /IM true /W 1 /H 1 /BPC 1 ID "
+        .to_vec();
+    glyph_stencil_then_form.push(0x00);
+    glyph_stencil_then_form.extend_from_slice(b"\nEI Q\n/FmBlue Do");
+
+    let form_green = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 1000 1000]",
+        b"0 1 0 rg 0 0 700 1000 re f",
+    );
+    let form_blue = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 1000 1000]",
+        b"0 0 1 rg 300 0 700 1000 re f",
+    );
+    let mixed_content = b"1 0 0 rg BT /F1 100 Tf 10 0 Td (A) Tj 110 0 Td (B) Tj ET";
+    let mixed_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 100] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", mixed_content),                 // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 66 /Widths [1000 1000] \
+          /Resources << /XObject << /FmGreen 10 0 R /FmBlue 11 0 R >> >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R /B 9 0 R >>".to_vec(),           // 6
+        b"<< /Type /Encoding /Differences [65 /A /B] >>".to_vec(), // 7
+        stream_obj("", &glyph_form_then_stencil),      // 8
+        stream_obj("", &glyph_stencil_then_form),      // 9
+        form_green,                                    // 10
+        form_blue,                                     // 11
+    ]);
+
+    let mixed_doc = PdfDocument::open(mixed_pdf).expect("open mixed pdf");
+    let mixed_page = mixed_doc.page(0).expect("mixed page 0");
+    let mut mixed_fonts = mixed_doc.load_page_fonts(&mixed_page);
+    let mixed_bytes = mixed_doc
+        .page_content_bytes(&mixed_page)
+        .expect("mixed content bytes");
+
+    // Supply fonts + document, deliberately omitting `with_images`.
+    let mixed_dl = ContentInterpreter::new(mixed_page.media_box)
+        .with_fonts(&mut mixed_fonts)
+        .with_document(mixed_doc.file(), &mixed_page.resources)
+        .interpret(&mixed_bytes);
+
+    assert!(
+        !mixed_dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, zpdf::display_list::RenderCommand::DrawGlyphRun(_))),
+        "mixed Form+stencil Type 3 glyph must not truncate and fall back to DrawGlyphRun"
+    );
+    assert_eq!(
+        mixed_dl
+            .commands
+            .iter()
+            .filter(|c| matches!(c, zpdf::display_list::RenderCommand::DrawInlineImage(_)))
+            .count(),
+        2,
+        "both glyphs must emit their inline stencil via DrawInlineImage"
+    );
+
+    let mixed_rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&mixed_fonts)
+        .render_display_list(&mixed_dl, 1.0)
+        .expect("cpu render mixed");
+
+    // Glyph A at x in [10..110]: green Form [10..80], then red stencil [40..110].
+    assert_eq!(
+        px(&mixed_rendered, 25, 50),
+        [0, 255, 0],
+        "glyph A: Form XObject mark from font /Resources must be preserved"
+    );
+    assert_eq!(
+        px(&mixed_rendered, 60, 50),
+        [255, 0, 0],
+        "glyph A: inline stencil painted after Form must cover overlap"
+    );
+    assert_eq!(
+        px(&mixed_rendered, 95, 50),
+        [255, 0, 0],
+        "glyph A: inline stencil mark must be preserved"
+    );
+
+    // Glyph B at x in [120..220]: red stencil [120..190], then blue Form [150..220].
+    assert_eq!(
+        px(&mixed_rendered, 135, 50),
+        [255, 0, 0],
+        "glyph B: inline stencil mark must be preserved"
+    );
+    assert_eq!(
+        px(&mixed_rendered, 170, 50),
+        [0, 0, 255],
+        "glyph B: Form XObject painted after inline stencil must cover overlap"
+    );
+    assert_eq!(
+        px(&mixed_rendered, 205, 50),
+        [0, 0, 255],
+        "glyph B: Form XObject mark from font /Resources must be preserved"
+    );
 }
 
 #[test]

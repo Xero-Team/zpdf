@@ -1540,7 +1540,8 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             zpdf::display_list::RenderCommand::StrokePath { .. } => strokes += 1,
             zpdf::display_list::RenderCommand::DrawGlyphRun(_) => glyphs += 1,
             zpdf::display_list::RenderCommand::PushClip { .. } => clips += 1,
-            zpdf::display_list::RenderCommand::DrawImage(_) => images += 1,
+            zpdf::display_list::RenderCommand::DrawImage(_)
+            | zpdf::display_list::RenderCommand::DrawInlineImage(_) => images += 1,
             _ => {}
         }
     }

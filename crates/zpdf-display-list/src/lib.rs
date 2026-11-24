@@ -105,6 +105,9 @@ pub enum RenderCommand {
     },
     DrawGlyphRun(GlyphRun),
     DrawImage(ImageDraw),
+    /// Self-contained inline bitmap draw (for example, a Type 3 CharProc
+    /// inline image expanded without an external `ImageCache`).
+    DrawInlineImage(InlineImageDraw),
     PushClip {
         path: Path,
         rule: FillRule,
@@ -432,6 +435,26 @@ pub struct ImageDraw {
     pub alpha: f32,
     /// True only when the source image is a PDF `/ImageMask` stencil.
     pub is_image_mask: bool,
+}
+
+/// Self-contained decoded RGBA8 bitmap carried directly on a
+/// [`RenderCommand::DrawInlineImage`].
+#[derive(Debug, Clone)]
+pub struct InlineImage {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+    pub has_alpha: bool,
+    /// True only when the source image is a PDF `/ImageMask` stencil.
+    pub is_image_mask: bool,
+    pub premultiplied: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineImageDraw {
+    pub image: std::sync::Arc<InlineImage>,
+    pub transform: Matrix,
+    pub alpha: f32,
 }
 
 // -- Blend --

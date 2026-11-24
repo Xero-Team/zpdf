@@ -1525,6 +1525,7 @@ impl<'a> CpuRenderer<'a> {
             } => self.render_stroke(path, style, paint, *alpha),
             RenderCommand::DrawGlyphRun(run) => self.render_glyph_run(run),
             RenderCommand::DrawImage(draw) => self.render_image(draw),
+            RenderCommand::DrawInlineImage(draw) => self.render_inline_image(draw),
             _ => {}
         }
     }
@@ -1546,6 +1547,7 @@ impl<'a> CpuRenderer<'a> {
             } => self.render_stroke(path, style, paint, 1.0),
             RenderCommand::DrawGlyphRun(run) => self.render_glyph_run_with_alpha(run, 1.0),
             RenderCommand::DrawImage(draw) => self.render_image_with_alpha(draw, 1.0),
+            RenderCommand::DrawInlineImage(draw) => self.render_inline_image_with_alpha(draw, 1.0),
             _ => {}
         }
     }
@@ -1959,6 +1961,21 @@ impl<'a> CpuRenderer<'a> {
         self.render_image_from_cache(image_cache, draw, alpha_override, true);
     }
 
+    fn render_inline_image(&mut self, draw: &InlineImageDraw) {
+        self.render_inline_image_with_alpha(draw, draw.alpha);
+    }
+
+    fn render_inline_image_with_alpha(&mut self, draw: &InlineImageDraw, alpha_override: f32) {
+        self.render_rgba_image(
+            draw.image.width,
+            draw.image.height,
+            &draw.image.data,
+            &draw.transform,
+            alpha_override,
+            None,
+        );
+    }
+
     fn render_image_from_cache(
         &mut self,
         image_cache: &ImageCache,
@@ -1970,22 +1987,41 @@ impl<'a> CpuRenderer<'a> {
             Some(img) => img,
             None => return,
         };
-        let Some(expected_len) = (image.width as usize)
-            .checked_mul(image.height as usize)
+        self.render_rgba_image(
+            image.width,
+            image.height,
+            &image.data,
+            &draw.transform,
+            alpha_override,
+            cache_downscaled.then_some(draw.image_id),
+        );
+    }
+
+    fn render_rgba_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        draw_transform: &zpdf_core::Matrix,
+        alpha_override: f32,
+        downscale_cache_id: Option<ImageId>,
+    ) {
+        let Some(expected_len) = (width as usize)
+            .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
         else {
             tracing::warn!(
-                image_id = draw.image_id,
+                image_id = ?downscale_cache_id,
                 "skipping overflowing image dimensions"
             );
             return;
         };
-        if image.width == 0 || image.height == 0 || image.data.len() != expected_len {
+        if width == 0 || height == 0 || data.len() != expected_len {
             tracing::warn!(
-                image_id = draw.image_id,
-                width = image.width,
-                height = image.height,
-                bytes = image.data.len(),
+                image_id = ?downscale_cache_id,
+                width,
+                height,
+                bytes = data.len(),
                 "skipping malformed decoded image"
             );
             return;
@@ -2014,7 +2050,7 @@ impl<'a> CpuRenderer<'a> {
         // Composed into a single affine in image-pixel coordinates:
         //   screen_x = (a*s/iw)*ix + (-c*s/ih)*iy + (c + e - x0)*s
         //   screen_y = (-b*s/iw)*ix + (d*s/ih)*iy + (y1 - d - f)*s
-        let tm = &draw.transform;
+        let tm = draw_transform;
         let s = self.scale;
         let (a, b, c, d, e, f) = (
             tm.a as f32,
@@ -2031,44 +2067,32 @@ impl<'a> CpuRenderer<'a> {
         // An interpreter given `with_image_downscale` at this scale has already
         // applied the same rule, so its images arrive at their target size.
         let mut downscaled: Option<(Arc<[u8]>, u32, u32)> = None;
-        if let Some((tw, th)) =
-            zpdf_image::box_filter_size(&draw.transform, s, image.width, image.height)
-        {
-            let key = (draw.image_id, tw, th);
-            let data = if cache_downscaled {
-                if let Some(data) = self.downscaled_images.get(&key) {
-                    Arc::clone(data)
+        if let Some((tw, th)) = zpdf_image::box_filter_size(draw_transform, s, width, height) {
+            let scaled = if let Some(image_id) = downscale_cache_id {
+                let key = (image_id, tw, th);
+                if let Some(cached) = self.downscaled_images.get(&key) {
+                    Arc::clone(cached)
                 } else {
-                    let data: Arc<[u8]> = Arc::from(zpdf_image::box_downscale_rgba(
-                        &image.data,
-                        image.width,
-                        image.height,
-                        tw,
-                        th,
-                    ));
+                    let scaled: Arc<[u8]> =
+                        Arc::from(zpdf_image::box_downscale_rgba(data, width, height, tw, th));
                     let retained: usize = self.downscaled_images.values().map(|d| d.len()).sum();
-                    if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
-                        if retained.saturating_add(data.len()) > MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                    if scaled.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                        if retained.saturating_add(scaled.len()) > MAX_DOWNSCALED_IMAGE_CACHE_BYTES
+                        {
                             self.downscaled_images.clear();
                         }
-                        self.downscaled_images.insert(key, Arc::clone(&data));
+                        self.downscaled_images.insert(key, Arc::clone(&scaled));
                     }
-                    data
+                    scaled
                 }
             } else {
-                Arc::from(zpdf_image::box_downscale_rgba(
-                    &image.data,
-                    image.width,
-                    image.height,
-                    tw,
-                    th,
-                ))
+                Arc::from(zpdf_image::box_downscale_rgba(data, width, height, tw, th))
             };
-            downscaled = Some((data, tw, th));
+            downscaled = Some((scaled, tw, th));
         }
         let (data, w, h) = match &downscaled {
-            Some((data, w, h)) => (data.as_ref(), *w, *h),
-            None => (image.data.as_slice(), image.width, image.height),
+            Some((scaled, w, h)) => (scaled.as_ref(), *w, *h),
+            None => (data, width, height),
         };
         let src = match tiny_skia::PixmapRef::from_bytes(data, w, h) {
             Some(p) => p,
@@ -2924,6 +2948,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
                     | RenderCommand::StrokePath { .. }
                     | RenderCommand::DrawGlyphRun(_)
                     | RenderCommand::DrawImage(_)
+                    | RenderCommand::DrawInlineImage(_)
             )
         {
             self.knockout_paint(cmd);
@@ -2942,7 +2967,8 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             RenderCommand::FillPath { .. }
             | RenderCommand::StrokePath { .. }
             | RenderCommand::DrawGlyphRun(_)
-            | RenderCommand::DrawImage(_) => {
+            | RenderCommand::DrawImage(_)
+            | RenderCommand::DrawInlineImage(_) => {
                 self.render_paint_cmd(cmd);
             }
             RenderCommand::PushClip { path, rule } => {

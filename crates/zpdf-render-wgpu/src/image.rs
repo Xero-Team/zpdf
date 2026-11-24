@@ -67,13 +67,17 @@ pub fn image_quad(iw: f32, ih: f32, tm: &Matrix, map: &PageMap, alpha: f32) -> [
     ]
 }
 
-pub fn is_valid_decoded_image(img: &DecodedImage) -> bool {
-    img.width > 0
-        && img.height > 0
-        && (img.width as usize)
-            .checked_mul(img.height as usize)
+pub fn is_valid_rgba_image(width: u32, height: u32, data_len: usize) -> bool {
+    width > 0
+        && height > 0
+        && (width as usize)
+            .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
-            == Some(img.data.len())
+            == Some(data_len)
+}
+
+pub fn is_valid_decoded_image(img: &DecodedImage) -> bool {
+    is_valid_rgba_image(img.width, img.height, img.data.len())
 }
 
 pub fn is_safe_quad(quad: &[TexturedVertex; 4]) -> bool {
@@ -89,9 +93,19 @@ pub fn is_safe_quad(quad: &[TexturedVertex; 4]) -> bool {
 /// (group 1: texture + the shared bilinear sampler). Bytes are uploaded verbatim —
 /// no host premultiply (the shader/blend reproduce the CPU's compositing).
 pub fn upload_image_bind_group(ctx: &GpuContext, img: &DecodedImage) -> wgpu::BindGroup {
+    upload_rgba_bind_group(ctx, img.width, img.height, &img.data)
+}
+
+/// Upload raw RGBA8 pixels to an `Rgba8Unorm` texture and build its bind group.
+pub fn upload_rgba_bind_group(
+    ctx: &GpuContext,
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> wgpu::BindGroup {
     let size = wgpu::Extent3d {
-        width: img.width,
-        height: img.height,
+        width,
+        height,
         depth_or_array_layers: 1,
     };
     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -112,11 +126,11 @@ pub fn upload_image_bind_group(ctx: &GpuContext, img: &DecodedImage) -> wgpu::Bi
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &img.data,
+        data,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(img.width * 4),
-            rows_per_image: Some(img.height),
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
         },
         size,
     );

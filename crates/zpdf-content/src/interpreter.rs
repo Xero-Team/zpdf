@@ -154,17 +154,24 @@ pub struct ContentInterpreter<'a> {
     /// used to deduplicate repeated inline bitmap images (e.g. TeX Type 3
     /// glyphs) into a single `ImageId` per `(glyph, colour, footprint)`.
     type3_inline_ctx: Option<(FontId, u16, u32)>,
-    /// Set when a visible inline image inside the active Type 3 CharProc was
-    /// skipped because the caller omitted `with_images`, triggering a fallback
-    /// `DrawGlyphRun` so backends with private Type 3 image caches still paint
-    /// bitmap stencils.
-    type3_dropped_inline_image: bool,
-    /// Deduplication cache for inline images decoded inside Type 3 glyphs.
+    /// Deduplication cache for inline images decoded inside Type 3 glyphs when
+    /// an external `ImageCache` is supplied.
     #[allow(clippy::type_complexity)]
     type3_inline_image_cache: HashMap<
         (FontId, u16, u32, Type3InlineColorKey, (u32, u32)),
         (zpdf_display_list::ImageId, bool),
     >,
+    /// Deduplication cache for Type 3 inline images embedded directly on
+    /// `RenderCommand::DrawInlineImage` when no external `ImageCache` was
+    /// supplied.
+    #[allow(clippy::type_complexity)]
+    type3_inline_fallback_cache: HashMap<
+        (FontId, u16, u32, Type3InlineColorKey, (u32, u32)),
+        std::sync::Arc<zpdf_display_list::InlineImage>,
+    >,
+    /// Decoded RGBA bytes retained by `DrawInlineImage` commands emitted
+    /// without an external `ImageCache`, charged against `max_image_cache_bytes`.
+    type3_inline_fallback_bytes: u64,
     /// `Q` must never pop the state stack below this index — a form XObject
     /// raises it past its own saved state so an unbalanced `Q` inside the
     /// form cannot corrupt the page-level state.
@@ -1027,8 +1034,9 @@ impl<'a> ContentInterpreter<'a> {
             type3_font_resources: HashMap::new(),
             type3_glyph_resources: HashMap::new(),
             type3_inline_ctx: None,
-            type3_dropped_inline_image: false,
             type3_inline_image_cache: HashMap::new(),
+            type3_inline_fallback_cache: HashMap::new(),
+            type3_inline_fallback_bytes: 0,
             state_floor: 0,
             text_sink: None,
             span_streams: None,
@@ -5016,6 +5024,7 @@ impl<'a> ContentInterpreter<'a> {
             .as_ref()
             .map_or(0, |cache| cache.bytes_used())
             .saturating_add(self.retained_image_bytes)
+            .saturating_add(self.type3_inline_fallback_bytes)
             .saturating_add(bytes)
             <= self.max_image_cache_bytes
     }
@@ -5034,10 +5043,24 @@ impl<'a> ContentInterpreter<'a> {
         }));
     }
 
+    fn emit_inline_image_draw(
+        &mut self,
+        image: std::sync::Arc<zpdf_display_list::InlineImage>,
+        transform: Matrix,
+    ) {
+        self.emit_painted(RenderCommand::DrawInlineImage(
+            zpdf_display_list::InlineImageDraw {
+                image,
+                transform,
+                alpha: self.current.fill_alpha,
+            },
+        ));
+    }
+
     fn do_inline_image(&mut self, dict: zpdf_core::PdfDict, data: Vec<u8>) {
         // BI ... EI is one operation in every content loop. Charge it even
-        // when rendering is skipped (for example a Type3 child without an
-        // image cache), just as execute_operator charges suppressed operators.
+        // when rendering is skipped (for example a page without an image
+        // cache), just as execute_operator charges suppressed operators.
         self.ops_executed = self.ops_executed.saturating_add(1);
 
         // Allocate the per-glyph inline-image ordinal in source order before
@@ -5061,10 +5084,13 @@ impl<'a> ContentInterpreter<'a> {
         if cs_produces_no_marks(&self.current.fill_cs) && is_mask {
             return;
         }
-        if self.image_cache.is_none() {
-            if type3_slot.is_some() {
-                self.type3_dropped_inline_image = true;
-            }
+        // Outside Type 3 glyphs, omit inline images when the caller supplied no
+        // `ImageCache`. Inside a Type 3 glyph (including helper Forms it calls),
+        // embed decoded pixels directly on `DrawInlineImage` so bitmap glyphs
+        // and mixed Form+stencil glyphs preserve every mark in paint order.
+        let embed_type3_inline = self.image_cache.is_none()
+            && (type3_slot.is_some() || !self.active_type3_glyphs.is_empty());
+        if self.image_cache.is_none() && !embed_type3_inline {
             return;
         }
         let intent = norm
@@ -5130,7 +5156,14 @@ impl<'a> ContentInterpreter<'a> {
                     .unwrap_or(0);
                 let footprint = self.image_footprint(&self.current.ctm, w, h);
                 let key = (font_id, glyph_id, idx, color_key, footprint);
-                if let Some(&(image_id, cached_is_mask)) = self.type3_inline_image_cache.get(&key) {
+                if embed_type3_inline {
+                    if let Some(image) = self.type3_inline_fallback_cache.get(&key) {
+                        self.emit_inline_image_draw(std::sync::Arc::clone(image), self.current.ctm);
+                        return;
+                    }
+                } else if let Some(&(image_id, cached_is_mask)) =
+                    self.type3_inline_image_cache.get(&key)
+                {
                     self.emit_image_draw(image_id, self.current.ctm, cached_is_mask);
                     return;
                 }
@@ -5166,7 +5199,13 @@ impl<'a> ContentInterpreter<'a> {
             &self.parse_limits,
         ) {
             Ok(img) => {
-                if let Some(image_id) = self.emit_draw_image(img) {
+                if embed_type3_inline {
+                    if let Some(inline) = self.emit_draw_inline_image(img) {
+                        if let Some(key) = type3_cache_key {
+                            self.type3_inline_fallback_cache.insert(key, inline);
+                        }
+                    }
+                } else if let Some(image_id) = self.emit_draw_image(img) {
                     if let Some(key) = type3_cache_key {
                         self.type3_inline_image_cache
                             .insert(key, (image_id, is_mask));
@@ -5196,6 +5235,30 @@ impl<'a> ContentInterpreter<'a> {
         Some(image_id)
     }
 
+    fn emit_draw_inline_image(
+        &mut self,
+        image: zpdf_image::DecodedImage,
+    ) -> Option<std::sync::Arc<zpdf_display_list::InlineImage>> {
+        let transform = self.current.ctm;
+        let image = self.fit_image_to_footprint(image, &transform);
+        let bytes = u64::try_from(image.data.capacity()).unwrap_or(u64::MAX);
+        if !self.image_room(bytes) {
+            self.warn_image_dropped(bytes);
+            return None;
+        }
+        self.type3_inline_fallback_bytes = self.type3_inline_fallback_bytes.saturating_add(bytes);
+        let inline = std::sync::Arc::new(zpdf_display_list::InlineImage {
+            width: image.width,
+            height: image.height,
+            data: image.data,
+            has_alpha: image.has_alpha,
+            is_image_mask: image.is_image_mask,
+            premultiplied: image.premultiplied,
+        });
+        self.emit_inline_image_draw(std::sync::Arc::clone(&inline), transform);
+        Some(inline)
+    }
+
     fn admit_image(&mut self, image: zpdf_image::DecodedImage) -> Option<zpdf_image::ImageId> {
         let bytes = u64::try_from(image.data.capacity()).unwrap_or(u64::MAX);
         let id = self.insert_image(image);
@@ -5209,7 +5272,8 @@ impl<'a> ContentInterpreter<'a> {
     fn insert_image(&mut self, image: zpdf_image::DecodedImage) -> Option<zpdf_image::ImageId> {
         let limit = self
             .max_image_cache_bytes
-            .saturating_sub(self.retained_image_bytes);
+            .saturating_sub(self.retained_image_bytes)
+            .saturating_sub(self.type3_inline_fallback_bytes);
         self.image_cache
             .as_mut()?
             .try_insert_with_limit(image, limit)
@@ -6627,7 +6691,6 @@ impl<'a> ContentInterpreter<'a> {
         let mut completed = true;
         let mut verified_segments: Vec<(usize, usize, Vec<PositionedGlyph>)> = Vec::new();
         let mut active_verified: Option<(usize, usize, Vec<PositionedGlyph>)> = None;
-        let mut fallback_glyphs: Vec<PositionedGlyph> = Vec::new();
 
         for glyph in glyphs {
             if self.over_budget() {
@@ -6652,19 +6715,6 @@ impl<'a> ContentInterpreter<'a> {
                 .and_then(|fc| fc.get(font_id))
                 .and_then(|font| font.type3_glyph_entry(glyph.glyph_id))
             else {
-                if !fallback_glyphs.is_empty() {
-                    let run_glyphs = std::mem::take(&mut fallback_glyphs);
-                    self.emit_painted(RenderCommand::DrawGlyphRun(GlyphRun {
-                        font_id,
-                        font_size,
-                        glyphs: run_glyphs,
-                        paint: Paint::Solid(paint_color),
-                        alpha,
-                        overprint,
-                        transform,
-                        h_scale,
-                    }));
-                }
                 if glyph_verified {
                     let pos = self.display_list.commands.len();
                     match active_verified.as_mut() {
@@ -6744,7 +6794,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
 
-            let mut glyph_cmd_start = self.display_list.commands.len();
+            let glyph_cmd_start = self.display_list.commands.len();
             let depth_floor = self.state_stack.len();
             self.state_stack.push(self.current.clone());
             let saved_floor = self.state_floor;
@@ -6774,8 +6824,6 @@ impl<'a> ContentInterpreter<'a> {
             let saved_suppress_color_ops = self.suppress_color_ops;
             let saved_type3_inline_ctx =
                 self.type3_inline_ctx.replace((font_id, glyph.glyph_id, 0));
-            let saved_dropped_inline_image =
-                std::mem::replace(&mut self.type3_dropped_inline_image, false);
 
             self.current.ctm = glyph_ctm;
             self.base_ctm = glyph_ctm;
@@ -6859,10 +6907,6 @@ impl<'a> ContentInterpreter<'a> {
             self.base_ctm = saved_base_ctm;
             self.suppress_color_ops = saved_suppress_color_ops;
             self.type3_inline_ctx = saved_type3_inline_ctx;
-            let dropped_inline_image = std::mem::replace(
-                &mut self.type3_dropped_inline_image,
-                saved_dropped_inline_image,
-            );
 
             if pushed_glyph_overrides {
                 self.pop_form_fonts();
@@ -6871,68 +6915,27 @@ impl<'a> ContentInterpreter<'a> {
                 self.form_resources.pop();
             }
 
-            if dropped_inline_image {
-                // Caller supplied fonts without an ImageCache: roll back any
-                // partial marks from this glyph and fall back to DrawGlyphRun
-                // so backends with private Type 3 image caches still render
-                // bitmap stencils.
-                self.display_list.commands.truncate(glyph_cmd_start);
-                if let Some(prev) = active_verified.take() {
-                    verified_segments.push(prev);
-                }
-                fallback_glyphs.push(*glyph);
-            } else {
-                if !fallback_glyphs.is_empty() {
-                    let tail = self.display_list.commands.split_off(glyph_cmd_start);
-                    let run_glyphs = std::mem::take(&mut fallback_glyphs);
-                    self.emit_painted(RenderCommand::DrawGlyphRun(GlyphRun {
-                        font_id,
-                        font_size,
-                        glyphs: run_glyphs,
-                        paint: Paint::Solid(paint_color),
-                        alpha,
-                        overprint,
-                        transform,
-                        h_scale,
-                    }));
-                    glyph_cmd_start = self.display_list.commands.len();
-                    self.display_list.commands.extend(tail);
-                }
-                if completed && glyph_verified {
-                    let glyph_cmd_end = self.display_list.commands.len();
-                    match active_verified.as_mut() {
-                        Some((_, end, seg_glyphs)) if *end == glyph_cmd_start => {
-                            *end = glyph_cmd_end;
-                            seg_glyphs.push(*glyph);
-                        }
-                        _ => {
-                            if let Some(prev) = active_verified.take() {
-                                verified_segments.push(prev);
-                            }
-                            active_verified = Some((glyph_cmd_start, glyph_cmd_end, vec![*glyph]));
-                        }
+            if completed && glyph_verified {
+                let glyph_cmd_end = self.display_list.commands.len();
+                match active_verified.as_mut() {
+                    Some((_, end, seg_glyphs)) if *end == glyph_cmd_start => {
+                        *end = glyph_cmd_end;
+                        seg_glyphs.push(*glyph);
                     }
-                } else if let Some(prev) = active_verified.take() {
-                    verified_segments.push(prev);
+                    _ => {
+                        if let Some(prev) = active_verified.take() {
+                            verified_segments.push(prev);
+                        }
+                        active_verified = Some((glyph_cmd_start, glyph_cmd_end, vec![*glyph]));
+                    }
                 }
+            } else if let Some(prev) = active_verified.take() {
+                verified_segments.push(prev);
             }
 
             if !completed {
                 break;
             }
-        }
-
-        if !fallback_glyphs.is_empty() {
-            self.emit_painted(RenderCommand::DrawGlyphRun(GlyphRun {
-                font_id,
-                font_size,
-                glyphs: fallback_glyphs,
-                paint: Paint::Solid(paint_color),
-                alpha,
-                overprint,
-                transform,
-                h_scale,
-            }));
         }
 
         if pushed_font_overrides {
@@ -12030,6 +12033,78 @@ mod tests {
         assert!(
             dl.expanded_glyph_runs().is_empty(),
             "partial Type 3 replay stopped by budget must not publish an ExpandedGlyphRun"
+        );
+    }
+
+    #[test]
+    fn type3_inline_image_without_cache_deduplicates_and_respects_budget() {
+        let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
+            800 0 0 800 0 0 cm\n\
+            BI /IM true /W 2 /H 2 /BPC 1 ID "
+            .to_vec();
+        glyph_bytes.extend_from_slice(&[0x00, 0x00]);
+        glyph_bytes.extend_from_slice(b"\nEI");
+
+        let mut char_procs = HashMap::new();
+        char_procs.insert(
+            "A".to_string(),
+            std::sync::Arc::<[u8]>::from(glyph_bytes.as_slice()),
+        );
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".to_string();
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0],
+                first_char: 65,
+            },
+            "Type3InlineDedup".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        fonts.insert("F1".into(), font);
+
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 200.0, 80.0))
+            .with_fonts(&mut fonts)
+            .interpret(b"1 0 0 rg BT /F1 40 Tf 10 20 Td (AA) Tj ET");
+        let inline_draws: Vec<_> = dl
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCommand::DrawInlineImage(draw) => Some(draw),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inline_draws.len(),
+            2,
+            "both glyph instances emit inline draws"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&inline_draws[0].image, &inline_draws[1].image),
+            "repeated Type 3 inline images without ImageCache must share one decoded Arc"
+        );
+
+        // Tight budget smaller than a 2x2 RGBA buffer (16 bytes) drops the inline
+        // image and records `resource_limit_reached`.
+        let tight = zpdf_core::ParseLimits {
+            max_image_cache_bytes: 8,
+            ..zpdf_core::ParseLimits::default()
+        };
+        let (dl_tight, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 200.0, 80.0))
+            .with_fonts(&mut fonts)
+            .with_limits(&tight)
+            .interpret_with_stats(b"1 0 0 rg BT /F1 40 Tf 10 20 Td (A) Tj ET");
+        assert!(
+            dl_tight.commands.is_empty(),
+            "inline image exceeding max_image_cache_bytes must be dropped"
+        );
+        assert!(
+            stats.diagnostics.resource_limit_reached,
+            "dropping an over-budget inline image must report resource_limit_reached"
         );
     }
 }

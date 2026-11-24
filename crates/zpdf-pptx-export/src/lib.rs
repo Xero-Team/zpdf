@@ -239,6 +239,9 @@ impl<'a> SlideConverter<'a> {
             RenderCommand::DrawImage(image_draw) => {
                 self.convert_image(image_draw)?;
             }
+            RenderCommand::DrawInlineImage(image_draw) => {
+                self.convert_inline_image(image_draw)?;
+            }
             // Skip clip/blend commands - we're extracting content only
             _ => {}
         }
@@ -477,9 +480,33 @@ impl<'a> SlideConverter<'a> {
             .image_cache
             .get(image_draw.image_id)
             .ok_or_else(|| zpdf_core::Error::StreamDecode("Image not found".into()))?;
+        self.convert_rgba_image(
+            image.width,
+            image.height,
+            &image.data,
+            &image_draw.transform,
+        )
+    }
 
-        // Extract transform to get position and size
-        let mat = &image_draw.transform;
+    fn convert_inline_image(
+        &mut self,
+        image_draw: &zpdf_display_list::InlineImageDraw,
+    ) -> Result<()> {
+        self.convert_rgba_image(
+            image_draw.image.width,
+            image_draw.image.height,
+            &image_draw.image.data,
+            &image_draw.transform,
+        )
+    }
+
+    fn convert_rgba_image(
+        &mut self,
+        img_width: u32,
+        img_height: u32,
+        data: &[u8],
+        mat: &zpdf_core::Matrix,
+    ) -> Result<()> {
         if !mat.is_finite() {
             return Err(zpdf_core::Error::StreamDecode(
                 "non-finite PPTX image transform".into(),
@@ -495,7 +522,7 @@ impl<'a> SlideConverter<'a> {
         let (x_ppt, y_ppt) = (cx - width / 2.0, cy - height / 2.0);
 
         // Convert image to PNG
-        let png_data = image_to_png(image)?;
+        let png_data = rgba_to_png(img_width, img_height, data)?;
 
         self.image_counter += 1;
         let image_id = format!("image{}", self.image_counter);
@@ -559,17 +586,12 @@ fn pt_to_emu(pt: f64) -> i64 {
     (pt * 12700.0) as i64
 }
 
-/// Convert an image to PNG format
-fn image_to_png(image: &zpdf_image::DecodedImage) -> Result<Vec<u8>> {
+/// Convert RGBA8 pixels to PNG format
+fn rgba_to_png(width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>> {
     let mut png_data = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
     encoder
-        .write_image(
-            &image.data,
-            image.width,
-            image.height,
-            image::ExtendedColorType::Rgba8,
-        )
+        .write_image(data, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| zpdf_core::Error::StreamDecode(format!("PNG encode: {e}")))?;
     Ok(png_data)
 }
