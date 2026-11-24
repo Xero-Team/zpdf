@@ -8,6 +8,28 @@ use zpdf::{ContentInterpreter, ImageCache, PdfDocument, RenderBackend};
 
 const SCALE: f32 = 2.0;
 
+/// Real embedded Noto Sans subset TrueType font whose 'A' (U+0041, GID 2) has
+/// bold diagonal strokes and an inner triangular counter, giving deterministic
+/// anti-aliased edges independent of host system fonts.
+const NOTO_SC_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/noto-sans-sc-subset.ttf");
+
+fn embedded_noto_font_objs(descriptor_id: u32, file_id: u32) -> [Vec<u8>; 3] {
+    [
+        format!(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /NotoSansSubset \
+             /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 65 /Widths [608] \
+             /FontDescriptor {descriptor_id} 0 R >>"
+        )
+        .into_bytes(),
+        format!(
+            "<< /Type /FontDescriptor /FontName /NotoSansSubset /Flags 32 \
+             /FontBBox [0 -120 1000 880] /FontFile2 {file_id} 0 R >>"
+        )
+        .into_bytes(),
+        stream_obj(&format!("/Length1 {}", NOTO_SC_TTF.len()), NOTO_SC_TTF),
+    ]
+}
+
 /// Concatenate 1-based objects with a classic xref table + trailer.
 fn assemble(objs: &[Vec<u8>]) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
@@ -708,17 +730,17 @@ fn tiling_pattern_cell_text_block_preserves_outer_text_clip() {
         "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
          /BBox [0 0 20 20] /XStep 20 /YStep 20 \
          /Resources << /Font << /F1 6 0 R >> >>",
-        b"BT /F1 8 Tf 2 2 Td (x) Tj ET\n1 0 0 rg 0 0 20 20 re f",
+        b"BT /F1 8 Tf 2 2 Td (A) Tj ET\n1 0 0 rg 0 0 20 20 re f",
     );
     // Outer page uses mode 4 (fill + add to clip) painted with `/P0`, then
     // fills the entire page with blue after `ET`. Because the outer text clip
     // must remain intact, pixels outside the glyph outline stay white.
     let content = stream_obj(
         "",
-        b"q\nBT /F1 120 Tf 4 Tr /Pattern cs /P0 scn 20 40 Td (I) Tj ET\n\
+        b"q\nBT /F1 120 Tf 4 Tr /Pattern cs /P0 scn 20 40 Td (A) Tj ET\n\
           0 0 1 rg 0 0 200 200 re f\nQ",
     );
-    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let [font, font_desc, font_stream] = embedded_noto_font_objs(7, 8);
     let pdf = assemble(&[
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
@@ -728,6 +750,8 @@ fn tiling_pattern_cell_text_block_preserves_outer_text_clip() {
         content,
         cell,
         font,
+        font_desc,
+        font_stream,
     ]);
     let (dl, _stats, page) = render_with_stats(pdf, SCALE);
     let has_push_clip = dl
@@ -1747,7 +1771,7 @@ fn multi_segment_tiling_applies_outer_shape_coverage_once_for_fill_stroke_and_gl
          /Resources << /ExtGState << /GM 7 0 R >> >>",
         b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
     );
-    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let [font, font_desc, font_stream] = embedded_noto_font_objs(8, 9);
     let build_pdf = |paint_cmds: &[u8]| {
         let content = stream_obj("", paint_cmds);
         assemble(&[
@@ -1760,24 +1784,26 @@ fn multi_segment_tiling_applies_outer_shape_coverage_once_for_fill_stroke_and_gl
             cell.clone(),                                  // 5
             font.clone(),                                  // 6
             gs_mul.clone(),                                // 7
+            font_desc.clone(),                             // 8
+            font_stream.clone(),                           // 9
         ])
     };
 
     // 1. Half-pixel fill edge at x = 10.5 (pixel x=10 has ~50% coverage).
     // 2. Half-pixel stroke edges at x = 45.5 and 54.5 (stroke at x=50, width=9).
-    // 3. Anti-aliased glyph clip 'O' at (70, 25), 60pt Helvetica. Using `7 Tr`
-    //    (clip) + solid black rect in `ref_pdf` exercises the exact same
+    // 3. Anti-aliased glyph clip 'A' at (70, 25), 60pt embedded Noto Sans. Using
+    //    `7 Tr` (clip) + solid black rect in `ref_pdf` exercises the exact same
     //    `PushClip(glyph_clip)` geometry as pattern-painted text so every AA
     //    edge pixel is directly comparable without outline-curve flattening drift.
     let pat_pdf = build_pdf(
         b"/Pattern cs /P0 scn 10.5 10 20 80 re f\n\
           /Pattern CS /P0 SCN 9 w 50 10 m 50 90 l S\n\
-          /Pattern cs /P0 scn BT /F1 60 Tf 70 25 Td (O) Tj ET",
+          /Pattern cs /P0 scn BT /F1 60 Tf 70 25 Td (A) Tj ET",
     );
     let ref_pdf = build_pdf(
         b"0 0 0 rg 10.5 10 20 80 re f\n\
           0 0 0 RG 9 w 50 10 m 50 90 l S\n\
-          q BT /F1 60 Tf 7 Tr 70 25 Td (O) Tj ET 0 0 0 rg 65 20 55 60 re f Q",
+          q BT /F1 60 Tf 7 Tr 70 25 Td (A) Tj ET 0 0 0 rg 65 20 55 60 re f Q",
     );
 
     let (pat_dl, _, pat_page) = render_with_stats(pat_pdf, 1.0);
@@ -1807,7 +1833,7 @@ fn multi_segment_tiling_applies_outer_shape_coverage_once_for_fill_stroke_and_gl
         "multi-segment stroke edge must match solid reference ({stroke_edge_ref:?}), got {stroke_edge_pat:?}"
     );
 
-    // Anti-aliased glyph-clip 'O' region x=[65..118], y_dev=[20..110]: every
+    // Anti-aliased glyph-clip 'A' region x=[65..118], y_dev=[20..110]: every
     // partial-coverage edge pixel in the solid reference (60..=200) must match
     // the multi-segment tiling pattern within <= 2 (single coverage pass).
     let mut aa_clip_pixels = 0usize;
@@ -1827,7 +1853,7 @@ fn multi_segment_tiling_applies_outer_shape_coverage_once_for_fill_stroke_and_gl
     }
     assert!(
         aa_clip_pixels >= 20,
-        "expected anti-aliased glyph-clip edge pixels in 'O', found {aa_clip_pixels}"
+        "expected anti-aliased glyph-clip edge pixels in 'A', found {aa_clip_pixels}"
     );
 
     // 4. Direct `RenderCommand::DrawGlyphRun` with `Paint::Tiling` (2 black
@@ -1844,7 +1870,7 @@ fn multi_segment_tiling_applies_outer_shape_coverage_once_for_fill_stroke_and_gl
             _ => None,
         })
         .expect("tiling paint in pat_dl");
-    let glyph_pdf = build_pdf(b"0 0 0 rg BT /F1 60 Tf 70 25 Td (O) Tj ET");
+    let glyph_pdf = build_pdf(b"0 0 0 rg BT /F1 60 Tf 70 25 Td (A) Tj ET");
     let doc = PdfDocument::open(glyph_pdf).expect("open glyph pdf");
     let page = doc.page(0).expect("page 0");
     let mut fonts = doc.load_page_fonts(&page);
@@ -1891,7 +1917,7 @@ fn multi_segment_tiling_applies_outer_shape_coverage_once_for_fill_stroke_and_gl
     }
     assert!(
         aa_run_pixels >= 20,
-        "expected anti-aliased DrawGlyphRun edge pixels in 'O', found {aa_run_pixels}"
+        "expected anti-aliased DrawGlyphRun edge pixels in 'A', found {aa_run_pixels}"
     );
 }
 
@@ -2229,12 +2255,12 @@ fn dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
 #[test]
 fn small_outline_glyph_in_non_isolated_screen_group_on_7000x7000_raster() {
     let gs_screen = b"<< /Type /ExtGState /BM /Screen >>".to_vec();
-    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let [font, font_desc, font_stream] = embedded_noto_font_objs(8, 9);
     let form = stream_obj(
         "/Type /XObject /Subtype /Form /BBox [0 0 7000 7000] \
          /Group << /S /Transparency /I false >> \
          /Resources << /Font << /F1 6 0 R >> >>",
-        b"0.5 0.5 0.5 rg BT /F1 40 Tf 100 100 Td (I) Tj ET",
+        b"0.5 0.5 0.5 rg BT /F1 40 Tf 100 100 Td (A) Tj ET",
     );
     let content = stream_obj("", b"0.5 0.5 0.5 rg 0 0 7000 7000 re f\n/GS gs /FM Do");
     let pdf = assemble(&[
@@ -2247,13 +2273,15 @@ fn small_outline_glyph_in_non_isolated_screen_group_on_7000x7000_raster() {
         form,                                          // 5
         font,                                          // 6
         gs_screen,                                     // 7
+        font_desc,                                     // 8
+        font_stream,                                   // 9
     ]);
     let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
     assert_eq!((page.width, page.height), (7000, 7000));
-    // Check that the glyph 'I' painted visibly (Screen(0.5, 0.5) ≈ 191 over 128 gray).
+    // Check that the glyph 'A' painted visibly (Screen(0.5, 0.5) ≈ 191 over 128 gray).
     let mut brightened = 0usize;
     for y_pdf in 100..135 {
-        for x in 100..120 {
+        for x in 100..130 {
             let p = px_on(&page, 7000.0, 1.0, x as f64 + 0.5, y_pdf as f64 + 0.5);
             if p[0] >= 180 && p[1] >= 180 && p[2] >= 180 {
                 brightened += 1;

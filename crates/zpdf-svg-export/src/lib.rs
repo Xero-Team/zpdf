@@ -5235,11 +5235,20 @@ mod tests {
              /Resources << /ExtGState << /GM 7 0 R >> >>",
             b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
         );
-        let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+        const NOTO_SC_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/noto-sans-sc-subset.ttf");
+        let font = b"<< /Type /Font /Subtype /TrueType /BaseFont /NotoSansSubset \
+                     /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 65 /Widths [608] \
+                     /FontDescriptor 8 0 R >>"
+            .to_vec();
+        let font_desc = b"<< /Type /FontDescriptor /FontName /NotoSansSubset /Flags 32 \
+                          /FontBBox [0 -120 1000 880] /FontFile2 9 0 R >>"
+            .to_vec();
+        let font_stream = push_stream(&format!("/Length1 {}", NOTO_SC_TTF.len()), NOTO_SC_TTF);
         let content = push_stream(
             "",
             b"/Pattern cs /P0 scn 0 0 10 10 re f\n\
-              0 0 0 rg BT /F1 60 Tf 70 25 Td (O) Tj ET",
+              0 0 0 rg BT /F1 60 Tf 70 25 Td (A) Tj ET",
         );
         objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
         objects.push(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec());
@@ -5252,6 +5261,8 @@ mod tests {
         objects.push(cell);
         objects.push(font);
         objects.push(gs_mul);
+        objects.push(font_desc);
+        objects.push(font_stream);
 
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = vec![0usize];
@@ -5350,11 +5361,11 @@ mod tests {
         }
         assert!(
             dark_pixels >= 100,
-            "SVG DrawGlyphRun with Paint::Tiling must render visible 'O', found {dark_pixels} dark pixels"
+            "SVG DrawGlyphRun with Paint::Tiling must render visible 'A', found {dark_pixels} dark pixels"
         );
         assert!(
             aa_pixels >= 10,
-            "expected anti-aliased edge pixels in SVG 'O', found {aa_pixels}"
+            "expected anti-aliased edge pixels in SVG 'A', found {aa_pixels}"
         );
     }
 

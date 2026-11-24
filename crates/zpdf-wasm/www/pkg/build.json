@@ -2,7 +2,7 @@
   "schema_version": 1,
   "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
   "wasm_bindgen": "wasm-bindgen 0.2.130",
-  "source_sha256": "d23671bba490f9d435a8f01f69fd3769aeb39d3f647cac2bab1aacdee7e672c0",
+  "source_sha256": "1f5b3ed0ffd7e88a81389a64b58d3765d3e13fa8ff0b2a5a5c26882d58f2caec",
   "source_files": 153,
   "artifacts": {
     "zpdf_wasm.js": "4a6741df7a9b6959bd38d25e9fe3723f536b73b5c6fa8c3976f119f6cd18ccfd",

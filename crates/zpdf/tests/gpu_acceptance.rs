@@ -68,6 +68,28 @@ fn render_gpu_shared(
 /// which exercises the same fixture/GID via `glyph_outline(1)` directly).
 const TEST_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/var.ttf");
 
+/// Real embedded Noto Sans subset TrueType font whose 'A' (U+0041, GID 2) has
+/// bold diagonal strokes and an inner triangular counter, giving deterministic
+/// anti-aliased edges independent of host system fonts.
+const NOTO_SC_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/noto-sans-sc-subset.ttf");
+
+fn embedded_noto_font_objs(descriptor_id: u32, file_id: u32) -> [Vec<u8>; 3] {
+    [
+        format!(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /NotoSansSubset \
+             /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 65 /Widths [608] \
+             /FontDescriptor {descriptor_id} 0 R >>"
+        )
+        .into_bytes(),
+        format!(
+            "<< /Type /FontDescriptor /FontName /NotoSansSubset /Flags 32 \
+             /FontBBox [0 -120 1000 880] /FontFile2 {file_id} 0 R >>"
+        )
+        .into_bytes(),
+        stream_obj(&format!("/Length1 {}", NOTO_SC_TTF.len()), NOTO_SC_TTF),
+    ]
+}
+
 /// Concatenate 1-based objects with a classic xref table + trailer.
 fn assemble(objs: &[Vec<u8>]) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
@@ -1603,7 +1625,7 @@ fn gpu_multi_segment_tiling_applies_outer_shape_coverage_once() {
          /Resources << /ExtGState << /GM 7 0 R >> >>",
         b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
     );
-    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let [font, font_desc, font_stream] = embedded_noto_font_objs(8, 9);
     let build_pdf = |paint_cmds: &[u8]| {
         let content = stream_obj("", paint_cmds);
         assemble(&[
@@ -1616,17 +1638,19 @@ fn gpu_multi_segment_tiling_applies_outer_shape_coverage_once() {
             cell.clone(),                                  // 5
             font.clone(),                                  // 6
             gs_mul.clone(),                                // 7
+            font_desc.clone(),                             // 8
+            font_stream.clone(),                           // 9
         ])
     };
     let pat_pdf = build_pdf(
         b"/Pattern cs /P0 scn 10.5 10 20 80 re f\n\
           /Pattern CS /P0 SCN 9 w 50 10 m 50 90 l S\n\
-          /Pattern cs /P0 scn BT /F1 60 Tf 70 25 Td (O) Tj ET",
+          /Pattern cs /P0 scn BT /F1 60 Tf 70 25 Td (A) Tj ET",
     );
     let ref_pdf = build_pdf(
         b"0 0 0 rg 10.5 10 20 80 re f\n\
           0 0 0 RG 9 w 50 10 m 50 90 l S\n\
-          q BT /F1 60 Tf 7 Tr 70 25 Td (O) Tj ET 0 0 0 rg 65 20 55 60 re f Q",
+          q BT /F1 60 Tf 7 Tr 70 25 Td (A) Tj ET 0 0 0 rg 65 20 55 60 re f Q",
     );
 
     let render_gpu = |pdf: Vec<u8>| {
@@ -1992,7 +2016,7 @@ fn gpu_tiling_glyph_run_renders_page_and_cell_text() {
          /Resources << /ExtGState << /GM 7 0 R >> >>",
         b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
     );
-    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let [font, font_desc, font_stream] = embedded_noto_font_objs(8, 9);
     let build_pdf = |paint_cmds: &[u8]| {
         let content = stream_obj("", paint_cmds);
         assemble(&[
@@ -2005,6 +2029,8 @@ fn gpu_tiling_glyph_run_renders_page_and_cell_text() {
             cell.clone(),                                  // 5
             font.clone(),                                  // 6
             gs_mul.clone(),                                // 7
+            font_desc.clone(),                             // 8
+            font_stream.clone(),                           // 9
         ])
     };
 
@@ -2032,7 +2058,7 @@ fn gpu_tiling_glyph_run_renders_page_and_cell_text() {
         .expect("tiling paint");
 
     // 1. Direct page-level DrawGlyphRun with Paint::Tiling (matching pattern_tiling.rs fixture).
-    let glyph_pdf = build_pdf(b"0 0 0 rg BT /F1 60 Tf 70 25 Td (O) Tj ET");
+    let glyph_pdf = build_pdf(b"0 0 0 rg BT /F1 60 Tf 70 25 Td (A) Tj ET");
     let doc = PdfDocument::open(glyph_pdf).expect("open glyph pdf");
     let page = doc.page(0).expect("page 0");
     let mut fonts = doc.load_page_fonts(&page);
@@ -2086,11 +2112,11 @@ fn gpu_tiling_glyph_run_renders_page_and_cell_text() {
     }
     assert!(
         dark_pixels >= 100,
-        "GPU DrawGlyphRun with Paint::Tiling must render visible 'O', found {dark_pixels} dark pixels"
+        "GPU DrawGlyphRun with Paint::Tiling must render visible 'A', found {dark_pixels} dark pixels"
     );
     assert!(
         aa_pixels >= 10,
-        "expected anti-aliased edge pixels in solid 'O', found {aa_pixels}"
+        "expected anti-aliased edge pixels in solid 'A', found {aa_pixels}"
     );
 
     // 2. Direct cell-level DrawGlyphRun with Paint::Tiling inside a repeating tiling cell.
@@ -2149,34 +2175,73 @@ fn gpu_tiling_glyph_run_renders_page_and_cell_text() {
         .count();
     assert!(
         gpu_dark >= 200,
-        "GPU cell-level DrawGlyphRun with Paint::Tiling must render repeated 'O' cells, found {gpu_dark} dark pixels"
+        "GPU cell-level DrawGlyphRun with Paint::Tiling must render repeated 'A' cells, found {gpu_dark} dark pixels"
     );
     // Tiled-paint cell text must match solid-paint cell text across every pixel on GPU,
-    // and match CPU across every interior/non-AA-edge pixel (no missing or shifted cells).
-    let total = (cell_cpu.width * cell_cpu.height) as usize;
+    // render dark ink in all 4 cells, and match CPU across every interior (non-AA-edge)
+    // pixel (no missing or shifted cells; AA edges may vary slightly from bilinear glyph
+    // atlas resampling).
+    let (w, h) = (cell_cpu.width as usize, cell_cpu.height as usize);
+    let total = w * h;
     let mut gpu_vs_solid_max = 0u32;
     let mut gpu_vs_cpu_gt64 = 0usize;
-    for i in 0..total {
-        let b = i * 4;
-        for c in 0..3 {
-            let ds =
-                (cell_gpu.data[b + c] as i32 - solid_cell_gpu.data[b + c] as i32).unsigned_abs();
-            gpu_vs_solid_max = gpu_vs_solid_max.max(ds);
-        }
-        let dr = (cell_gpu.data[b] as i32 - cell_cpu.data[b] as i32).unsigned_abs();
-        let dg = (cell_gpu.data[b + 1] as i32 - cell_cpu.data[b + 1] as i32).unsigned_abs();
-        let db = (cell_gpu.data[b + 2] as i32 - cell_cpu.data[b + 2] as i32).unsigned_abs();
-        if dr.max(dg).max(db) > 64 {
-            gpu_vs_cpu_gt64 += 1;
+    let mut interior_mismatches = 0usize;
+    let mut cell_dark = [0usize; 4];
+    for y in 0..h {
+        for x in 0..w {
+            let b = (y * w + x) * 4;
+            if cell_gpu.data[b] < 30 && cell_gpu.data[b + 1] < 30 && cell_gpu.data[b + 2] < 30 {
+                let q = (y / 60).min(1) * 2 + (x / 60).min(1);
+                cell_dark[q] += 1;
+            }
+            for c in 0..3 {
+                let ds = (cell_gpu.data[b + c] as i32 - solid_cell_gpu.data[b + c] as i32)
+                    .unsigned_abs();
+                gpu_vs_solid_max = gpu_vs_solid_max.max(ds);
+            }
+            let dr = (cell_gpu.data[b] as i32 - cell_cpu.data[b] as i32).unsigned_abs();
+            let dg = (cell_gpu.data[b + 1] as i32 - cell_cpu.data[b + 1] as i32).unsigned_abs();
+            let db = (cell_gpu.data[b + 2] as i32 - cell_cpu.data[b + 2] as i32).unsigned_abs();
+            let dmax = dr.max(dg).max(db);
+            if dmax > 64 {
+                gpu_vs_cpu_gt64 += 1;
+            }
+            if x > 0 && x + 1 < w && y > 0 && y + 1 < h {
+                let mut all_dark = true;
+                let mut all_white = true;
+                for ny in (y - 1)..=(y + 1) {
+                    for nx in (x - 1)..=(x + 1) {
+                        let r = cell_cpu.data[(ny * w + nx) * 4];
+                        if r >= 30 {
+                            all_dark = false;
+                        }
+                        if r <= 225 {
+                            all_white = false;
+                        }
+                    }
+                }
+                if (all_dark || all_white) && dmax > THRESHOLD as u32 {
+                    interior_mismatches += 1;
+                }
+            }
         }
     }
     assert!(
         gpu_vs_solid_max <= 16,
         "GPU cell-level tiling DrawGlyphRun must match GPU solid cell text within <=16, max diff={gpu_vs_solid_max}"
     );
+    assert!(
+        cell_dark.iter().all(|&n| n >= 50),
+        "GPU cell-level tiling DrawGlyphRun must render all 4 repeated 'A' cells, per-cell dark={cell_dark:?}"
+    );
     assert_eq!(
-        gpu_vs_cpu_gt64, 0,
-        "GPU cell-level tiling DrawGlyphRun must align with CPU across all 4 cells (found {gpu_vs_cpu_gt64} pixels differing by >64)"
+        interior_mismatches, 0,
+        "GPU cell-level tiling DrawGlyphRun must match CPU on every interior pixel across all 4 cells (found {interior_mismatches} mismatches)"
+    );
+    let gt64_pct = gpu_vs_cpu_gt64 as f64 / total as f64 * 100.0;
+    assert!(
+        gt64_pct < MAX_DIFF_PCT,
+        "GPU cell-level tiling DrawGlyphRun diverged from CPU on {gpu_vs_cpu_gt64} pixels ({gt64_pct:.3}%)"
     );
 }
 
