@@ -1893,7 +1893,8 @@ fn gpu_dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() 
     let mut cell_alt_stream = String::new();
     for k in 0..175 {
         let gs = if k % 2 == 0 { "/GM" } else { "/GD" };
-        cell_alt_stream.push_str(&format!("{gs} gs 1 1 1 rg 0 0 12 2 re f\n"));
+        let rgb = if k == 20 { "0.5 0.5 0.5" } else { "1 1 1" };
+        cell_alt_stream.push_str(&format!("{gs} gs {rgb} rg 0 0 12 2 re f\n"));
     }
     cell_alt_stream.push_str("/GM gs 0 0 0 rg 0 0 1 2 re f\n");
     let cell_alt = stream_obj(
@@ -1965,8 +1966,8 @@ fn gpu_dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() 
     );
     let bg_b = px(341, 66);
     assert!(
-        bg_b[0] < 10 && bg_b[1] < 10 && bg_b[2] > 245,
-        "GPU Cell B white Multiply/Darken marks in fallback must preserve blue backdrop, got {bg_b:?}"
+        bg_b[0] <= 2 && bg_b[1] <= 2 && (2..=7).contains(&bg_b[2]),
+        "GPU Cell B 6x overlapping 50%-gray Multiply over blue must be ~[0,0,4] (NOT ~[0,0,128]), got {bg_b:?}"
     );
 }
 

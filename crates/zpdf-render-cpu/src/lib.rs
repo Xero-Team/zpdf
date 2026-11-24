@@ -185,6 +185,7 @@ struct TilingCacheKey {
     commands: usize,
     segment_index: usize,
     overlap_shift: Option<(i64, i64)>,
+    copy_blend_mode: u8,
     bbox: [u64; 4],
     steps: [u64; 2],
     tile_w: u32,
@@ -193,10 +194,12 @@ struct TilingCacheKey {
 }
 
 impl TilingCacheKey {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         tiling: &TilingPattern,
         segment_index: usize,
         overlap_shift: Option<(i64, i64)>,
+        copy_blend_mode: BlendMode,
         tile_w: u32,
         tile_h: u32,
         blend_depth: usize,
@@ -205,6 +208,7 @@ impl TilingCacheKey {
             commands: Arc::as_ptr(&tiling.commands) as *const () as usize,
             segment_index,
             overlap_shift,
+            copy_blend_mode: copy_blend_mode as u8,
             bbox: [
                 tiling.bbox.x0.to_bits(),
                 tiling.bbox.y0.to_bits(),
@@ -1063,7 +1067,15 @@ impl<'a> CpuRenderer<'a> {
         tiny_skia::FilterQuality,
         f32,
     )> {
-        self.prepare_tiling_paint_for(tiling, &tiling.commands, 0, None, alpha)
+        self.prepare_tiling_paint_for(
+            tiling,
+            &tiling.commands,
+            0,
+            None,
+            BlendMode::Normal,
+            None,
+            alpha,
+        )
     }
 
     /// Rasterize (or look up in `tiling_cache`) either the whole cell
@@ -1071,13 +1083,20 @@ impl<'a> CpuRenderer<'a> {
     /// of `tiling` into a tile pixmap snapped to whole device pixels. When
     /// `overlap_shift` is `Some((di, dj))`, only that single neighbor copy is
     /// rasterized so overlapping backdrop-dependent cells can composite each
-    /// neighbor copy separately in painter's order.
+    /// neighbor copy separately in painter's order. When `overlap_shift` is
+    /// `None` and `copy_blend_mode` is an associative per-copy mode
+    /// (`Multiply`/`Screen`/`Darken`/`Lighten`), overlapping copies are
+    /// composited into the tile with `copy_blend_mode` so repeated per-copy
+    /// blending is preserved even when flattening past the pass budget.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_tiling_paint_for(
         &mut self,
         tiling: &TilingPattern,
         commands: &DisplayList,
         segment_index: usize,
         overlap_shift: Option<(i64, i64)>,
+        copy_blend_mode: BlendMode,
+        copy_filter_bounds: Option<zpdf_core::Rect>,
         alpha: f32,
     ) -> Option<(
         Arc<tiny_skia::Pixmap>,
@@ -1191,6 +1210,16 @@ impl<'a> CpuRenderer<'a> {
             tiny_skia::FilterQuality::Bilinear
         };
 
+        let combine_copies = overlap_shift.is_none()
+            && matches!(
+                copy_blend_mode,
+                BlendMode::Multiply | BlendMode::Screen | BlendMode::Darken | BlendMode::Lighten
+            );
+        let key_mode = if combine_copies {
+            copy_blend_mode
+        } else {
+            BlendMode::Normal
+        };
         let blend_depth = self
             .soft_mask_depth
             .saturating_add(self.blend_stack.len())
@@ -1199,6 +1228,7 @@ impl<'a> CpuRenderer<'a> {
             tiling,
             segment_index,
             overlap_shift,
+            key_mode,
             tile_w,
             tile_h,
             blend_depth,
@@ -1292,10 +1322,22 @@ impl<'a> CpuRenderer<'a> {
                 page_start: None,
             };
 
+            let mut drew_any = false;
             for dj in dj_range {
                 for di in di_range.clone() {
                     if sub.over_budget {
                         break;
+                    }
+                    if let Some(b) = copy_filter_bounds {
+                        let dx = di as f64 * x_step;
+                        let dy = dj as f64 * y_step;
+                        if b.x1 + dx <= bx0 + 1e-9
+                            || b.x0 + dx >= bx0 + abs_x - 1e-9
+                            || b.y1 + dy <= by0 + 1e-9
+                            || b.y0 + dy >= by0 + abs_y - 1e-9
+                        {
+                            continue;
+                        }
                     }
                     // Soft-mask planes are rasterized in `sub`'s device coordinates
                     // (`rect_x0`, `rect_y1`); invalidate before shifting the origin.
@@ -1306,15 +1348,28 @@ impl<'a> CpuRenderer<'a> {
                     sub.rect_x0 = (bx0 - di as f64 * x_step) as f32;
                     sub.rect_y0 = (by0 - dj as f64 * y_step) as f32;
                     sub.rect_y1 = (by0 + abs_y - dj as f64 * y_step) as f32;
+                    let wrapped = combine_copies && drew_any;
+                    if wrapped {
+                        sub.push_blend_group(copy_blend_mode, true, false, 1.0, None);
+                    }
+                    let base_blends = sub.blend_stack.len();
                     for cmd in &commands.commands {
                         let _ = sub.execute(cmd);
-                    }
-                    while !sub.blend_stack.is_empty() {
-                        sub.pop_blend_group();
                     }
                     while !sub.clip_stack.is_empty() {
                         sub.pop_clip();
                     }
+                    while sub.blend_stack.len() > base_blends {
+                        sub.pop_blend_group();
+                    }
+                    if wrapped {
+                        if sub.skipped_blend_depth > 0 {
+                            sub.skipped_blend_depth -= 1;
+                        } else {
+                            sub.pop_blend_group();
+                        }
+                    }
+                    drew_any = true;
                 }
             }
             if sub.over_budget {
@@ -1826,6 +1881,12 @@ impl<'a> CpuRenderer<'a> {
                             &seg.commands,
                             seg.segment_id,
                             overlap_shift,
+                            if overlap_shift.is_none() {
+                                seg.blend_mode
+                            } else {
+                                BlendMode::Normal
+                            },
+                            seg.bounds,
                             1.0,
                         )
                     else {
@@ -1873,6 +1934,8 @@ impl<'a> CpuRenderer<'a> {
                                         &m_seg.commands,
                                         m_seg.segment_id,
                                         overlap_shift,
+                                        BlendMode::Normal,
+                                        m_seg.bounds,
                                         1.0,
                                     )
                                 {
@@ -2179,8 +2242,16 @@ impl<'a> CpuRenderer<'a> {
         // outer shape coverage once directly in a single `fill_path` call.
         if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
             if let Some([TilingBlendStep::Segment(seg)]) = steps.as_deref() {
-                if let Some((pixmap, transform, quality, tile_opacity)) =
-                    self.prepare_tiling_paint_for(tiling, &seg.commands, seg.segment_id, None, 1.0)
+                if let Some((pixmap, transform, quality, tile_opacity)) = self
+                    .prepare_tiling_paint_for(
+                        tiling,
+                        &seg.commands,
+                        seg.segment_id,
+                        None,
+                        BlendMode::Normal,
+                        seg.bounds,
+                        1.0,
+                    )
                 {
                     let paint = tiny_skia::Paint {
                         shader: tiny_skia::Pattern::new(
@@ -2245,7 +2316,15 @@ impl<'a> CpuRenderer<'a> {
                 // cell): paint the single rasterized cell rather than dropping blank.
                 if let (Some(rect), Some((pixmap, transform, quality, tile_opacity))) = (
                     region.to_rect(),
-                    renderer.prepare_tiling_paint_for(tiling, &tiling.commands, 0, None, 1.0),
+                    renderer.prepare_tiling_paint_for(
+                        tiling,
+                        &tiling.commands,
+                        0,
+                        None,
+                        BlendMode::Normal,
+                        None,
+                        1.0,
+                    ),
                 ) {
                     let paint = tiny_skia::Paint {
                         shader: tiny_skia::Pattern::new(
@@ -2310,8 +2389,16 @@ impl<'a> CpuRenderer<'a> {
         // Fast path: single non-overlapping segment at full opacity.
         if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
             if let Some([TilingBlendStep::Segment(seg)]) = steps.as_deref() {
-                if let Some((pixmap, transform, quality, tile_opacity)) =
-                    self.prepare_tiling_paint_for(tiling, &seg.commands, seg.segment_id, None, 1.0)
+                if let Some((pixmap, transform, quality, tile_opacity)) = self
+                    .prepare_tiling_paint_for(
+                        tiling,
+                        &seg.commands,
+                        seg.segment_id,
+                        None,
+                        BlendMode::Normal,
+                        seg.bounds,
+                        1.0,
+                    )
                 {
                     let paint = tiny_skia::Paint {
                         shader: tiny_skia::Pattern::new(
@@ -2391,7 +2478,15 @@ impl<'a> CpuRenderer<'a> {
                 // blend_steps() decline: paint the single rasterized cell.
                 if let (Some(rect), Some((pixmap, transform, quality, tile_opacity))) = (
                     region.to_rect(),
-                    renderer.prepare_tiling_paint_for(tiling, &tiling.commands, 0, None, 1.0),
+                    renderer.prepare_tiling_paint_for(
+                        tiling,
+                        &tiling.commands,
+                        0,
+                        None,
+                        BlendMode::Normal,
+                        None,
+                        1.0,
+                    ),
                 ) {
                     let paint = tiny_skia::Paint {
                         shader: tiny_skia::Pattern::new(
@@ -2682,6 +2777,8 @@ impl<'a> CpuRenderer<'a> {
                                     &seg.commands,
                                     seg.segment_id,
                                     None,
+                                    BlendMode::Normal,
+                                    seg.bounds,
                                     1.0,
                                 )
                             {
@@ -3284,12 +3381,105 @@ impl<'a> CpuRenderer<'a> {
         }
     }
 
+    /// Conservative device-space bounding box (in current `self.pixmap`
+    /// coordinates) of all drawing commands in `cmds`, intersected with
+    /// `self.clip_bounds`. Falls back to `PaintedBounds::whole(w, h)` for
+    /// commands whose bounds cannot be bounded cheaply (e.g. Type 3 glyphs).
+    fn commands_device_scope(&mut self, cmds: &[RenderCommand], w: u32, h: u32) -> PaintedBounds {
+        let mut scope: Option<PaintedBounds> = None;
+        let mut extend = |b: PaintedBounds| {
+            if !b.is_empty() {
+                scope = Some(match scope {
+                    Some(cur) => cur.union(b),
+                    None => b,
+                });
+            }
+        };
+        for cmd in cmds {
+            match cmd {
+                RenderCommand::FillPath { path, .. } => {
+                    if let Some(sp) = self.build_skia_path(path) {
+                        extend(Self::drawn_extent(sp.bounds(), 1.0, w, h));
+                    }
+                }
+                RenderCommand::StrokePath { path, style, .. } => {
+                    if let Some(sp) = self.build_skia_path(path) {
+                        let max_scale = self.scale.max(self.scale_y).max(1.0);
+                        let stroke = Self::skia_stroke(style, max_scale, 1.0);
+                        let grow = stroke_overshoot(stroke.width, stroke.miter_limit) + 2.0;
+                        extend(Self::drawn_extent(sp.bounds(), grow, w, h));
+                    }
+                }
+                RenderCommand::DrawImage(draw) => {
+                    let t = &draw.transform;
+                    let corners = [
+                        (t.e, t.f),
+                        (t.a + t.e, t.b + t.f),
+                        (t.c + t.e, t.d + t.f),
+                        (t.a + t.c + t.e, t.b + t.d + t.f),
+                    ];
+                    let (mut x0, mut y0) = (f32::INFINITY, f32::INFINITY);
+                    let (mut x1, mut y1) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                    for (px, py) in corners {
+                        let dx = self.to_pixel_x(px as f32);
+                        let dy = self.flip_y(py as f32);
+                        x0 = x0.min(dx);
+                        y0 = y0.min(dy);
+                        x1 = x1.max(dx);
+                        y1 = y1.max(dy);
+                    }
+                    if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() {
+                        if let Some(rect) =
+                            tiny_skia::Rect::from_ltrb(x0, y0, x1.max(x0 + 1e-4), y1.max(y0 + 1e-4))
+                        {
+                            extend(Self::drawn_extent(rect, 1.0, w, h));
+                        }
+                    } else {
+                        extend(PaintedBounds::whole(w, h));
+                    }
+                }
+                RenderCommand::DrawGlyphRun(run) => {
+                    let font = self.font_cache.and_then(|fc| fc.get(run.font_id));
+                    let b = font.and_then(|f| self.outline_glyph_run_scope(run, f));
+                    extend(b.unwrap_or_else(|| PaintedBounds::whole(w, h)));
+                }
+                RenderCommand::PushClip { .. }
+                | RenderCommand::PushClipStroke { .. }
+                | RenderCommand::PopClip
+                | RenderCommand::PushBlendGroup { .. }
+                | RenderCommand::PopBlendGroup => {}
+            }
+        }
+        let region = scope.unwrap_or(PaintedBounds {
+            x0: 0,
+            y0: 0,
+            x1: 0,
+            y1: 0,
+        });
+        match self.clip_bounds {
+            Some(clip) => region.intersect(clip),
+            None => region,
+        }
+    }
+
     /// Replay a recorded non-isolated non-`Normal` group against both the live
     /// backdrop (producing `(C_n, α_n)`) and a transparent surface (producing
     /// accumulated group alpha `α_g`), perform exact ISO 32000-1 §11.4.5
     /// backdrop removal, fold any soft mask, and composite onto `backdrop` with
     /// `rec.blend_mode` and `rec.alpha`.
+    ///
+    /// Scopes and bands the `(group_color, group_alpha)` scratch pair to the
+    /// affected region so small (and full-page) groups on large rasters (e.g.
+    /// 7,000 × 7,000) preserve the live backdrop within [`MAX_BLEND_SURFACE_BYTES`].
     fn finish_recorded_non_isolated_group(&mut self, rec: RecordedNonIsolatedGroup) {
+        self.finish_recorded_non_isolated_group_budgeted(rec, MAX_COVERAGE_BAND_BYTES);
+    }
+
+    fn finish_recorded_non_isolated_group_budgeted(
+        &mut self,
+        rec: RecordedNonIsolatedGroup,
+        max_band_bytes: u64,
+    ) {
         if self.over_budget || rec.cmds.is_empty() {
             return;
         }
@@ -3297,14 +3487,186 @@ impl<'a> CpuRenderer<'a> {
             return;
         };
         let (w, h) = (backdrop.width(), backdrop.height());
-        let surface_bytes = w as u64 * h as u64 * 4;
-        let pooled_count = self
-            .surface_pool
-            .iter()
-            .filter(|p| (p.width(), p.height()) == (w, h))
-            .count();
-        let needed_new_bytes = 2usize.saturating_sub(pooled_count) as u64 * surface_bytes;
-        if needed_new_bytes > 0 && !self.surface_room(needed_new_bytes) {
+        let initial_region = self.commands_device_scope(&rec.cmds, w, h);
+        if initial_region.is_empty() {
+            self.pixmap = Some(backdrop);
+            return;
+        }
+
+        let page_surface_bytes = w as u64 * h as u64 * 4;
+        let full_pair_bytes = page_surface_bytes.saturating_mul(2);
+        let use_full_page =
+            initial_region == PaintedBounds::whole(w, h) && full_pair_bytes <= max_band_bytes;
+
+        if use_full_page {
+            let pooled_count = self
+                .surface_pool
+                .iter()
+                .filter(|p| (p.width(), p.height()) == (w, h))
+                .count();
+            let needed_new_bytes = 2usize.saturating_sub(pooled_count) as u64 * page_surface_bytes;
+            if needed_new_bytes == 0 || self.surface_room(needed_new_bytes) {
+                if let Some(mut group_color) = self.take_surface(w, h) {
+                    if let Some(group_alpha) = self.take_surface(w, h) {
+                        let backdrop_dirty = self.dirty.take();
+                        self.blend_surface_bytes =
+                            self.blend_surface_bytes.saturating_add(full_pair_bytes);
+
+                        let run_pass = |this: &mut Self, target: tiny_skia::Pixmap| {
+                            let base_clips = this.clip_stack.len();
+                            let base_blends = this.blend_stack.len();
+                            let base_skipped = this.skipped_blend_depth;
+                            this.pixmap = Some(target);
+                            this.dirty = None;
+                            for cmd in &rec.cmds {
+                                if this.over_budget {
+                                    break;
+                                }
+                                let _ = this.execute(cmd);
+                            }
+                            while this.skipped_blend_depth > base_skipped {
+                                this.skipped_blend_depth -= 1;
+                            }
+                            while this.blend_stack.len() > base_blends {
+                                this.pop_blend_group();
+                            }
+                            while this.clip_stack.len() > base_clips {
+                                this.pop_clip();
+                            }
+                            (this.pixmap.take(), this.dirty.take())
+                        };
+
+                        self.non_isolated_depth = self.non_isolated_depth.saturating_add(1);
+                        group_color.data_mut().copy_from_slice(backdrop.data());
+                        let (group_color, _color_dirty) = run_pass(self, group_color);
+
+                        let prev_alpha_only = std::mem::replace(&mut self.alpha_only_pass, true);
+                        let (group_alpha, alpha_dirty) = run_pass(self, group_alpha);
+                        self.alpha_only_pass = prev_alpha_only;
+                        self.non_isolated_depth = self.non_isolated_depth.saturating_sub(1);
+
+                        self.blend_surface_bytes =
+                            self.blend_surface_bytes.saturating_sub(full_pair_bytes);
+
+                        let (mut group_color, group_alpha) = match (group_color, group_alpha) {
+                            (Some(gc), Some(ga)) => (gc, ga),
+                            (gc_opt, ga_opt) => {
+                                if let Some(gc) = gc_opt {
+                                    let whole = PaintedBounds::whole(gc.width(), gc.height());
+                                    self.recycle_surface(gc, Some(whole));
+                                }
+                                if let Some(ga) = ga_opt {
+                                    self.recycle_surface(ga, alpha_dirty);
+                                }
+                                self.dirty = backdrop_dirty;
+                                self.pixmap = Some(backdrop);
+                                return;
+                            }
+                        };
+
+                        let region = alpha_dirty.filter(|r| !r.is_empty());
+                        if let Some(region) = region {
+                            let stride = w as usize;
+                            let base_data = backdrop.data();
+                            let alpha_data = group_alpha.data();
+                            let col_data = group_color.data_mut();
+                            let (x0, x1) = (region.x0 as usize, region.x1 as usize);
+                            for y in region.y0 as usize..region.y1 as usize {
+                                let row = y * stride;
+                                let m_row = rec
+                                    .mask
+                                    .as_ref()
+                                    .and_then(|plane| plane.get(row + x0..row + x1));
+                                for (dx, x) in (x0..x1).enumerate() {
+                                    let p = (row + x) * 4;
+                                    let ga_u8 = alpha_data[p + 3];
+                                    if ga_u8 == 0 {
+                                        col_data[p..p + 4].fill(0);
+                                        continue;
+                                    }
+                                    let a_g = ga_u8 as f32 / 255.0;
+                                    let a_n = col_data[p + 3] as f32 / 255.0;
+                                    let a_0 = base_data[p + 3] as f32 / 255.0;
+                                    let factor = a_0 / a_g - a_0;
+                                    let m_u8 = m_row.map_or(255, |r| r[dx]);
+                                    if m_u8 == 0 {
+                                        col_data[p..p + 4].fill(0);
+                                        continue;
+                                    }
+                                    for ch in 0..3 {
+                                        let c_n = if a_n > 0.0 {
+                                            (col_data[p + ch] as f32 / 255.0) / a_n
+                                        } else {
+                                            0.0
+                                        };
+                                        let c_0 = if a_0 > 0.0 {
+                                            (base_data[p + ch] as f32 / 255.0) / a_0
+                                        } else {
+                                            0.0
+                                        };
+                                        let c_g = (c_n + (c_n - c_0) * factor).clamp(0.0, 1.0);
+                                        let premul =
+                                            (c_g * a_g * 255.0).round().clamp(0.0, 255.0) as u8;
+                                        col_data[p + ch] = if m_u8 == 255 {
+                                            premul
+                                        } else {
+                                            mul255(premul, m_u8)
+                                        };
+                                    }
+                                    col_data[p + 3] = if m_u8 == 255 {
+                                        ga_u8
+                                    } else {
+                                        mul255(ga_u8, m_u8)
+                                    };
+                                }
+                            }
+
+                            let paint = tiny_skia::PixmapPaint {
+                                blend_mode: Self::blend_mode_to_skia(rec.blend_mode),
+                                opacity: unit(rec.alpha),
+                                ..Default::default()
+                            };
+                            if let Some(rect) = region.to_rect() {
+                                composite_group_region(&mut backdrop, &group_color, &paint, rect);
+                            }
+                            self.dirty = Some(match backdrop_dirty {
+                                Some(b) => b.union(region),
+                                None => region,
+                            });
+                        } else {
+                            self.dirty = backdrop_dirty;
+                        }
+
+                        let whole = PaintedBounds::whole(group_color.width(), group_color.height());
+                        self.recycle_surface(group_color, Some(whole));
+                        self.recycle_surface(group_alpha, alpha_dirty);
+                        self.pixmap = Some(backdrop);
+                        return;
+                    }
+                    self.recycle_surface(group_color, None);
+                }
+            }
+        }
+
+        // Region-scoped / banded path: size the `(group_color, group_alpha)`
+        // scratch pair to `initial_region` (and split into bands when large) so
+        // small or large non-isolated groups on 7,000 × 7,000 rasters stay well
+        // within `MAX_BLEND_SURFACE_BYTES` while preserving the live backdrop.
+        while !self.surface_pool.is_empty()
+            && self
+                .blend_surface_bytes
+                .saturating_add(self.pooled_surface_bytes)
+                .saturating_add(max_band_bytes)
+                > MAX_BLEND_SURFACE_BYTES
+        {
+            if let Some(s) = self.surface_pool.pop() {
+                self.pooled_surface_bytes =
+                    self.pooled_surface_bytes.saturating_sub(surface_bytes(&s));
+            }
+        }
+        let avail_bytes = MAX_BLEND_SURFACE_BYTES.saturating_sub(self.blend_surface_bytes);
+        let budget_bytes = avail_bytes.min(max_band_bytes);
+        if budget_bytes < 8 {
             tracing::warn!(
                 "non-isolated blend group scratch exceeds memory budget; falling back to isolated group"
             );
@@ -3319,152 +3681,298 @@ impl<'a> CpuRenderer<'a> {
             self.pop_blend_group();
             return;
         }
-        let Some(mut group_color) = self.take_surface(w, h) else {
-            self.pixmap = Some(backdrop);
-            return;
-        };
-        let Some(group_alpha) = self.take_surface(w, h) else {
-            self.recycle_surface(group_color, None);
-            self.pixmap = Some(backdrop);
-            return;
+
+        let reg_w = initial_region.x1 - initial_region.x0;
+        let reg_h = initial_region.y1 - initial_region.y0;
+        let max_band_pixels = (budget_bytes / 8).max(1);
+        let (band_w, band_h) = if reg_w as u64 * reg_h as u64 <= max_band_pixels {
+            (reg_w, reg_h)
+        } else {
+            let bw = (reg_w as u64).min(max_band_pixels) as u32;
+            let bh = (max_band_pixels / bw as u64).clamp(1, reg_h as u64) as u32;
+            (bw, bh)
         };
 
         let backdrop_dirty = self.dirty.take();
-        self.blend_surface_bytes = self
-            .blend_surface_bytes
-            .saturating_add(surface_bytes.saturating_mul(2));
+        let saved_ox = self.dev_origin_x;
+        let saved_oy = self.dev_origin_y;
+        let saved_clip = self.current_clip.take();
+        let saved_clip_bounds = self.clip_bounds.take();
+        let saved_clip_stack = std::mem::take(&mut self.clip_stack);
+        let saved_mask_pool = std::mem::take(&mut self.mask_pool);
+        let saved_soft_masks = std::mem::take(&mut self.soft_mask_planes);
+        let saved_soft_mask_bytes = std::mem::replace(&mut self.soft_mask_cache_bytes, 0);
 
-        let run_pass = |this: &mut Self, target: tiny_skia::Pixmap| {
-            let base_clips = this.clip_stack.len();
-            let base_blends = this.blend_stack.len();
-            let base_skipped = this.skipped_blend_depth;
-            this.pixmap = Some(target);
-            this.dirty = None;
-            for cmd in &rec.cmds {
-                if this.over_budget {
-                    break;
-                }
-                let _ = this.execute(cmd);
-            }
-            while this.skipped_blend_depth > base_skipped {
-                this.skipped_blend_depth -= 1;
-            }
-            while this.blend_stack.len() > base_blends {
-                this.pop_blend_group();
-            }
-            while this.clip_stack.len() > base_clips {
-                this.pop_clip();
-            }
-            (this.pixmap.take(), this.dirty.take())
+        let mut merged_dirty: Option<PaintedBounds> = None;
+        let mut color_buf: Option<tiny_skia::Pixmap> = None;
+        let mut alpha_buf: Option<tiny_skia::Pixmap> = None;
+        let mut live_bytes = 0u64;
+        let page_w = w as usize;
+        let paint = tiny_skia::PixmapPaint {
+            blend_mode: Self::blend_mode_to_skia(rec.blend_mode),
+            opacity: unit(rec.alpha),
+            ..Default::default()
         };
 
-        // Pass 1: evaluate commands over a copy of the live backdrop -> (C_n, α_n).
-        self.non_isolated_depth = self.non_isolated_depth.saturating_add(1);
-        group_color.data_mut().copy_from_slice(backdrop.data());
-        let (group_color, _color_dirty) = run_pass(self, group_color);
-
-        // Pass 2: evaluate the same commands over transparent -> exact α_g
-        // (in `alpha_only_pass` mode so nested non-isolated groups never fork).
-        let prev_alpha_only = std::mem::replace(&mut self.alpha_only_pass, true);
-        let (group_alpha, alpha_dirty) = run_pass(self, group_alpha);
-        self.alpha_only_pass = prev_alpha_only;
-        self.non_isolated_depth = self.non_isolated_depth.saturating_sub(1);
-
-        self.blend_surface_bytes = self
-            .blend_surface_bytes
-            .saturating_sub(surface_bytes.saturating_mul(2));
-
-        let (mut group_color, group_alpha) = match (group_color, group_alpha) {
-            (Some(gc), Some(ga)) => (gc, ga),
-            (gc_opt, ga_opt) => {
-                if let Some(gc) = gc_opt {
-                    let whole = PaintedBounds::whole(gc.width(), gc.height());
-                    self.recycle_surface(gc, Some(whole));
+        'bands: for by0 in (initial_region.y0..initial_region.y1).step_by(band_h as usize) {
+            let cur_h = (initial_region.y1 - by0).min(band_h);
+            for bx0 in (initial_region.x0..initial_region.x1).step_by(band_w as usize) {
+                if self.over_budget {
+                    break 'bands;
                 }
-                if let Some(ga) = ga_opt {
-                    self.recycle_surface(ga, alpha_dirty);
-                }
-                self.dirty = backdrop_dirty;
-                self.pixmap = Some(backdrop);
-                return;
-            }
-        };
+                let cur_w = (initial_region.x1 - bx0).min(band_w);
+                let bw_usize = cur_w as usize;
 
-        let region = alpha_dirty.filter(|r| !r.is_empty());
-        if let Some(region) = region {
-            let stride = w as usize;
-            let base_data = backdrop.data();
-            let alpha_data = group_alpha.data();
-            let col_data = group_color.data_mut();
-            let (x0, x1) = (region.x0 as usize, region.x1 as usize);
-            for y in region.y0 as usize..region.y1 as usize {
-                let row = y * stride;
-                let m_row = rec
-                    .mask
-                    .as_ref()
-                    .and_then(|plane| plane.get(row + x0..row + x1));
-                for (dx, x) in (x0..x1).enumerate() {
-                    let p = (row + x) * 4;
-                    let ga_u8 = alpha_data[p + 3];
-                    if ga_u8 == 0 {
-                        col_data[p..p + 4].fill(0);
-                        continue;
-                    }
-                    let a_g = ga_u8 as f32 / 255.0;
-                    let a_n = col_data[p + 3] as f32 / 255.0;
-                    let a_0 = base_data[p + 3] as f32 / 255.0;
-                    let factor = a_0 / a_g - a_0;
-                    let m_u8 = m_row.map_or(255, |r| r[dx]);
-                    if m_u8 == 0 {
-                        col_data[p..p + 4].fill(0);
-                        continue;
-                    }
-                    for ch in 0..3 {
-                        let c_n = if a_n > 0.0 {
-                            (col_data[p + ch] as f32 / 255.0) / a_n
-                        } else {
-                            0.0
-                        };
-                        let c_0 = if a_0 > 0.0 {
-                            (base_data[p + ch] as f32 / 255.0) / a_0
-                        } else {
-                            0.0
-                        };
-                        let c_g = (c_n + (c_n - c_0) * factor).clamp(0.0, 1.0);
-                        let premul = (c_g * a_g * 255.0).round().clamp(0.0, 255.0) as u8;
-                        col_data[p + ch] = if m_u8 == 255 {
-                            premul
-                        } else {
-                            mul255(premul, m_u8)
-                        };
-                    }
-                    col_data[p + 3] = if m_u8 == 255 {
-                        ga_u8
-                    } else {
-                        mul255(ga_u8, m_u8)
+                // Slice outer clip mask into band coordinates (skip band if completely clipped out).
+                let band_clip = if let Some(ref cm) = saved_clip {
+                    let mut m = match tiny_skia::Mask::new(cur_w, cur_h) {
+                        Some(m) => m,
+                        None => break 'bands,
                     };
-                }
-            }
+                    let src = cm.data();
+                    let dst = m.data_mut();
+                    let mut any_nonzero = false;
+                    for ly in 0..cur_h as usize {
+                        let s_off = (by0 as usize + ly) * page_w + bx0 as usize;
+                        let d_off = ly * bw_usize;
+                        let row_src = &src[s_off..s_off + bw_usize];
+                        dst[d_off..d_off + bw_usize].copy_from_slice(row_src);
+                        if !any_nonzero && row_src.iter().any(|&v| v != 0) {
+                            any_nonzero = true;
+                        }
+                    }
+                    if !any_nonzero {
+                        continue;
+                    }
+                    Some(m)
+                } else {
+                    None
+                };
 
-            let paint = tiny_skia::PixmapPaint {
-                blend_mode: Self::blend_mode_to_skia(rec.blend_mode),
-                opacity: unit(rec.alpha),
-                ..Default::default()
-            };
-            if let Some(rect) = region.to_rect() {
-                composite_group_region(&mut backdrop, &group_color, &paint, rect);
+                let reuse = color_buf
+                    .as_ref()
+                    .is_some_and(|p| p.width() == cur_w && p.height() == cur_h);
+                if reuse {
+                    if let Some(ref mut a) = alpha_buf {
+                        a.data_mut().fill(0);
+                    }
+                } else {
+                    color_buf = None;
+                    alpha_buf = None;
+                    self.blend_surface_bytes = self.blend_surface_bytes.saturating_sub(live_bytes);
+                    live_bytes = 0;
+                    let pair_bytes = cur_w as u64 * cur_h as u64 * 8;
+                    if !self.surface_room(pair_bytes) {
+                        break 'bands;
+                    }
+                    let Some(gc) = tiny_skia::Pixmap::new(cur_w, cur_h) else {
+                        break 'bands;
+                    };
+                    let Some(ga) = tiny_skia::Pixmap::new(cur_w, cur_h) else {
+                        break 'bands;
+                    };
+                    self.blend_surface_bytes = self.blend_surface_bytes.saturating_add(pair_bytes);
+                    live_bytes = pair_bytes;
+                    color_buf = Some(gc);
+                    alpha_buf = Some(ga);
+                }
+
+                let Some(mut gc) = color_buf.take() else {
+                    break 'bands;
+                };
+                let Some(ga) = alpha_buf.take() else {
+                    color_buf = Some(gc);
+                    break 'bands;
+                };
+
+                self.dev_origin_x = saved_ox.saturating_add(bx0);
+                self.dev_origin_y = saved_oy.saturating_add(by0);
+                if !self.soft_mask_planes.is_empty() {
+                    self.soft_mask_planes.clear();
+                    self.soft_mask_cache_bytes = 0;
+                }
+                self.current_clip = band_clip;
+                self.clip_bounds = self
+                    .current_clip
+                    .as_ref()
+                    .map(|_| PaintedBounds::whole(cur_w, cur_h));
+
+                // Seed `gc` from `backdrop` over this band.
+                let row_bytes = bw_usize * 4;
+                let base_data = backdrop.data();
+                let gc_data = gc.data_mut();
+                for ly in 0..cur_h as usize {
+                    let dst_off = ly * row_bytes;
+                    let src_off = ((by0 as usize + ly) * page_w + bx0 as usize) * 4;
+                    gc_data[dst_off..dst_off + row_bytes]
+                        .copy_from_slice(&base_data[src_off..src_off + row_bytes]);
+                }
+
+                let run_band_pass = |this: &mut Self, target: tiny_skia::Pixmap| {
+                    let base_clips = this.clip_stack.len();
+                    let base_blends = this.blend_stack.len();
+                    let base_skipped = this.skipped_blend_depth;
+                    this.pixmap = Some(target);
+                    this.dirty = None;
+                    for cmd in &rec.cmds {
+                        if this.over_budget {
+                            break;
+                        }
+                        let _ = this.execute(cmd);
+                    }
+                    while this.skipped_blend_depth > base_skipped {
+                        this.skipped_blend_depth -= 1;
+                    }
+                    while this.blend_stack.len() > base_blends {
+                        this.pop_blend_group();
+                    }
+                    while this.clip_stack.len() > base_clips {
+                        this.pop_clip();
+                    }
+                    (this.pixmap.take(), this.dirty.take())
+                };
+
+                self.non_isolated_depth = self.non_isolated_depth.saturating_add(1);
+                let (gc_opt, _color_dirty) = run_band_pass(self, gc);
+                let prev_alpha_only = std::mem::replace(&mut self.alpha_only_pass, true);
+                let (ga_opt, alpha_dirty) = run_band_pass(self, ga);
+                self.alpha_only_pass = prev_alpha_only;
+                self.non_isolated_depth = self.non_isolated_depth.saturating_sub(1);
+
+                self.current_clip = None;
+                self.clip_bounds = None;
+                self.clip_stack.clear();
+
+                let (Some(mut gc), Some(ga)) = (gc_opt, ga_opt) else {
+                    break 'bands;
+                };
+
+                if let Some(local_region) = alpha_dirty.filter(|r| !r.is_empty()) {
+                    let base_data = backdrop.data();
+                    let alpha_data = ga.data();
+                    let col_data = gc.data_mut();
+                    let (lx0, lx1) = (local_region.x0 as usize, local_region.x1 as usize);
+                    let (ly0, ly1) = (local_region.y0 as usize, local_region.y1 as usize);
+
+                    for ly in 0..cur_h as usize {
+                        let row_start = ly * bw_usize;
+                        if ly < ly0 || ly >= ly1 {
+                            col_data[row_start * 4..(row_start + bw_usize) * 4].fill(0);
+                            continue;
+                        }
+                        if lx0 > 0 {
+                            col_data[row_start * 4..(row_start + lx0) * 4].fill(0);
+                        }
+                        if lx1 < bw_usize {
+                            col_data[(row_start + lx1) * 4..(row_start + bw_usize) * 4].fill(0);
+                        }
+                        let page_row = (by0 as usize + ly) * page_w + bx0 as usize;
+                        let m_row = rec
+                            .mask
+                            .as_ref()
+                            .and_then(|plane| plane.get(page_row + lx0..page_row + lx1));
+                        for (dx, lx) in (lx0..lx1).enumerate() {
+                            let lp = (row_start + lx) * 4;
+                            let ga_u8 = alpha_data[lp + 3];
+                            if ga_u8 == 0 {
+                                col_data[lp..lp + 4].fill(0);
+                                continue;
+                            }
+                            let m_u8 = m_row.map_or(255, |r| r[dx]);
+                            if m_u8 == 0 {
+                                col_data[lp..lp + 4].fill(0);
+                                continue;
+                            }
+                            let bp = (page_row + lx) * 4;
+                            let a_g = ga_u8 as f32 / 255.0;
+                            let a_n = col_data[lp + 3] as f32 / 255.0;
+                            let a_0 = base_data[bp + 3] as f32 / 255.0;
+                            let factor = a_0 / a_g - a_0;
+                            for ch in 0..3 {
+                                let c_n = if a_n > 0.0 {
+                                    (col_data[lp + ch] as f32 / 255.0) / a_n
+                                } else {
+                                    0.0
+                                };
+                                let c_0 = if a_0 > 0.0 {
+                                    (base_data[bp + ch] as f32 / 255.0) / a_0
+                                } else {
+                                    0.0
+                                };
+                                let c_g = (c_n + (c_n - c_0) * factor).clamp(0.0, 1.0);
+                                let premul = (c_g * a_g * 255.0).round().clamp(0.0, 255.0) as u8;
+                                col_data[lp + ch] = if m_u8 == 255 {
+                                    premul
+                                } else {
+                                    mul255(premul, m_u8)
+                                };
+                            }
+                            col_data[lp + 3] = if m_u8 == 255 {
+                                ga_u8
+                            } else {
+                                mul255(ga_u8, m_u8)
+                            };
+                        }
+                    }
+
+                    backdrop.draw_pixmap(
+                        bx0 as i32,
+                        by0 as i32,
+                        gc.as_ref(),
+                        &paint,
+                        tiny_skia::Transform::identity(),
+                        None,
+                    );
+                    let page_active = PaintedBounds {
+                        x0: bx0 + local_region.x0,
+                        y0: by0 + local_region.y0,
+                        x1: bx0 + local_region.x1,
+                        y1: by0 + local_region.y1,
+                    };
+                    merged_dirty = Some(match merged_dirty {
+                        Some(m) => m.union(page_active),
+                        None => page_active,
+                    });
+                }
+
+                color_buf = Some(gc);
+                alpha_buf = Some(ga);
             }
-            self.dirty = Some(match backdrop_dirty {
-                Some(b) => b.union(region),
-                None => region,
-            });
-        } else {
-            self.dirty = backdrop_dirty;
         }
 
-        let whole = PaintedBounds::whole(group_color.width(), group_color.height());
-        self.recycle_surface(group_color, Some(whole));
-        self.recycle_surface(group_alpha, alpha_dirty);
+        drop(color_buf);
+        drop(alpha_buf);
+        self.blend_surface_bytes = self.blend_surface_bytes.saturating_sub(live_bytes);
+
+        let mut kept_bytes = 0u64;
+        self.surface_pool.retain(|p| {
+            let keep = p.width() == w && p.height() == h;
+            if keep {
+                kept_bytes = kept_bytes.saturating_add(surface_bytes(p));
+            }
+            keep
+        });
+        self.pooled_surface_bytes = kept_bytes;
+
+        let band_mask_bytes: u64 = self
+            .mask_pool
+            .iter()
+            .map(|m| m.width() as u64 * m.height() as u64)
+            .sum();
+        self.clip_mask_bytes = self.clip_mask_bytes.saturating_sub(band_mask_bytes);
+        self.mask_pool = saved_mask_pool;
+        self.clip_stack = saved_clip_stack;
+        self.current_clip = saved_clip;
+        self.clip_bounds = saved_clip_bounds;
+        self.soft_mask_planes = saved_soft_masks;
+        self.soft_mask_cache_bytes = saved_soft_mask_bytes;
+        self.dev_origin_x = saved_ox;
+        self.dev_origin_y = saved_oy;
+
+        self.dirty = match (backdrop_dirty, merged_dirty) {
+            (Some(b), Some(m)) => Some(b.union(m)),
+            (b, m) => b.or(m),
+        };
         self.pixmap = Some(backdrop);
     }
 
@@ -5370,6 +5878,10 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         }
 
         if let Some(ref mut rec) = self.recording_non_isolated {
+            if self.over_budget && !rec.cmds.is_empty() {
+                rec.cmds.clear();
+                rec.cmds.shrink_to_fit();
+            }
             match cmd {
                 RenderCommand::PushBlendGroup { .. } => {
                     rec.nesting += 1;
@@ -5868,6 +6380,143 @@ mod tests {
         assert_eq!(renderer.skipped_blend_depth, 0);
         renderer.execute(&RenderCommand::PopBlendGroup).unwrap();
         assert!(renderer.blend_stack.is_empty());
+
+        // A recorded non-isolated Screen parent also occupies depth 1, so with
+        // max_blend_group_depth = 1 a nested child group inside it must be
+        // skipped to passthrough rather than allocating/compositing a second
+        // blend group (verified by alpha = 0.0 on the child: if not skipped it
+        // would hide the inner red fill; when skipped the red fill draws through).
+        let mut full = Path::new();
+        full.rect(Rect::new(0.0, 0.0, 4.0, 4.0));
+        renderer
+            .execute(&RenderCommand::FillPath {
+                path: full.clone(),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            })
+            .unwrap();
+        renderer
+            .execute(&RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Screen,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+                alpha: 1.0,
+                mask: None,
+            })
+            .unwrap();
+        renderer
+            .execute(&RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+                alpha: 0.0,
+                mask: None,
+            })
+            .unwrap();
+        renderer
+            .execute(&RenderCommand::FillPath {
+                path: full,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            })
+            .unwrap();
+        renderer.execute(&RenderCommand::PopBlendGroup).unwrap();
+        renderer.execute(&RenderCommand::PopBlendGroup).unwrap();
+        assert!(renderer.blend_stack.is_empty());
+        assert_eq!(renderer.skipped_blend_depth, 0);
+        assert_eq!(renderer.non_isolated_depth, 0);
+        let page = renderer.end_page().unwrap();
+        let px = &page.data[0..3];
+        assert!(
+            px[0] > 240 && px[1] < 10 && px[2] < 10,
+            "nested child group inside recorded non-isolated Screen parent at depth limit 1 must be skipped to passthrough, got {px:?}"
+        );
+    }
+
+    #[test]
+    fn recording_non_isolated_group_drops_saved_draws_after_timeout() {
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 16.0, 16.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        renderer
+            .execute(&RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Screen,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 16.0, 16.0),
+                alpha: 1.0,
+                mask: None,
+            })
+            .unwrap();
+        let mut rect = Path::new();
+        rect.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        renderer
+            .execute(&RenderCommand::FillPath {
+                path: rect,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            })
+            .unwrap();
+        assert_eq!(
+            renderer
+                .recording_non_isolated
+                .as_ref()
+                .expect("recording active")
+                .cmds
+                .len(),
+            1
+        );
+
+        // Expire the page deadline and execute a glyph run; previously saved
+        // draws must be released and the glyph run must not be cloned into cmds.
+        renderer.deadline = Some(zpdf_core::time::Instant::now());
+        renderer.over_budget = true;
+        let glyph_run = GlyphRun {
+            font_id: 0,
+            font_size: 12.0,
+            glyphs: vec![zpdf_display_list::PositionedGlyph {
+                glyph_id: 1,
+                code_len: 1,
+                code: 65,
+                x: 1.0,
+                y: 1.0,
+                advance: 6.0,
+            }],
+            transform: zpdf_core::Matrix::identity(),
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            h_scale: 1.0,
+        };
+        renderer
+            .execute(&RenderCommand::DrawGlyphRun(glyph_run))
+            .unwrap();
+        let rec = renderer
+            .recording_non_isolated
+            .as_ref()
+            .expect("still tracking nesting until matching pop");
+        assert!(
+            rec.cmds.is_empty() && rec.cmds.capacity() == 0,
+            "saved draws must be released once deadline fires (len={}, cap={})",
+            rec.cmds.len(),
+            rec.cmds.capacity()
+        );
+        renderer.execute(&RenderCommand::PopBlendGroup).unwrap();
+        assert!(renderer.recording_non_isolated.is_none());
+        assert!(renderer.end_page().is_ok());
     }
 
     #[test]
@@ -7918,5 +8567,79 @@ mod tests {
                 && (px2[2] as i32 - 96).abs() <= 2,
             "nested non-isolated Multiply(Screen(0.5, red)) over gray must be ~(128, 96, 96), got {px2:?}"
         );
+    }
+
+    #[test]
+    fn banded_non_isolated_screen_group_matches_single_pass() {
+        // Verify multi-band slicing in `finish_recorded_non_isolated_group_budgeted`
+        // (including active clip mask and soft mask) matches a single full pass
+        // bit-for-bit.
+        let page_rect = Rect::new(0.0, 0.0, 48.0, 48.0);
+        let mut clip_path = Path::new();
+        clip_path.rect(Rect::new(4.0, 4.0, 44.0, 44.0));
+        let mut fill_path = Path::new();
+        fill_path.rect(Rect::new(8.0, 8.0, 40.0, 40.0));
+
+        let run = |max_band_bytes: u64| -> Vec<u8> {
+            let mut r = CpuRenderer::new();
+            r.begin_page(&PageRenderInfo {
+                page_rect,
+                scale: 1.0,
+                background: Color::rgb(0.0, 0.0, 1.0),
+            })
+            .unwrap();
+            // Right half gray so Screen(gray, gray) = ~191 while left stays blue.
+            let mut right = Path::new();
+            right.rect(Rect::new(24.0, 0.0, 48.0, 48.0));
+            r.execute(&RenderCommand::FillPath {
+                path: right,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.5, 0.5, 0.5)),
+                alpha: 1.0,
+                overprint: None,
+            })
+            .unwrap();
+            r.push_clip(&clip_path, &FillRule::NonZero);
+            let rec = RecordedNonIsolatedGroup {
+                blend_mode: BlendMode::Screen,
+                alpha: 1.0,
+                mask: None,
+                nesting: 0,
+                cmds: vec![
+                    RenderCommand::PushBlendGroup {
+                        blend_mode: BlendMode::Multiply,
+                        isolated: true,
+                        knockout: false,
+                        bounds: page_rect,
+                        alpha: 1.0,
+                        mask: None,
+                    },
+                    RenderCommand::FillPath {
+                        path: fill_path.clone(),
+                        rule: FillRule::NonZero,
+                        paint: Paint::Solid(Color::white()),
+                        alpha: 1.0,
+                        overprint: None,
+                    },
+                    RenderCommand::PopBlendGroup,
+                ],
+            };
+            r.finish_recorded_non_isolated_group_budgeted(rec, max_band_bytes);
+            r.pop_clip();
+            r.end_page().unwrap().data
+        };
+
+        let single = run(MAX_COVERAGE_BAND_BYTES);
+        let banded = run(512);
+        let tiled = run(128);
+        assert_eq!(single, banded);
+        assert_eq!(single, tiled);
+        // Left half inside fill (x=16, y=24) must stay pure blue; right half (x=32, y=24) must be ~191 gray.
+        let left_off = ((24 * 48 + 16) * 4) as usize;
+        assert_eq!(&single[left_off..left_off + 3], &[0, 0, 255]);
+        let right_off = ((24 * 48 + 32) * 4) as usize;
+        assert!(single[right_off..right_off + 3]
+            .iter()
+            .all(|&c| (186..=197).contains(&c)));
     }
 }

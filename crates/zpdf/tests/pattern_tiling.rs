@@ -2002,9 +2002,9 @@ fn outer_screen_blend_mode_on_backdrop_dependent_tiling_evaluates_cell_first() {
           /Resources << /Pattern << /P0 5 0 R >> /ExtGState << /GS 7 0 R >> >> >>"
             .to_vec(), // 3
         content,                                       // 4
-        cell,                                          // 5
-        gs_mul,                                        // 6
-        gs_screen,                                     // 7
+        cell.clone(),                                  // 5
+        gs_mul.clone(),                                // 6
+        gs_screen.clone(),                             // 7
     ]);
     let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
 
@@ -2023,6 +2023,36 @@ fn outer_screen_blend_mode_on_backdrop_dependent_tiling_evaluates_cell_first() {
     assert!(
         gray_out.iter().all(|&c| (124..=132).contains(&c)),
         "50% gray outside the patterned fill must stay untouched (~128), got {gray_out:?}"
+    );
+
+    // Same small white-Multiply pattern under outer /BM /Screen over opaque blue
+    // on a 7,000 × 7,000 raster (page = 196 MB; two full-page scratch buffers
+    // would exceed the 512 MiB blend budget). Scoped/banded replay must keep
+    // the backdrop live so the pixel stays pure blue instead of isolating to white.
+    let big_content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 7000 7000 re f\n\
+          /GS gs /Pattern cs /P0 scn 100 100 80 80 re f",
+    );
+    let big_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 7000 7000] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> /ExtGState << /GS 7 0 R >> >> >>"
+            .to_vec(), // 3
+        big_content,                                   // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+        gs_screen,                                     // 7
+    ]);
+    let (_dl_big, _stats_big, big_page) = render_with_stats(big_pdf, 1.0);
+    assert_eq!(big_page.width, 7000);
+    assert_eq!(big_page.height, 7000);
+    let big_blue_in = px_on(&big_page, 7000.0, 1.0, 140.5, 140.5);
+    assert_rgbish(
+        big_blue_in,
+        [0, 0, 255],
+        "white Multiply cell under outer /BM /Screen over blue on 7000x7000 raster must stay blue",
     );
 }
 
@@ -2113,13 +2143,16 @@ fn dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
         cell_mul_stream.as_bytes(),
     );
 
-    // Cell B: 175 non-coalesceable alternating Multiply/Darken white marks across
-    // 6 steps (6 × 175 = 1,050 > 1,024 pass budget) + trailing black detail in
-    // step 0, on a 2×2 step (132×132 fill = 66×66 = 4,356 > 4,096 dense tiles).
+    // Cell B: 175 non-coalesceable alternating Multiply/Darken spanning marks
+    // across 6 steps (6 × 175 = 1,050 > 1,024 pass budget), with one spanning
+    // Multiply mark set to 50% gray (0.5) so 6 repeated Multiply copies must
+    // reduce opaque blue from 255 to ~4 (NOT 128), plus a trailing black detail
+    // in step 0, on a 2×2 step (132×132 fill = 66×66 = 4,356 > 4,096 tiles).
     let mut cell_alt_stream = String::new();
     for k in 0..175 {
         let gs = if k % 2 == 0 { "/GM" } else { "/GD" };
-        cell_alt_stream.push_str(&format!("{gs} gs 1 1 1 rg 0 0 12 2 re f\n"));
+        let rgb = if k == 20 { "0.5 0.5 0.5" } else { "1 1 1" };
+        cell_alt_stream.push_str(&format!("{gs} gs {rgb} rg 0 0 12 2 re f\n"));
     }
     cell_alt_stream.push_str("/GM gs 0 0 0 rg 0 0 1 2 re f\n");
     let cell_alt = stream_obj(
@@ -2161,15 +2194,16 @@ fn dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
         "Cell A white Multiply marks must preserve blue backdrop",
     );
 
-    // Cell B (175 alternating Multiply/Darken > 1,024 passes): x mod 2 == 0 is black, x mod 2 == 1 stays blue.
+    // Cell B (175 alternating Multiply/Darken > 1,024 passes): x mod 2 == 0 is black,
+    // x mod 2 == 1 gets 6 overlapping copies of 50%-gray Multiply over blue -> ~4 (NOT 128).
     assert_rgbish(
         px_on(&page, 260.0, 1.0, 340.2, 66.5),
         [0, 0, 0],
         "Cell B trailing black detail past 1,024-pass overlap budget must remain visible",
     );
-    assert_rgbish(
-        px_on(&page, 260.0, 1.0, 341.2, 66.5),
-        [0, 0, 255],
-        "Cell B white Multiply/Darken marks in bounded fallback must preserve blue backdrop",
+    let bg_b = px_on(&page, 260.0, 1.0, 341.2, 66.5);
+    assert!(
+        bg_b[0] <= 2 && bg_b[1] <= 2 && (2..=7).contains(&bg_b[2]),
+        "Cell B 6x overlapping 50%-gray Multiply over blue must be ~[0,0,4] (NOT ~[0,0,128]), got {bg_b:?}"
     );
 }

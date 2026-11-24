@@ -145,6 +145,7 @@ pub struct SyntheticTileKey {
     commands: usize,
     segment_index: usize,
     overlap_shift: Option<(i64, i64)>,
+    copy_blend_mode: u8,
     bbox: [u64; 4],
     steps: [u64; 2],
     width: u32,
@@ -154,10 +155,12 @@ pub struct SyntheticTileKey {
 }
 
 impl SyntheticTileKey {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tiling: &zpdf_display_list::TilingPattern,
         segment_index: usize,
         overlap_shift: Option<(i64, i64)>,
+        copy_blend_mode: BlendMode,
         width: u32,
         height: u32,
         nearest: bool,
@@ -167,6 +170,7 @@ impl SyntheticTileKey {
             commands: std::sync::Arc::as_ptr(&tiling.commands) as *const () as usize,
             segment_index,
             overlap_shift,
+            copy_blend_mode: copy_blend_mode as u8,
             bbox: [
                 tiling.bbox.x0.to_bits(),
                 tiling.bbox.y0.to_bits(),

@@ -1785,12 +1785,28 @@ fn record_tiling_pattern_rasterized(
     let get_or_record_tile = |rec: &mut PageRecorder,
                               commands: &zpdf_display_list::DisplayList,
                               segment_index: usize,
-                              overlap_shift: Option<(i64, i64)>|
+                              overlap_shift: Option<(i64, i64)>,
+                              copy_blend_mode: zpdf_display_list::BlendMode,
+                              seg_bounds: Option<zpdf_core::Rect>|
      -> Option<u32> {
+        let combine_copies = overlap_shift.is_none()
+            && matches!(
+                copy_blend_mode,
+                zpdf_display_list::BlendMode::Multiply
+                    | zpdf_display_list::BlendMode::Screen
+                    | zpdf_display_list::BlendMode::Darken
+                    | zpdf_display_list::BlendMode::Lighten
+            );
+        let key_mode = if combine_copies {
+            copy_blend_mode
+        } else {
+            zpdf_display_list::BlendMode::Normal
+        };
         let key = record::SyntheticTileKey::new(
             tiling,
             segment_index,
             overlap_shift,
+            key_mode,
             tile_w,
             tile_h,
             exact_1to1,
@@ -1805,10 +1821,25 @@ fn record_tiling_pattern_rasterized(
                 Some((di, dj)) => (di..=di, dj..=dj),
                 None => (overlap.di.clone(), overlap.dj.clone()),
             };
+            let mut drew_any = false;
             'copies: for dj in dj_range {
                 for di in di_range.clone() {
                     if !r.can_record() {
                         break 'copies;
+                    }
+                    if let Some(b) = seg_bounds {
+                        let dx = di as f64 * tiling.x_step;
+                        let dy = dj as f64 * tiling.y_step;
+                        if b.x1 + dx <= bx0 + 1e-9
+                            || b.x0 + dx >= bx0 + abs_x - 1e-9
+                            || b.y1 + dy <= by0 + 1e-9
+                            || b.y0 + dy >= by0 + abs_y - 1e-9
+                        {
+                            continue;
+                        }
+                    }
+                    if combine_copies && drew_any && r.can_push_blend() {
+                        r.push_blend(copy_blend_mode, 1.0, None);
                     }
                     let copy_ctm = pat_to_tile.concat(&zpdf_core::Matrix::translate(
                         di as f64 * tiling.x_step,
@@ -1823,8 +1854,9 @@ fn record_tiling_pattern_rasterized(
                         &tile_map,
                         depth + 1,
                     );
-                    r.close_open_blends();
                     r.pop_all_clips();
+                    r.close_open_blends();
+                    drew_any = true;
                 }
             }
             r.replace_page_rect(saved_rect);
@@ -1889,6 +1921,8 @@ fn record_tiling_pattern_rasterized(
                     &zpdf_display_list::DisplayList,
                     usize,
                     Option<(i64, i64)>,
+                    zpdf_display_list::BlendMode,
+                    Option<zpdf_core::Rect>,
                 ) -> Option<u32>,
             {
                 for step in steps {
@@ -1908,6 +1942,12 @@ fn record_tiling_pattern_rasterized(
                                 &seg.commands,
                                 seg.segment_id,
                                 overlap_shift,
+                                if overlap_shift.is_none() {
+                                    seg.blend_mode
+                                } else {
+                                    zpdf_display_list::BlendMode::Normal
+                                },
+                                seg.bounds,
                             ) else {
                                 continue;
                             };
@@ -1951,6 +1991,8 @@ fn record_tiling_pattern_rasterized(
                                         &m_seg.commands,
                                         m_seg.segment_id,
                                         overlap_shift,
+                                        zpdf_display_list::BlendMode::Normal,
+                                        m_seg.bounds,
                                     ) else {
                                         continue;
                                     };
@@ -2059,7 +2101,14 @@ fn record_tiling_pattern_rasterized(
         }
     }
 
-    if let Some(tile_id) = get_or_record_tile(rec, &tiling.commands, 0, None) {
+    if let Some(tile_id) = get_or_record_tile(
+        rec,
+        &tiling.commands,
+        0,
+        None,
+        zpdf_display_list::BlendMode::Normal,
+        None,
+    ) {
         rec.add_tile(quad_alpha, tile_id);
     }
 }
