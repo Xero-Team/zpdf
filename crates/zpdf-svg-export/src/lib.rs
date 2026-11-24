@@ -91,21 +91,6 @@ pub fn display_list_to_svg(
 
     let mut writer = SvgWriter::new(rect, width, height, fonts, images, options);
 
-    writer
-        .out
-        .push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    writer
-        .out
-        .push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"");
-    push_num(&mut writer.out, width);
-    writer.out.push_str("pt\" height=\"");
-    push_num(&mut writer.out, height);
-    writer.out.push_str("pt\" viewBox=\"0 0 ");
-    push_num(&mut writer.out, width);
-    writer.out.push(' ');
-    push_num(&mut writer.out, height);
-    writer.out.push_str("\">\n");
-
     if let Some(bg) = &options.background {
         writer.out.push_str("<rect width=\"");
         push_num(&mut writer.out, width);
@@ -118,8 +103,25 @@ pub fn display_list_to_svg(
 
     writer.emit_commands(&display_list.commands, 0);
 
-    writer.out.push_str("</svg>\n");
-    writer.out
+    let mut svg = String::with_capacity(writer.defs.len() + writer.out.len() + 192);
+    svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    svg.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"");
+    push_num(&mut svg, width);
+    svg.push_str("pt\" height=\"");
+    push_num(&mut svg, height);
+    svg.push_str("pt\" viewBox=\"0 0 ");
+    push_num(&mut svg, width);
+    svg.push(' ');
+    push_num(&mut svg, height);
+    svg.push_str("\">\n");
+    if !writer.defs.is_empty() {
+        svg.push_str("<defs>\n");
+        svg.push_str(&writer.defs);
+        svg.push_str("</defs>\n");
+    }
+    svg.push_str(&writer.out);
+    svg.push_str("</svg>\n");
+    svg
 }
 
 /// A structural frame opened by a Push* command.
@@ -139,11 +141,17 @@ enum Frame {
     },
     Blend {
         open: bool,
+        isolates: bool,
     },
 }
 
 struct SvgWriter<'a> {
+    defs: String,
     out: String,
+    has_opaque_background: bool,
+    blend_depth: usize,
+    isolated_depth: usize,
+    backdrop_snapshots: usize,
     x0: f64,
     y1: f64,
     /// Uniform coordinate scale from current PDF space (page or pattern cell)
@@ -236,6 +244,23 @@ struct PatternDefKey {
 /// Cap on separate `(overlap_copy × blend_segment)` SVG passes for one
 /// overlapping backdrop-dependent tiling fill or stroke.
 const MAX_SVG_TILING_BLEND_PASSES: usize = 64;
+/// Cap on chained page-backdrop `<g id="b...">` snapshots used for non-associative
+/// multi-pass tiling patterns painted with `opacity < 1.0`.
+const MAX_BACKDROP_SNAPSHOTS: usize = 4;
+
+struct TilingPatternGeometry {
+    bx0: f64,
+    by0: f64,
+    bbox_x1: f64,
+    bbox_y1: f64,
+    x_step: f64,
+    y_step: f64,
+    abs_y: f64,
+    cell_scale: f64,
+    tile_w: f64,
+    tile_h: f64,
+    matrix: zpdf_core::Matrix,
+}
 
 /// An interpreted Type 3 glyph procedure.
 struct Type3Glyph {
@@ -255,7 +280,12 @@ impl<'a> SvgWriter<'a> {
         options: &SvgOptions,
     ) -> Self {
         Self {
+            defs: String::new(),
             out: String::new(),
+            has_opaque_background: options.background.is_some_and(|c| c.a >= 1.0),
+            blend_depth: 0,
+            isolated_depth: 0,
+            backdrop_snapshots: 0,
             x0: rect.x0,
             y1: rect.y1,
             scale: 1.0,
@@ -384,13 +414,25 @@ impl<'a> SvgWriter<'a> {
                     if *knockout {
                         self.warn_knockout();
                     }
-                    self.open_blend_group(*blend_mode, *isolated, *alpha, mask.as_ref(), depth);
-                    frames.push(Frame::Blend { open: true });
+                    let isolates =
+                        self.open_blend_group(*blend_mode, *isolated, *alpha, mask.as_ref(), depth);
+                    self.blend_depth += 1;
+                    if isolates {
+                        self.isolated_depth += 1;
+                    }
+                    frames.push(Frame::Blend {
+                        open: true,
+                        isolates,
+                    });
                 }
                 RenderCommand::PopBlendGroup => match frames.last() {
-                    Some(Frame::Blend { open }) => {
+                    Some(Frame::Blend { open, isolates }) => {
                         if *open {
                             self.out.push_str("</g>\n");
+                            self.blend_depth = self.blend_depth.saturating_sub(1);
+                            if *isolates {
+                                self.isolated_depth = self.isolated_depth.saturating_sub(1);
+                            }
                         }
                         frames.pop();
                     }
@@ -401,9 +443,13 @@ impl<'a> SvgWriter<'a> {
         // A malformed stream can leave frames unclosed; keep the SVG well-formed.
         for frame in frames.drain(..).rev() {
             match frame {
-                Frame::Blend { open } => {
+                Frame::Blend { open, isolates } => {
                     if open {
                         self.out.push_str("</g>\n");
+                        self.blend_depth = self.blend_depth.saturating_sub(1);
+                        if isolates {
+                            self.isolated_depth = self.isolated_depth.saturating_sub(1);
+                        }
                     }
                 }
                 Frame::Clip {
@@ -433,6 +479,14 @@ impl<'a> SvgWriter<'a> {
 
     // -- fills / strokes --
 
+    /// True when the active SVG canvas backdrop is guaranteed opaque everywhere
+    /// (every pixel has `alpha == 1.0`), so identity-backdrop associative tile
+    /// collapsing (`#ffffff` for `Multiply`, `#000000` for `Screen`) cannot
+    /// paint unpainted tile pixels onto a transparent canvas.
+    fn opaque_backdrop(&self, depth: u8) -> bool {
+        depth == 0 && self.has_opaque_background && self.isolated_depth == 0
+    }
+
     /// Cached per-export check of `tiling.is_backdrop_dependent()`.
     fn tiling_is_backdrop_dependent(&mut self, tiling: &zpdf_display_list::TilingPattern) -> bool {
         let ptr = std::sync::Arc::as_ptr(&tiling.commands) as *const () as usize;
@@ -445,19 +499,10 @@ impl<'a> SvgWriter<'a> {
         dep
     }
 
-    /// Emit a [`TilingPattern`] (or one blend segment / overlap copy of it) as
-    /// an SVG `<pattern>` def and return its id.
-    fn emit_tiling_pattern_def_for(
-        &mut self,
+    fn compute_tiling_pattern_geometry(
+        &self,
         tiling: &zpdf_display_list::TilingPattern,
-        commands: &DisplayList,
-        segment_index: usize,
-        overlap_shift: Option<(i64, i64)>,
-        depth: u8,
-    ) -> Option<u32> {
-        if depth >= MAX_MASK_DEPTH || commands.commands.is_empty() {
-            return None;
-        }
+    ) -> Option<TilingPatternGeometry> {
         let bbox = tiling.bbox.normalize();
         let (bx0, by0) = (bbox.x0, bbox.y0);
         let (bw, bh) = (bbox.width(), bbox.height());
@@ -521,19 +566,79 @@ impl<'a> SvgWriter<'a> {
             bx0,
             by0 + abs_y,
         );
-        let m = pat_pdf_to_outer_svg.concat(&pat_svg_to_pat_pdf);
-        if ![m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite()) {
+        let matrix = pat_pdf_to_outer_svg.concat(&pat_svg_to_pat_pdf);
+        if ![matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f]
+            .iter()
+            .all(|v| v.is_finite())
+        {
             return None;
         }
+        Some(TilingPatternGeometry {
+            bx0,
+            by0,
+            bbox_x1: bbox.x1,
+            bbox_y1: bbox.y1,
+            x_step,
+            y_step,
+            abs_y,
+            cell_scale,
+            tile_w,
+            tile_h,
+            matrix,
+        })
+    }
+
+    fn write_pattern_def(&mut self, id: u32, g: &TilingPatternGeometry, body: &str) {
+        let _ = write!(
+            self.defs,
+            "<pattern id=\"p{id}\" patternUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
+        );
+        push_num(&mut self.defs, g.tile_w);
+        self.defs.push_str("\" height=\"");
+        push_num(&mut self.defs, g.tile_h);
+        self.defs.push_str("\" patternTransform=\"matrix(");
+        push_num(&mut self.defs, g.matrix.a);
+        self.defs.push(' ');
+        push_num(&mut self.defs, g.matrix.b);
+        self.defs.push(' ');
+        push_num(&mut self.defs, g.matrix.c);
+        self.defs.push(' ');
+        push_num(&mut self.defs, g.matrix.d);
+        self.defs.push(' ');
+        push_num(&mut self.defs, g.matrix.e);
+        self.defs.push(' ');
+        push_num(&mut self.defs, g.matrix.f);
+        self.defs.push_str(")\">\n");
+        self.defs.push_str(body);
+        self.defs.push_str("</pattern>\n");
+    }
+
+    /// Emit a [`TilingPattern`] (or one blend segment / overlap copy of it) as
+    /// an SVG `<pattern>` def and return its id.
+    fn emit_tiling_pattern_def_for(
+        &mut self,
+        tiling: &zpdf_display_list::TilingPattern,
+        commands: &DisplayList,
+        segment_index: usize,
+        overlap_shift: Option<(i64, i64)>,
+        depth: u8,
+    ) -> Option<u32> {
+        if depth >= MAX_MASK_DEPTH || commands.commands.is_empty() {
+            return None;
+        }
+        let g = self.compute_tiling_pattern_geometry(tiling)?;
 
         let key = PatternDefKey {
             commands: std::sync::Arc::as_ptr(&tiling.commands),
             segment_index,
             overlap_shift,
-            bbox: [bx0, by0, bbox.x1, bbox.y1].map(f64::to_bits),
-            steps: [x_step, y_step].map(f64::to_bits),
-            tile_dims: [tile_w, tile_h].map(f64::to_bits),
-            matrix: [m.a, m.b, m.c, m.d, m.e, m.f].map(f64::to_bits),
+            bbox: [g.bx0, g.by0, g.bbox_x1, g.bbox_y1].map(f64::to_bits),
+            steps: [g.x_step, g.y_step].map(f64::to_bits),
+            tile_dims: [g.tile_w, g.tile_h].map(f64::to_bits),
+            matrix: [
+                g.matrix.a, g.matrix.b, g.matrix.c, g.matrix.d, g.matrix.e, g.matrix.f,
+            ]
+            .map(f64::to_bits),
             depth,
         };
         if let Some(&(_, id)) = self.pattern_defs.get(&key) {
@@ -542,37 +647,6 @@ impl<'a> SvgWriter<'a> {
         let id = self.fresh_id();
         self.pattern_defs
             .insert(key, (std::sync::Arc::clone(&tiling.commands), id));
-
-        let _ = write!(
-            self.out,
-            "<pattern id=\"p{id}\" patternUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
-        );
-        push_num(&mut self.out, tile_w);
-        self.out.push_str("\" height=\"");
-        push_num(&mut self.out, tile_h);
-        self.out.push_str("\" patternTransform=\"matrix(");
-        push_num(&mut self.out, m.a);
-        self.out.push(' ');
-        push_num(&mut self.out, m.b);
-        self.out.push(' ');
-        push_num(&mut self.out, m.c);
-        self.out.push(' ');
-        push_num(&mut self.out, m.d);
-        self.out.push(' ');
-        push_num(&mut self.out, m.e);
-        self.out.push(' ');
-        push_num(&mut self.out, m.f);
-        self.out.push_str(")\">\n");
-
-        let saved_x0 = self.x0;
-        let saved_y1 = self.y1;
-        let saved_scale = self.scale;
-        let saved_w = self.page_width;
-        let saved_h = self.page_height;
-        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
-        self.scale = cell_scale;
-        self.page_width = tile_w;
-        self.page_height = tile_h;
 
         let (di_range, dj_range) = match overlap_shift {
             Some((di, dj)) => (di..=di, dj..=dj),
@@ -587,31 +661,151 @@ impl<'a> SvgWriter<'a> {
                 (overlap.di, overlap.dj)
             }
         };
+
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_x0 = self.x0;
+        let saved_y1 = self.y1;
+        let saved_scale = self.scale;
+        let saved_w = self.page_width;
+        let saved_h = self.page_height;
+        let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
+        let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
+        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
+        self.scale = g.cell_scale;
+        self.page_width = g.tile_w;
+        self.page_height = g.tile_h;
+
         for dj in dj_range {
             for di in di_range.clone() {
-                self.x0 = bx0 - di as f64 * x_step;
-                self.y1 = by0 + abs_y - dj as f64 * y_step;
+                self.x0 = g.bx0 - di as f64 * g.x_step;
+                self.y1 = g.by0 + g.abs_y - dj as f64 * g.y_step;
                 self.emit_commands(&commands.commands, depth + 1);
             }
         }
 
+        let body = std::mem::replace(&mut self.out, saved_out);
         self.x0 = saved_x0;
         self.y1 = saved_y1;
         self.scale = saved_scale;
         self.page_width = saved_w;
         self.page_height = saved_h;
+        self.blend_depth = saved_blend_depth;
+        self.isolated_depth = saved_isolated_depth;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
-        self.out.push_str("</pattern>\n");
+        self.write_pattern_def(id, &g, &body);
+        Some(id)
+    }
+
+    /// Collapse an all-`Multiply` or all-`Screen` segmented tiling pattern
+    /// (including overlapping copies) into ONE `<pattern>` seeded with the
+    /// blend mode's algebraic identity (`#ffffff` for `Multiply`, `#000000`
+    /// for `Screen`). Because `Multiply` and `Screen` are associative and
+    /// affine in the backdrop, evaluating all marks onto the identity tile
+    /// lets the caller paint a single `<path>` with `mix-blend-mode` and
+    /// apply the object's constant opacity once (ISO 32000-1 §11.6.7).
+    fn emit_tiling_pattern_def_collapsed(
+        &mut self,
+        tiling: &zpdf_display_list::TilingPattern,
+        segments: &[zpdf_display_list::TilingBlendSegment],
+        mode: BlendMode,
+        depth: u8,
+    ) -> Option<u32> {
+        if depth >= MAX_MASK_DEPTH || segments.is_empty() {
+            return None;
+        }
+        let identity = match mode {
+            BlendMode::Multiply => "#ffffff",
+            BlendMode::Screen => "#000000",
+            _ => return None,
+        };
+        let css_name = blend_css(mode)?;
+        let g = self.compute_tiling_pattern_geometry(tiling)?;
+
+        let key = PatternDefKey {
+            commands: std::sync::Arc::as_ptr(&tiling.commands),
+            segment_index: usize::MAX,
+            overlap_shift: None,
+            bbox: [g.bx0, g.by0, g.bbox_x1, g.bbox_y1].map(f64::to_bits),
+            steps: [g.x_step, g.y_step].map(f64::to_bits),
+            tile_dims: [g.tile_w, g.tile_h].map(f64::to_bits),
+            matrix: [
+                g.matrix.a, g.matrix.b, g.matrix.c, g.matrix.d, g.matrix.e, g.matrix.f,
+            ]
+            .map(f64::to_bits),
+            depth,
+        };
+        if let Some(&(_, id)) = self.pattern_defs.get(&key) {
+            return Some(id);
+        }
+        let id = self.fresh_id();
+        self.pattern_defs
+            .insert(key, (std::sync::Arc::clone(&tiling.commands), id));
+
+        let overlap = tiling.overlap_copy_ranges();
+        if overlap.truncated {
+            tracing::warn!(
+                "svg tiling pattern overlapping cell copies exceed {}; clamping",
+                zpdf_display_list::MAX_TILING_OVERLAP_COPIES
+            );
+        }
+
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_x0 = self.x0;
+        let saved_y1 = self.y1;
+        let saved_scale = self.scale;
+        let saved_w = self.page_width;
+        let saved_h = self.page_height;
+        let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
+        let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
+        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
+        self.scale = g.cell_scale;
+        self.page_width = g.tile_w;
+        self.page_height = g.tile_h;
+
+        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+        push_num(&mut self.out, g.tile_w);
+        self.out.push_str("\" height=\"");
+        push_num(&mut self.out, g.tile_h);
+        let _ = writeln!(self.out, "\" fill=\"{identity}\"/>");
+
+        for dj in overlap.dj.clone() {
+            for di in overlap.di.clone() {
+                self.x0 = g.bx0 - di as f64 * g.x_step;
+                self.y1 = g.by0 + g.abs_y - dj as f64 * g.y_step;
+                for seg in segments {
+                    let _ = writeln!(
+                        self.out,
+                        "<g style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
+                    );
+                    self.emit_commands(&seg.commands.commands, depth + 1);
+                    self.out.push_str("</g>\n");
+                }
+            }
+        }
+
+        let body = std::mem::replace(&mut self.out, saved_out);
+        self.x0 = saved_x0;
+        self.y1 = saved_y1;
+        self.scale = saved_scale;
+        self.page_width = saved_w;
+        self.page_height = saved_h;
+        self.blend_depth = saved_blend_depth;
+        self.isolated_depth = saved_isolated_depth;
+        self.clip = saved_clip;
+        self.stroke_mask = saved_mask;
+        self.write_pattern_def(id, &g, &body);
         Some(id)
     }
 
     /// Resolve a tiling pattern into one or more `(pattern_id, BlendMode)`
     /// passes. Backdrop-independent cells reuse a single `<pattern>` with
-    /// `Normal`; backdrop-dependent cells emit per-segment (and per-overlap
-    /// copy in painter's order) `<pattern>` defs so the enclosing `<path>`
-    /// composites each segment directly against the live SVG page backdrop
-    /// via `mix-blend-mode` (ISO 32000-1 §11.6.7).
+    /// `Normal`; backdrop-dependent cells collapse associative all-`Multiply`
+    /// or all-`Screen` multi-pass cells on an opaque backdrop into one
+    /// identity-seeded `<pattern>`, and otherwise emit per-segment (and
+    /// per-overlap copy in painter's order) `<pattern>` defs so the enclosing
+    /// path composites directly against the live SVG page backdrop
+    /// (ISO 32000-1 §11.6.7).
     fn emit_tiling_passes(
         &mut self,
         tiling: &zpdf_display_list::TilingPattern,
@@ -633,6 +827,21 @@ impl<'a> SvgWriter<'a> {
                     .saturating_add(1)
                     .max(0) as usize;
                 let overlap_count = overlap_nx.saturating_mul(overlap_ny);
+
+                let uniform_assoc = segments.first().map(|s| s.blend_mode).filter(|&m| {
+                    matches!(m, BlendMode::Multiply | BlendMode::Screen)
+                        && segments.iter().all(|s| s.blend_mode == m)
+                });
+                if (segments.len() > 1 || overlap_count > 1) && self.opaque_backdrop(depth) {
+                    if let Some(mode) = uniform_assoc {
+                        if let Some(id) =
+                            self.emit_tiling_pattern_def_collapsed(tiling, &segments, mode, depth)
+                        {
+                            return vec![(id, mode)];
+                        }
+                    }
+                }
+
                 let separate_copies = overlap_count > 1
                     && overlap_count.saturating_mul(segments.len()) <= MAX_SVG_TILING_BLEND_PASSES;
 
@@ -677,6 +886,22 @@ impl<'a> SvgWriter<'a> {
             .unwrap_or_default()
     }
 
+    /// Snapshot the current top-level canvas into `<defs><g id="b{id}">` and
+    /// re-reference it on the page so a multi-pass translucent tiling object
+    /// can evaluate all passes at full opacity against the live backdrop and
+    /// apply the object's opacity once. Returns `None` when `self.out` is empty.
+    fn snapshot_page_backdrop(&mut self) -> Option<u32> {
+        self.backdrop_snapshots += 1;
+        if self.out.is_empty() {
+            return None;
+        }
+        let prior = std::mem::take(&mut self.out);
+        let bg_id = self.fresh_id();
+        let _ = write!(self.defs, "<g id=\"b{bg_id}\">\n{prior}</g>\n");
+        let _ = writeln!(self.out, "<use href=\"#b{bg_id}\"/>");
+        Some(bg_id)
+    }
+
     fn emit_fill(&mut self, path: &Path, rule: &FillRule, paint: &Paint, alpha: f32, depth: u8) {
         match paint {
             Paint::Solid(color) => {
@@ -713,6 +938,51 @@ impl<'a> SvgWriter<'a> {
                     return;
                 };
                 let passes = self.emit_tiling_passes(tiling, depth);
+                if passes.is_empty() {
+                    return;
+                }
+                if passes.len() > 1
+                    && opacity < 1.0
+                    && depth == 0
+                    && self.blend_depth == 0
+                    && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS
+                {
+                    let bg_id = self.snapshot_page_backdrop();
+                    let clip_id = self.fresh_id();
+                    let _ = write!(self.defs, "<clipPath id=\"c{clip_id}\"");
+                    if let Some(outer) = self.clip {
+                        let _ = write!(self.defs, " clip-path=\"url(#c{outer})\"");
+                    }
+                    let _ = write!(self.defs, "><path d=\"{d}\"");
+                    if *rule == FillRule::EvenOdd {
+                        self.defs.push_str(" clip-rule=\"evenodd\"");
+                    }
+                    self.defs.push_str("/></clipPath>\n");
+
+                    self.out.push_str("<g opacity=\"");
+                    push_num(&mut self.out, opacity as f64);
+                    let _ = write!(self.out, "\" clip-path=\"url(#c{clip_id})\"");
+                    if let Some(m) = self.stroke_mask {
+                        let _ = write!(self.out, " mask=\"url(#m{m})\"");
+                    }
+                    self.out.push_str(">\n");
+                    if let Some(bg) = bg_id {
+                        let _ = writeln!(self.out, "<use href=\"#b{bg}\"/>");
+                    }
+                    for (id, blend_mode) in passes {
+                        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                        push_num(&mut self.out, self.page_width);
+                        self.out.push_str("\" height=\"");
+                        push_num(&mut self.out, self.page_height);
+                        let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
+                        if let Some(name) = blend_css(blend_mode) {
+                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                        }
+                        self.out.push_str("/>\n");
+                    }
+                    self.out.push_str("</g>\n");
+                    return;
+                }
                 let placement = self.placement_attrs();
                 for (id, blend_mode) in passes {
                     let _ = write!(self.out, "<path d=\"{d}\" fill=\"url(#p{id})\"");
@@ -774,6 +1044,58 @@ impl<'a> SvgWriter<'a> {
                     return;
                 };
                 let passes = self.emit_tiling_passes(tiling, depth);
+                if passes.is_empty() {
+                    return;
+                }
+                if passes.len() > 1
+                    && opacity < 1.0
+                    && depth == 0
+                    && self.blend_depth == 0
+                    && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS
+                {
+                    let bg_id = self.snapshot_page_backdrop();
+                    let mask_id = self.fresh_id();
+                    let _ = write!(
+                        self.defs,
+                        "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">"
+                    );
+                    if let Some(outer) = self.stroke_mask {
+                        let _ = write!(self.defs, "<g mask=\"url(#m{outer})\">");
+                    }
+                    let _ = write!(
+                        self.defs,
+                        "<path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
+                    );
+                    push_stroke_attrs(&mut self.defs, style, self.scale);
+                    if let Some(c) = self.clip {
+                        let _ = write!(self.defs, " clip-path=\"url(#c{c})\"");
+                    }
+                    self.defs.push_str("/>");
+                    if self.stroke_mask.is_some() {
+                        self.defs.push_str("</g>");
+                    }
+                    self.defs.push_str("</mask>\n");
+
+                    self.out.push_str("<g opacity=\"");
+                    push_num(&mut self.out, opacity as f64);
+                    let _ = writeln!(self.out, "\" mask=\"url(#m{mask_id})\">");
+                    if let Some(bg) = bg_id {
+                        let _ = writeln!(self.out, "<use href=\"#b{bg}\"/>");
+                    }
+                    for (id, blend_mode) in passes {
+                        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                        push_num(&mut self.out, self.page_width);
+                        self.out.push_str("\" height=\"");
+                        push_num(&mut self.out, self.page_height);
+                        let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
+                        if let Some(name) = blend_css(blend_mode) {
+                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                        }
+                        self.out.push_str("/>\n");
+                    }
+                    self.out.push_str("</g>\n");
+                    return;
+                }
                 let placement = self.placement_attrs();
                 for (id, blend_mode) in passes {
                     let _ = write!(
@@ -810,15 +1132,15 @@ impl<'a> SvgWriter<'a> {
             return;
         };
         let id = self.fresh_id();
-        let _ = write!(self.out, "<clipPath id=\"c{id}\"");
+        let _ = write!(self.defs, "<clipPath id=\"c{id}\"");
         if let Some(outer) = self.clip {
-            let _ = write!(self.out, " clip-path=\"url(#c{outer})\"");
+            let _ = write!(self.defs, " clip-path=\"url(#c{outer})\"");
         }
-        let _ = write!(self.out, "><path d=\"{d}\"");
+        let _ = write!(self.defs, "><path d=\"{d}\"");
         if *rule == FillRule::EvenOdd {
-            self.out.push_str(" clip-rule=\"evenodd\"");
+            self.defs.push_str(" clip-rule=\"evenodd\"");
         }
-        self.out.push_str("/></clipPath>\n");
+        self.defs.push_str("/></clipPath>\n");
         self.clip = Some(id);
     }
 
@@ -830,20 +1152,26 @@ impl<'a> SvgWriter<'a> {
             return;
         };
         let id = self.fresh_id();
-        let _ = write!(self.out, "<mask id=\"m{id}\" maskUnits=\"userSpaceOnUse\">");
+        let _ = write!(
+            self.defs,
+            "<mask id=\"m{id}\" maskUnits=\"userSpaceOnUse\">"
+        );
         if let Some(outer) = self.stroke_mask {
-            let _ = write!(self.out, "<g mask=\"url(#m{outer})\">");
+            let _ = write!(self.defs, "<g mask=\"url(#m{outer})\">");
         }
-        let _ = write!(self.out, "<path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\"");
-        push_stroke_attrs(&mut self.out, style, self.scale);
+        let _ = write!(
+            self.defs,
+            "<path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
+        );
+        push_stroke_attrs(&mut self.defs, style, self.scale);
         if let Some(c) = self.clip {
-            let _ = write!(self.out, " clip-path=\"url(#c{c})\"");
+            let _ = write!(self.defs, " clip-path=\"url(#c{c})\"");
         }
-        self.out.push_str("/>");
+        self.defs.push_str("/>");
         if self.stroke_mask.is_some() {
-            self.out.push_str("</g>");
+            self.defs.push_str("</g>");
         }
-        self.out.push_str("</mask>\n");
+        self.defs.push_str("</mask>\n");
         self.stroke_mask = Some(id);
     }
 
@@ -856,7 +1184,7 @@ impl<'a> SvgWriter<'a> {
         alpha: f32,
         mask: Option<&SoftMask>,
         depth: u8,
-    ) {
+    ) -> bool {
         let mask_id = mask.and_then(|m| self.emit_soft_mask_def(m, depth));
         self.out.push_str("<g");
         let alpha = if alpha.is_finite() {
@@ -884,6 +1212,7 @@ impl<'a> SvgWriter<'a> {
             let _ = write!(self.out, " mask=\"url(#m{id})\"");
         }
         self.out.push_str(">\n");
+        isolated || alpha < 1.0 || blend.is_some() || mask_id.is_some()
     }
 
     /// Emit an ExtGState soft mask as an SVG `<mask>` def and return its id.
@@ -910,11 +1239,10 @@ impl<'a> SvgWriter<'a> {
         }
         let id = self.fresh_id();
         self.mask_defs.insert(key, id);
-        let _ = write!(self.out, "<mask id=\"m{id}\" maskUnits=\"userSpaceOnUse\"");
-        if mask.kind == SoftMaskKind::Alpha {
-            self.out.push_str(" style=\"mask-type:alpha\"");
-        }
-        self.out.push_str(">\n");
+
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
+        let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
         // Mask content is self-contained (geometry fixed at `gs` time); it must
         // not inherit the page's active clip chain.
         let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
@@ -948,9 +1276,19 @@ impl<'a> SvgWriter<'a> {
         if translated {
             self.out.push_str("</g>\n");
         }
-        self.out.push_str("</mask>\n");
+        let body = std::mem::replace(&mut self.out, saved_out);
+        self.blend_depth = saved_blend_depth;
+        self.isolated_depth = saved_isolated_depth;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
+
+        let _ = write!(self.defs, "<mask id=\"m{id}\" maskUnits=\"userSpaceOnUse\"");
+        if mask.kind == SoftMaskKind::Alpha {
+            self.defs.push_str(" style=\"mask-type:alpha\"");
+        }
+        self.defs.push_str(">\n");
+        self.defs.push_str(&body);
+        self.defs.push_str("</mask>\n");
         Some(id)
     }
 
@@ -1364,13 +1702,13 @@ impl<'a> SvgWriter<'a> {
                 let id = png.map(|png| {
                     let id = self.fresh_id();
                     let _ = write!(
-                        self.out,
-                        "<defs><image id=\"i{id}\" width=\"{}\" height=\"{}\" \
+                        self.defs,
+                        "<image id=\"i{id}\" width=\"{}\" height=\"{}\" \
                          preserveAspectRatio=\"none\" href=\"data:image/png;base64,",
                         image.width, image.height
                     );
-                    push_base64(&mut self.out, &png);
-                    self.out.push_str("\"/></defs>\n");
+                    push_base64(&mut self.defs, &png);
+                    self.defs.push_str("\"/>\n");
                     id
                 });
                 if id.is_none() {
@@ -2550,5 +2888,210 @@ mod tests {
             [0, 255, 0],
             "cyan Multiply over yellow must turn green"
         );
+    }
+
+    #[test]
+    fn tiling_pattern_overlapping_multiply_applies_object_opacity_once_for_fill_and_stroke() {
+        // Two opaque black Multiply marks covering the same point inside one cell:
+        // painted at 50% opacity over white must yield ~#808080 (128), NOT ~#404040 (64).
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        for _ in 0..2 {
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 20.0, 20.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // White canvas; red patch on [80..120] to verify backdrop preservation too.
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 120.0, 60.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(80.0, 0.0, 120.0, 60.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        // Fill over white [0..40] and over red [80..120] at 50% opacity.
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 60.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(80.0, 0.0, 120.0, 60.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        // Thick 20pt vertical stroke over white at x=60 (covering x=50..70) at 50% opacity.
+        let mut line = Path::new();
+        line.move_to(Point::new(60.0, 0.0));
+        line.line_to(Point::new(60.0, 60.0));
+        dl.push(RenderCommand::StrokePath {
+            path: line,
+            style: StrokeStyle {
+                width: 20.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Tiling(tiling),
+            alpha: 0.5,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(120, 60).expect("pixmap");
+        let sx = 120.0 / tree.size().width();
+        let sy = 60.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let px = |x: u32, y: u32| -> [u8; 3] {
+            let p = pixmap.pixel(x, y).expect("in bounds");
+            [p.red(), p.green(), p.blue()]
+        };
+
+        let fill_white = px(20, 30);
+        assert!(
+            fill_white.iter().all(|&c| (124..=132).contains(&c)),
+            "fill with two black Multiply marks at 50% over white must be ~128 (not ~64), got {fill_white:?}"
+        );
+        let stroke_white = px(60, 30);
+        assert!(
+            stroke_white.iter().all(|&c| (124..=132).contains(&c)),
+            "stroke with two black Multiply marks at 50% over white must be ~128 (not ~64), got {stroke_white:?}"
+        );
+        let fill_red = px(100, 30);
+        assert!(
+            (124..=132).contains(&fill_red[0]) && fill_red[1] <= 2 && fill_red[2] <= 2,
+            "fill with two black Multiply marks at 50% over red must be ~[128, 0, 0], got {fill_red:?}"
+        );
+        assert_eq!(px(45, 30), [255, 255, 255], "unpainted gap stays white");
+    }
+
+    #[test]
+    fn tiling_pattern_mixed_blend_passes_apply_object_opacity_once_for_fill_and_stroke() {
+        // Non-associative mixed cell: Normal red followed by Multiply black.
+        // At 100%, the cell evaluates to black; at 50% over white, exact single-pass
+        // opacity gives ~[128, 128, 128] (per-pass 50% opacity would yield ~[128, 64, 64]).
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 60.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 60.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        let mut line = Path::new();
+        line.move_to(Point::new(75.0, 0.0));
+        line.line_to(Point::new(75.0, 60.0));
+        dl.push(RenderCommand::StrokePath {
+            path: line,
+            style: StrokeStyle {
+                width: 20.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Tiling(tiling),
+            alpha: 0.5,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(100, 60).expect("pixmap");
+        let sx = 100.0 / tree.size().width();
+        let sy = 60.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let px = |x: u32, y: u32| -> [u8; 3] {
+            let p = pixmap.pixel(x, y).expect("in bounds");
+            [p.red(), p.green(), p.blue()]
+        };
+
+        let fill_px = px(20, 30);
+        assert!(
+            fill_px.iter().all(|&c| (124..=132).contains(&c)),
+            "mixed Normal+Multiply fill at 50% over white must be ~[128,128,128] (not [128,64,64]), got {fill_px:?}"
+        );
+        let stroke_px = px(75, 30);
+        assert!(
+            stroke_px.iter().all(|&c| (124..=132).contains(&c)),
+            "mixed Normal+Multiply stroke at 50% over white must be ~[128,128,128] (not [128,64,64]), got {stroke_px:?}"
+        );
+        assert_eq!(px(50, 30), [255, 255, 255], "unpainted gap stays white");
     }
 }
