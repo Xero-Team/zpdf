@@ -279,6 +279,182 @@ pub struct SoftMask {
     pub transfer: Option<std::sync::Arc<[u8; 256]>>,
 }
 
+impl SoftMask {
+    /// Map a soft mask's commands, bounds, and offset by `matrix` (e.g. from
+    /// Type 3 glyph coordinates into page space), embedding any referenced
+    /// `ImageId` via `resolve_image` so the transformed mask is self-contained
+    /// across backends without depending on the glyph's private `ImageCache`.
+    pub fn transform_with_images<F>(&self, matrix: &Matrix, resolve_image: &F) -> Self
+    where
+        F: Fn(ImageId) -> Option<std::sync::Arc<InlineImage>>,
+    {
+        self.transform_with_images_depth(matrix, resolve_image, 0)
+    }
+
+    fn transform_with_images_depth<F>(&self, matrix: &Matrix, resolve_image: &F, depth: u8) -> Self
+    where
+        F: Fn(ImageId) -> Option<std::sync::Arc<InlineImage>>,
+    {
+        fn transform_rect(r: Rect, m: &Matrix) -> Rect {
+            let corners = [
+                zpdf_core::Point::new(r.x0, r.y0).transform(m),
+                zpdf_core::Point::new(r.x1, r.y0).transform(m),
+                zpdf_core::Point::new(r.x0, r.y1).transform(m),
+                zpdf_core::Point::new(r.x1, r.y1).transform(m),
+            ];
+            let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+            let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for p in corners {
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() {
+                Rect::new(x0, y0, x1, y1)
+            } else {
+                r
+            }
+        }
+        fn scale_stroke(style: &StrokeStyle, m: &Matrix) -> StrokeStyle {
+            let sx = m.a.hypot(m.b);
+            let sy = m.c.hypot(m.d);
+            let s = if sx.is_finite() && sy.is_finite() {
+                (0.5 * (sx + sy)) as f32
+            } else {
+                1.0
+            };
+            let mut out = style.clone();
+            if out.width > 0.0 && s.is_finite() && s > 0.0 {
+                out.width *= s;
+            }
+            if let Some(ref mut d) = out.dash {
+                if s.is_finite() && s > 0.0 {
+                    for v in &mut d.array {
+                        *v *= s;
+                    }
+                    d.phase *= s;
+                }
+            }
+            out
+        }
+        fn transform_paint(paint: &Paint, m: &Matrix) -> Paint {
+            match paint {
+                Paint::Tiling(t) => Paint::Tiling(std::sync::Arc::new(TilingPattern {
+                    commands: std::sync::Arc::clone(&t.commands),
+                    bbox: t.bbox,
+                    x_step: t.x_step,
+                    y_step: t.y_step,
+                    matrix: m.concat(&t.matrix),
+                    tiling_type: t.tiling_type,
+                })),
+                other => other.clone(),
+            }
+        }
+
+        let mut dl = DisplayList::new(transform_rect(self.commands.page_rect, matrix));
+        if depth < 8 {
+            for cmd in &self.commands.commands {
+                match cmd {
+                    RenderCommand::FillPath {
+                        path,
+                        rule,
+                        paint,
+                        alpha,
+                        overprint,
+                    } => dl.push(RenderCommand::FillPath {
+                        path: path.map_points(|p| p.transform(matrix)),
+                        rule: *rule,
+                        paint: transform_paint(paint, matrix),
+                        alpha: *alpha,
+                        overprint: *overprint,
+                    }),
+                    RenderCommand::StrokePath {
+                        path,
+                        style,
+                        paint,
+                        alpha,
+                        overprint,
+                    } => dl.push(RenderCommand::StrokePath {
+                        path: path.map_points(|p| p.transform(matrix)),
+                        style: scale_stroke(style, matrix),
+                        paint: transform_paint(paint, matrix),
+                        alpha: *alpha,
+                        overprint: *overprint,
+                    }),
+                    RenderCommand::PushClip { path, rule } => dl.push(RenderCommand::PushClip {
+                        path: path.map_points(|p| p.transform(matrix)),
+                        rule: *rule,
+                    }),
+                    RenderCommand::PushClipStroke { path, style } => {
+                        dl.push(RenderCommand::PushClipStroke {
+                            path: path.map_points(|p| p.transform(matrix)),
+                            style: scale_stroke(style, matrix),
+                        })
+                    }
+                    RenderCommand::PopClip => dl.push(RenderCommand::PopClip),
+                    RenderCommand::DrawImage(draw) => {
+                        if let Some(image) = resolve_image(draw.image_id) {
+                            dl.push(RenderCommand::DrawInlineImage(InlineImageDraw {
+                                image,
+                                transform: matrix.concat(&draw.transform),
+                                alpha: draw.alpha,
+                            }));
+                        } else {
+                            dl.push(RenderCommand::DrawImage(ImageDraw {
+                                image_id: draw.image_id,
+                                transform: matrix.concat(&draw.transform),
+                                alpha: draw.alpha,
+                                is_image_mask: draw.is_image_mask,
+                            }));
+                        }
+                    }
+                    RenderCommand::DrawInlineImage(draw) => {
+                        dl.push(RenderCommand::DrawInlineImage(InlineImageDraw {
+                            image: std::sync::Arc::clone(&draw.image),
+                            transform: matrix.concat(&draw.transform),
+                            alpha: draw.alpha,
+                        }))
+                    }
+                    RenderCommand::DrawGlyphRun(run) => {
+                        let mut mapped = run.clone();
+                        mapped.transform = matrix.concat(&run.transform);
+                        mapped.paint = transform_paint(&run.paint, matrix);
+                        dl.push(RenderCommand::DrawGlyphRun(mapped));
+                    }
+                    RenderCommand::PushBlendGroup {
+                        blend_mode,
+                        isolated,
+                        knockout,
+                        bounds,
+                        alpha,
+                        mask,
+                    } => dl.push(RenderCommand::PushBlendGroup {
+                        blend_mode: *blend_mode,
+                        isolated: *isolated,
+                        knockout: *knockout,
+                        bounds: transform_rect(*bounds, matrix),
+                        alpha: *alpha,
+                        mask: mask.as_ref().map(|sub| {
+                            sub.transform_with_images_depth(matrix, resolve_image, depth + 1)
+                        }),
+                    }),
+                    RenderCommand::PopBlendGroup => dl.push(RenderCommand::PopBlendGroup),
+                }
+            }
+        }
+        let ox = matrix.a * self.offset.0 as f64 + matrix.c * self.offset.1 as f64;
+        let oy = matrix.b * self.offset.0 as f64 + matrix.d * self.offset.1 as f64;
+        SoftMask {
+            kind: self.kind,
+            commands: std::sync::Arc::new(dl),
+            offset: (ox as f32, oy as f32),
+            backdrop_luma: self.backdrop_luma,
+            transfer: self.transfer.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SoftMaskKind {
     /// Mask value = group luminosity over the /BC backdrop.

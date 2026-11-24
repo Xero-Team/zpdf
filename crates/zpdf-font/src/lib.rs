@@ -228,6 +228,27 @@ pub enum Type3XObject {
     Form(Arc<Type3FormXObject>),
 }
 
+/// Pre-resolved `/SMask` value inside a Type 3 font's `/ExtGState` resource so
+/// standalone CharProc replay can build soft masks without a live `PdfFile`.
+#[derive(Debug, Clone)]
+pub enum Type3SoftMask {
+    /// `/SMask /None` — clears the active soft mask.
+    None,
+    /// `/SMask << /S ... /G <Form> /BC ... /TR ... >>`
+    Dict {
+        /// True for `/S /Alpha`, false for `/S /Luminosity`.
+        is_alpha: bool,
+        /// Pre-resolved transparency group Form XObject (`/G`) and its resources.
+        group: Arc<Type3FormXObject>,
+        /// Backdrop luminosity approximation from `/BC` in `[0, 1]`.
+        backdrop_luma: f32,
+        /// Resolved `/TR` transfer function object (dict/array/name, plus
+        /// decoded stream payload when `/TR` is a stream function) when present
+        /// and not `/Identity`.
+        transfer: Option<(zpdf_core::PdfObject, Option<Arc<[u8]>>)>,
+    },
+}
+
 /// Resolved named resources carried by a Type 3 [`LoadedFont`] so CharProcs
 /// can resolve `/Name Do`, `/GS gs`, and named `/ColorSpace` entries during
 /// standalone replay across CPU, GPU, SVG, and PPTX backends.
@@ -236,6 +257,9 @@ pub struct Type3Resources {
     pub xobjects: HashMap<String, Type3XObject>,
     pub color_spaces: HashMap<String, zpdf_core::PdfObject>,
     pub ext_g_states: HashMap<String, zpdf_core::PdfDict>,
+    /// Pre-resolved `/SMask` entries for named `/ExtGState` resources, keyed by
+    /// the same ExtGState resource name.
+    pub ext_g_state_smasks: HashMap<String, Type3SoftMask>,
 }
 
 #[derive(Default)]
@@ -252,7 +276,10 @@ struct Type3BytesVisited {
 
 impl Type3Resources {
     pub fn is_empty(&self) -> bool {
-        self.xobjects.is_empty() && self.color_spaces.is_empty() && self.ext_g_states.is_empty()
+        self.xobjects.is_empty()
+            && self.color_spaces.is_empty()
+            && self.ext_g_states.is_empty()
+            && self.ext_g_state_smasks.is_empty()
     }
 
     /// Estimate retained heap bytes across the entire reachable Type 3 resource
@@ -269,7 +296,8 @@ impl Type3Resources {
             bytes = bytes
                 .saturating_add(estimated_map_bytes(&res.xobjects))
                 .saturating_add(estimated_map_bytes(&res.color_spaces))
-                .saturating_add(estimated_map_bytes(&res.ext_g_states));
+                .saturating_add(estimated_map_bytes(&res.ext_g_states))
+                .saturating_add(estimated_map_bytes(&res.ext_g_state_smasks));
             for (name, xobj) in &res.xobjects {
                 bytes = bytes.saturating_add(name.capacity() as u64);
                 match xobj {
@@ -304,6 +332,33 @@ impl Type3Resources {
                 bytes = bytes
                     .saturating_add(name.capacity() as u64)
                     .saturating_add(estimated_pdf_dict_bytes(gs));
+            }
+            for (name, smask) in &res.ext_g_state_smasks {
+                bytes = bytes.saturating_add(name.capacity() as u64);
+                if let Type3SoftMask::Dict {
+                    group, transfer, ..
+                } = smask
+                {
+                    if visited.form_ptrs.insert(Arc::as_ptr(group) as usize) {
+                        bytes = bytes
+                            .saturating_add(std::mem::size_of::<Type3FormXObject>() as u64)
+                            .saturating_add(estimated_pdf_dict_bytes(&group.dict));
+                        if visited.stream_ptrs.insert(group.data.as_ptr() as usize) {
+                            bytes = bytes.saturating_add(group.data.len() as u64);
+                        }
+                        if let Some(child_res) = &group.resources {
+                            worklist.push(child_res.as_ref());
+                        }
+                    }
+                    if let Some((tr_obj, tr_data)) = transfer {
+                        bytes = bytes.saturating_add(estimated_pdf_object_bytes(tr_obj));
+                        if let Some(data) = tr_data {
+                            if visited.stream_ptrs.insert(data.as_ptr() as usize) {
+                                bytes = bytes.saturating_add(data.len() as u64);
+                            }
+                        }
+                    }
+                }
             }
         }
         bytes

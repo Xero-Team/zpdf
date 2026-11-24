@@ -352,6 +352,14 @@ pub struct ContentInterpreter<'a> {
     /// hangs the renderer. Once exceeded, the interpreter stops emitting and
     /// returns the partial page rather than hanging.
     max_commands: usize,
+    /// Cumulative path points retained across all expanded anisotropic stroke
+    /// outlines on this page (including detached tiling cells, soft masks, and
+    /// forms). Bounded by `max_anisotropic_stroke_points` so repeated nonuniform
+    /// dashed strokes fall back before retaining unbounded point buffers.
+    anisotropic_stroke_points: usize,
+    /// Hard ceiling on cumulative points produced by `expand_anisotropic_stroke`
+    /// across the whole page (see [`DEFAULT_MAX_ANISOTROPIC_STROKE_POINTS`]).
+    max_anisotropic_stroke_points: usize,
     /// Total operators executed across the page and all nested forms/patterns.
     /// A command-count ceiling alone misses *exponential form-XObject fanout*,
     /// where each call emits almost nothing yet spawns many more calls — the
@@ -757,6 +765,7 @@ struct SoftMaskCacheKey {
     clip: Option<[u64; 4]>,
     inherited: InheritedGraphicsStateKey,
     resource_scopes: Vec<ResourceScopeId>,
+    embed_type3_inline_images: bool,
 }
 
 /// Soft masks [`ContentInterpreter`] keeps per page; later masks are built
@@ -765,9 +774,10 @@ const MAX_CACHED_SOFT_MASKS: usize = 256;
 
 /// Cache key for pre-interpreted tiling-pattern cells. Coloured (`/PaintType 1`)
 /// cells depend on the pattern object, effective cell downscale, page-space
-/// shading scale, parent-stream entry state, and enclosing resource scopes
-/// (since `lookup_res` falls back through enclosing forms); uncoloured
-/// (`/PaintType 2`) cells also bake in the `scn`/`SCN` paint colour.
+/// shading scale, parent-stream entry state, enclosing resource scopes (since
+/// `lookup_res` falls back through enclosing forms), and whether no-cache Type 3
+/// inline-image embedding is active; uncoloured (`/PaintType 2`) cells also bake
+/// in the `scn`/`SCN` paint colour.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TilingCellKey {
     pat_id: ObjectId,
@@ -778,6 +788,10 @@ struct TilingCellKey {
     shading_scale: [u32; 2],
     inherited: InheritedGraphicsStateKey,
     resource_scopes: Vec<ResourceScopeId>,
+    /// True when `image_cache` is absent and we are inside an active Type 3
+    /// glyph, where inline/XObject/shading images inside the cell embed as
+    /// `DrawInlineImage` rather than being omitted as on ordinary page fills.
+    embed_type3_inline_images: bool,
 }
 
 /// Which enclosing resource scope supplied a pattern resolved inside a tiling
@@ -829,6 +843,11 @@ fn text_deadline_reached(index: usize, deadline: Option<zpdf_core::time::Instant
 /// emission *time* (not just memory) becomes a hang. Tuned together with the
 /// renderer's wall-clock budget so interpret + render stay comfortably bounded.
 const DEFAULT_MAX_COMMANDS: usize = 500_000;
+
+/// Default [`ContentInterpreter::max_anisotropic_stroke_points`]: 2M points
+/// (~32 MiB) across all expanded anisotropic stroke outlines retained on one
+/// page (including detached pattern cells and soft masks).
+const DEFAULT_MAX_ANISOTROPIC_STROKE_POINTS: usize = 2_000_000;
 
 /// Default [`ContentInterpreter::max_ops`]. Bounds total interpreter work
 /// (operators executed) so exponential form/pattern fanout that emits few
@@ -1548,6 +1567,8 @@ impl<'a> ContentInterpreter<'a> {
             max_actual_text_bytes: 16 << 20,
             oc_hidden_from: None,
             max_commands: DEFAULT_MAX_COMMANDS,
+            anisotropic_stroke_points: 0,
+            max_anisotropic_stroke_points: DEFAULT_MAX_ANISOTROPIC_STROKE_POINTS,
             ops_executed: 0,
             max_ops: DEFAULT_MAX_OPS,
             deadline: None,
@@ -1618,14 +1639,26 @@ impl<'a> ContentInterpreter<'a> {
             .and_then(|res| res.color_spaces.get(name).cloned())
     }
 
-    fn lookup_type3_ext_gstate(&self, name: &str) -> Option<zpdf_core::PdfDict> {
+    fn lookup_type3_ext_gstate(
+        &self,
+        name: &str,
+    ) -> Option<(zpdf_core::PdfDict, Option<zpdf_font::Type3SoftMask>)> {
         for res in self.type3_resource_stack.iter().rev() {
-            if let Some(gs) = res.ext_g_states.get(name) {
-                return Some(gs.clone());
+            let dict = res.ext_g_states.get(name);
+            let smask = res.ext_g_state_smasks.get(name);
+            if dict.is_some() || smask.is_some() {
+                return Some((dict.cloned().unwrap_or_default(), smask.cloned()));
             }
         }
-        self.type3_resources
-            .and_then(|res| res.ext_g_states.get(name).cloned())
+        self.type3_resources.and_then(|res| {
+            let dict = res.ext_g_states.get(name);
+            let smask = res.ext_g_state_smasks.get(name);
+            if dict.is_some() || smask.is_some() {
+                Some((dict.cloned().unwrap_or_default(), smask.cloned()))
+            } else {
+                None
+            }
+        })
     }
 
     /// Start a stopwatch for one step of interpret work, or `None` when it is
@@ -1676,6 +1709,13 @@ impl<'a> ContentInterpreter<'a> {
 
     pub fn with_command_limit(mut self, max_commands: usize) -> Self {
         self.max_commands = max_commands;
+        self
+    }
+
+    /// Override the cumulative page-wide point budget for expanded anisotropic
+    /// stroke outlines (including detached tiling cells and soft masks).
+    pub fn with_anisotropic_stroke_point_limit(mut self, max_points: usize) -> Self {
+        self.max_anisotropic_stroke_points = max_points;
         self
     }
 
@@ -4826,8 +4866,24 @@ impl<'a> ContentInterpreter<'a> {
             Ref(ObjectId),
         }
         if self.file.is_none() {
-            if let Some(dict) = self.lookup_type3_ext_gstate(name) {
+            if let Some((dict, smask)) = self.lookup_type3_ext_gstate(name) {
                 self.apply_ext_gstate_dict(&dict, None);
+                if let Some(smask) = smask {
+                    self.current.soft_mask = match smask {
+                        zpdf_font::Type3SoftMask::None => None,
+                        zpdf_font::Type3SoftMask::Dict {
+                            is_alpha,
+                            group,
+                            backdrop_luma,
+                            transfer,
+                        } => self.build_type3_soft_mask(
+                            is_alpha,
+                            &group,
+                            backdrop_luma,
+                            transfer.as_ref(),
+                        ),
+                    };
+                }
                 return;
             }
         }
@@ -5020,6 +5076,8 @@ impl<'a> ContentInterpreter<'a> {
                 .map(|r| [r.x0, r.y0, r.x1, r.y1].map(f64::to_bits)),
             inherited,
             resource_scopes: self.form_resource_scopes.clone(),
+            embed_type3_inline_images: self.image_cache.is_none()
+                && !self.active_type3_glyphs.is_empty(),
         };
         if let Some(mask) = self.soft_mask_cache.get(&key) {
             return mask.clone();
@@ -5117,6 +5175,80 @@ impl<'a> ContentInterpreter<'a> {
                 return None;
             }
             let f = self.parse_function(o)?;
+            let mut lut = [0u8; 256];
+            for (i, slot) in lut.iter_mut().enumerate() {
+                let out = f
+                    .eval(&[i as f64 / 255.0])
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(i as f64 / 255.0);
+                *slot = (out.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+            Some(std::sync::Arc::new(lut))
+        });
+
+        Some(SoftMask {
+            kind,
+            commands: std::sync::Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma,
+            transfer,
+        })
+    }
+
+    /// Build a [`SoftMask`] from a pre-resolved Type 3 `/ExtGState /SMask`
+    /// entry during standalone CharProc replay (without a live `PdfFile`).
+    fn build_type3_soft_mask(
+        &mut self,
+        is_alpha: bool,
+        group: &zpdf_font::Type3FormXObject,
+        backdrop_luma: f32,
+        transfer_obj: Option<&(PdfObject, Option<std::sync::Arc<[u8]>>)>,
+    ) -> Option<SoftMask> {
+        let kind = if is_alpha {
+            SoftMaskKind::Alpha
+        } else {
+            SoftMaskKind::Luminosity
+        };
+        let page_rect = self.display_list.page_rect;
+        let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
+        let saved_state = self.current.clone();
+        let saved_oc_hidden = self.oc_hidden_from.take();
+        let saved_text_sink = self.text_sink.take();
+        let saved_span_streams = self.span_streams.take();
+        let saved_rule_sink = self.rule_sink.take();
+        // Marks inside the mask's transparency group emit concrete `Paint::Solid`
+        // values rather than `Paint::Inherited` so backends evaluate mask alpha
+        // and luminosity directly.
+        let saved_type3_glyph = std::mem::replace(&mut self.type3_glyph, false);
+        self.current.soft_mask = None;
+        self.current.blend_mode = BlendMode::Normal;
+        self.current.fill_alpha = 1.0;
+        self.current.stroke_alpha = 1.0;
+        self.current.clip_elision_bounds = None;
+
+        let work = self.start_work(Some(Work::Form));
+        self.do_type3_form_xobject(group);
+        self.tock_work(work);
+
+        self.type3_glyph = saved_type3_glyph;
+        self.current = saved_state;
+        self.oc_hidden_from = saved_oc_hidden;
+        self.text_sink = saved_text_sink;
+        self.span_streams = saved_span_streams;
+        self.rule_sink = saved_rule_sink;
+        let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
+
+        let transfer = transfer_obj.and_then(|(obj, stream_data)| {
+            if matches!(obj, PdfObject::Name(n) if n.as_str() == "Identity") {
+                return None;
+            }
+            let mut resolve = |_id: zpdf_core::ObjectId| None;
+            let f = if let Some(data) = stream_data {
+                let dict = obj.as_dict().ok()?;
+                zpdf_color::PdfFunction::parse(dict, Some(data.as_ref()), &mut resolve)
+            } else {
+                zpdf_color::PdfFunction::parse_object(obj, &mut resolve)
+            }?;
             let mut lut = [0u8; 256];
             for (i, slot) in lut.iter_mut().enumerate() {
                 let out = f
@@ -7213,8 +7345,14 @@ impl<'a> ContentInterpreter<'a> {
                 let page_path = self.transform_path_to_page_space(&self.current_path);
                 self.capture_stroke_rules(&page_path);
             }
-            match self.expand_anisotropic_stroke(&self.current_path) {
+            let remaining = self
+                .max_anisotropic_stroke_points
+                .saturating_sub(self.anisotropic_stroke_points);
+            match self.expand_anisotropic_stroke(&self.current_path, remaining) {
                 AnisotropicStroke::Outline(outline) => {
+                    self.anisotropic_stroke_points = self
+                        .anisotropic_stroke_points
+                        .saturating_add(outline.points().len());
                     self.current_path.clear();
                     self.emit_stroke_as_filled_outline(outline);
                     return;
@@ -7243,7 +7381,15 @@ impl<'a> ContentInterpreter<'a> {
         }
         let page_path = self.transform_path_to_page_space(&self.current_path);
         if self.should_expand_anisotropic_stroke() {
-            let expanded = self.expand_anisotropic_stroke(&self.current_path);
+            let remaining = self
+                .max_anisotropic_stroke_points
+                .saturating_sub(self.anisotropic_stroke_points);
+            let expanded = self.expand_anisotropic_stroke(&self.current_path, remaining);
+            if let AnisotropicStroke::Outline(ref outline) = expanded {
+                self.anisotropic_stroke_points = self
+                    .anisotropic_stroke_points
+                    .saturating_add(outline.points().len());
+            }
             self.current_path.clear();
             self.fill_page_path(page_path.clone(), rule);
             match expanded {
@@ -7461,10 +7607,18 @@ impl<'a> ContentInterpreter<'a> {
     /// transformed dash lengths under nonuniform scales and shears, including
     /// fine dashes inside magnified pattern tiles and mixed compound/curved
     /// paths with off-page geometry.
-    fn expand_anisotropic_stroke(&self, user_path: &Path) -> AnisotropicStroke {
+    fn expand_anisotropic_stroke(
+        &self,
+        user_path: &Path,
+        remaining_points: usize,
+    ) -> AnisotropicStroke {
         const RES_SCALE: f32 = 4.0;
         const MAX_NORM_COORD: f32 = 1e7;
         const MAX_DASH_REPEATS: f64 = 100_000.0;
+
+        if remaining_points == 0 {
+            return AnisotropicStroke::Fallback;
+        }
 
         #[derive(Clone, Copy)]
         enum UserPathSeg {
@@ -7748,7 +7902,22 @@ impl<'a> ContentInterpreter<'a> {
                 return true;
             };
             let ctm_post = make_ctm_post(origin);
-            Self::append_transformed_skia_path(&stroked, &ctm_post, out)
+            Self::append_transformed_skia_path(&stroked, &ctm_post, out, remaining_points)
+        };
+        let intervals_per_period = dash_spec
+            .as_ref()
+            .map_or(1usize, |(arr, _, _, _)| (arr.len() / 2).max(1));
+        let min_points_for_dashes = |dashes: f64| -> usize {
+            if !dashes.is_finite() || dashes <= 0.0 {
+                return 0;
+            }
+            let whole = dashes.floor();
+            if whole >= (usize::MAX / 8) as f64 {
+                return usize::MAX;
+            }
+            (whole as usize)
+                .saturating_mul(4)
+                .saturating_mul(intervals_per_period)
         };
 
         let mut vis_user_cache = VisUserBounds::Uncomputed;
@@ -7881,6 +8050,14 @@ impl<'a> ContentInterpreter<'a> {
 
             let Some(vis_user) = vis_user_for_clip else {
                 cumulative_dashes += sp_dashes;
+                let min_needed = if dash_spec.is_some() {
+                    min_points_for_dashes(sp_dashes)
+                } else {
+                    sp.segments.len().saturating_mul(2)
+                };
+                if out.points().len().saturating_add(min_needed) > remaining_points {
+                    return AnisotropicStroke::Fallback;
+                }
                 let Some(norm_path) = pb.finish() else {
                     continue;
                 };
@@ -8098,6 +8275,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
 
+            let dashes_before_sp = cumulative_dashes;
             let mut ctx = ClipCtx {
                 vis_user,
                 period_user,
@@ -8153,6 +8331,16 @@ impl<'a> ContentInterpreter<'a> {
             let mut visible_runs = ctx.visible_runs;
             if visible_runs.is_empty() {
                 continue;
+            }
+            let sp_vis_dashes = (cumulative_dashes - dashes_before_sp).max(0.0);
+            if dash_spec.is_some()
+                && out
+                    .points()
+                    .len()
+                    .saturating_add(min_points_for_dashes(sp_vis_dashes))
+                    > remaining_points
+            {
+                return AnisotropicStroke::Fallback;
             }
 
             // If a partially clipped closed contour both starts and ends
@@ -8271,11 +8459,15 @@ impl<'a> ContentInterpreter<'a> {
         stroked: &tiny_skia_path::Path,
         ctm_post: &Matrix,
         out: &mut Path,
+        max_total_points: usize,
     ) -> bool {
         let mut last = Point::zero();
         for seg in stroked.segments() {
             match seg {
                 tiny_skia_path::PathSegment::MoveTo(p) => {
+                    if out.points().len() >= max_total_points {
+                        return false;
+                    }
                     last = Point::new(p.x as f64, p.y as f64);
                     let mapped = last.transform(ctm_post);
                     if !mapped.x.is_finite() || !mapped.y.is_finite() {
@@ -8284,6 +8476,9 @@ impl<'a> ContentInterpreter<'a> {
                     out.move_to(mapped);
                 }
                 tiny_skia_path::PathSegment::LineTo(p) => {
+                    if out.points().len() >= max_total_points {
+                        return false;
+                    }
                     last = Point::new(p.x as f64, p.y as f64);
                     let mapped = last.transform(ctm_post);
                     if !mapped.x.is_finite() || !mapped.y.is_finite() {
@@ -8292,6 +8487,9 @@ impl<'a> ContentInterpreter<'a> {
                     out.line_to(mapped);
                 }
                 tiny_skia_path::PathSegment::QuadTo(p1, p2) => {
+                    if out.points().len().saturating_add(3) > max_total_points {
+                        return false;
+                    }
                     let q1 = Point::new(p1.x as f64, p1.y as f64);
                     let q2 = Point::new(p2.x as f64, p2.y as f64);
                     let c1 = Point::new(
@@ -8315,6 +8513,9 @@ impl<'a> ContentInterpreter<'a> {
                     last = q2;
                 }
                 tiny_skia_path::PathSegment::CubicTo(p1, p2, p3) => {
+                    if out.points().len().saturating_add(3) > max_total_points {
+                        return false;
+                    }
                     let c1 = Point::new(p1.x as f64, p1.y as f64).transform(ctm_post);
                     let c2 = Point::new(p2.x as f64, p2.y as f64).transform(ctm_post);
                     let end_local = Point::new(p3.x as f64, p3.y as f64);
@@ -8401,14 +8602,29 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 }
                 PatternPaint::Shading(def) => {
-                    if let Some(bounds) = Self::path_bounds(&outline) {
-                        self.display_list.push(RenderCommand::PushClip {
-                            path: outline,
-                            rule: FillRule::NonZero,
-                        });
-                        self.emit_shading_image(&def, bounds);
-                        self.display_list.push(RenderCommand::PopClip);
+                    if self.oc_suppressed() {
+                        self.type3_oc_suppressed_mark = true;
                         return;
+                    }
+                    if !self.skip_images
+                        && (self.image_cache.is_some() || !self.active_type3_glyphs.is_empty())
+                    {
+                        if let Some(bounds) = Self::path_bounds(&outline) {
+                            let clip_idx = self.display_list.commands.len();
+                            self.display_list.push(RenderCommand::PushClip {
+                                path: outline.clone(),
+                                rule: FillRule::NonZero,
+                            });
+                            if self.emit_shading_image(&def, bounds) {
+                                self.display_list.push(RenderCommand::PopClip);
+                                return;
+                            }
+                            if self.display_list.commands.len() == clip_idx + 1 {
+                                self.display_list.commands.pop();
+                            } else {
+                                self.display_list.push(RenderCommand::PopClip);
+                            }
+                        }
                     }
                 }
             }
@@ -8467,17 +8683,32 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 }
                 PatternPaint::Shading(def) => {
+                    if self.oc_suppressed() {
+                        self.type3_oc_suppressed_mark = true;
+                        return;
+                    }
                     // The stroke region is the centerline extent grown by the stroke
                     // width. Unlike `path_bounds`, a flat path (a horizontal/vertical
                     // line) is fine here — growing makes the region two-dimensional.
-                    if let Some(bounds) = Self::stroke_region_bounds(&page_path, &style) {
-                        self.display_list.push(RenderCommand::PushClipStroke {
-                            path: page_path.clone(),
-                            style: style.clone(),
-                        });
-                        self.emit_shading_image(&def, bounds);
-                        self.display_list.push(RenderCommand::PopClip);
-                        return;
+                    if !self.skip_images
+                        && (self.image_cache.is_some() || !self.active_type3_glyphs.is_empty())
+                    {
+                        if let Some(bounds) = Self::stroke_region_bounds(&page_path, &style) {
+                            let clip_idx = self.display_list.commands.len();
+                            self.display_list.push(RenderCommand::PushClipStroke {
+                                path: page_path.clone(),
+                                style: style.clone(),
+                            });
+                            if self.emit_shading_image(&def, bounds) {
+                                self.display_list.push(RenderCommand::PopClip);
+                                return;
+                            }
+                            if self.display_list.commands.len() == clip_idx + 1 {
+                                self.display_list.commands.pop();
+                            } else {
+                                self.display_list.push(RenderCommand::PopClip);
+                            }
+                        }
                     }
                 }
             }
@@ -8562,24 +8793,39 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 }
                 PatternPaint::Shading(def) => {
-                    if let Some(bounds) = Self::path_bounds(&page_path) {
-                        let push_clip = !self.clip_path_covers_current_bounds(&page_path);
-                        let saved_elision_bounds = self.current.clip_elision_bounds;
-                        if push_clip {
-                            self.intersect_clip_elision_bounds(
-                                self.clip_path_enforced_device_bounds(&page_path),
-                            );
-                            self.display_list.push(RenderCommand::PushClip {
-                                path: page_path.clone(),
-                                rule,
-                            });
-                        }
-                        self.emit_shading_image(&def, bounds);
-                        if push_clip {
-                            self.display_list.push(RenderCommand::PopClip);
-                            self.current.clip_elision_bounds = saved_elision_bounds;
-                        }
+                    if self.oc_suppressed() {
+                        self.type3_oc_suppressed_mark = true;
                         return;
+                    }
+                    if !self.skip_images
+                        && (self.image_cache.is_some() || !self.active_type3_glyphs.is_empty())
+                    {
+                        if let Some(bounds) = Self::path_bounds(&page_path) {
+                            let push_clip = !self.clip_path_covers_current_bounds(&page_path);
+                            let saved_elision_bounds = self.current.clip_elision_bounds;
+                            let clip_idx = self.display_list.commands.len();
+                            if push_clip {
+                                self.intersect_clip_elision_bounds(
+                                    self.clip_path_enforced_device_bounds(&page_path),
+                                );
+                                self.display_list.push(RenderCommand::PushClip {
+                                    path: page_path.clone(),
+                                    rule,
+                                });
+                            }
+                            let emitted = self.emit_shading_image(&def, bounds);
+                            if push_clip {
+                                if !emitted && self.display_list.commands.len() == clip_idx + 1 {
+                                    self.display_list.commands.pop();
+                                } else {
+                                    self.display_list.push(RenderCommand::PopClip);
+                                }
+                                self.current.clip_elision_bounds = saved_elision_bounds;
+                            }
+                            if emitted {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -8801,6 +9047,8 @@ impl<'a> ContentInterpreter<'a> {
                     shading_scale,
                     inherited,
                     resource_scopes: self.form_resource_scopes.clone(),
+                    embed_type3_inline_images: self.image_cache.is_none()
+                        && !self.active_type3_glyphs.is_empty(),
                 }
             });
         if let Some(hit) = cache_key.as_ref().and_then(|key| {
@@ -10879,8 +11127,14 @@ impl<'a> ContentInterpreter<'a> {
                 if self.should_expand_anisotropic_stroke() {
                     if let Some(inv_ctm) = self.current.ctm.inverse() {
                         let user_path = path.map_points(|p| p.transform(&inv_ctm));
-                        match self.expand_anisotropic_stroke(&user_path) {
+                        let remaining = self
+                            .max_anisotropic_stroke_points
+                            .saturating_sub(self.anisotropic_stroke_points);
+                        match self.expand_anisotropic_stroke(&user_path, remaining) {
                             AnisotropicStroke::Outline(stroked) => {
+                                self.anisotropic_stroke_points = self
+                                    .anisotropic_stroke_points
+                                    .saturating_add(stroked.points().len());
                                 self.emit_stroke_as_filled_outline(stroked);
                                 continue;
                             }
@@ -16663,6 +16917,392 @@ mod tests {
                 .any(|c| matches!(c, RenderCommand::DrawImage(_) | RenderCommand::DrawInlineImage(_))),
             "standalone Type 3 replay of /Shallow Do must emit the image from Form 15's /Resources, got {:?}",
             replay_dl.commands
+        );
+    }
+
+    #[test]
+    fn anisotropic_stroke_point_budget_bounds_cumulative_page_and_cell_outlines() {
+        // Each 4x1 dashed line `[2 2] 0 d` from x=0..20 produces 5 rectangular
+        // dash contours (~20 points each). With a shared 60-point page allowance:
+        // - Individual strokes are well within the limit (20 <= 60),
+        // - Repeating the stroke 6 times (including inside a tiling cell) must
+        //   expand only while within budget and fall back to StrokePath (with
+        //   its dash array preserved) once the shared allowance is reached.
+        let stream_obj = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 120] /Contents 4 0 R \
+              /Resources << /Pattern << /P1 5 0 R >> >> >>"
+                .to_vec(),
+            stream_obj(
+                "",
+                b"/Pattern cs /P1 scn 0 0 40 40 re f \
+                  q 4 0 0 1 0 0 cm 2 w [2 2] 0 d \
+                  0 50 m 20 50 l S \
+                  0 60 m 20 60 l S \
+                  0 70 m 20 70 l S \
+                  0 80 m 20 80 l S \
+                  0 90 m 20 90 l S Q",
+            ),
+            // Pattern cell itself expands a 4x1 dashed stroke (~20 pts) against the shared allowance.
+            stream_obj(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 100 20] /XStep 100 /YStep 20 /Resources << >>",
+                b"q 4 0 0 1 0 0 cm 2 w [2 2] 0 d 0 10 m 20 10 l S Q",
+            ),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let allowance = 60usize;
+        let (dl, _) = ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_anisotropic_stroke_point_limit(allowance)
+            .interpret_with_stats(&content);
+
+        let mut expanded_fill_count = 0usize;
+        let mut fallback_stroke_count = 0usize;
+        let mut total_expanded_pts = 0usize;
+        for cmd in &dl.commands {
+            match cmd {
+                RenderCommand::FillPath {
+                    path,
+                    paint: Paint::Solid(_),
+                    ..
+                } => {
+                    expanded_fill_count += 1;
+                    total_expanded_pts += path.points().len();
+                }
+                RenderCommand::FillPath {
+                    paint: Paint::Tiling(t),
+                    ..
+                } => {
+                    for inner in &t.commands.commands {
+                        if let RenderCommand::FillPath { path, .. } = inner {
+                            expanded_fill_count += 1;
+                            total_expanded_pts += path.points().len();
+                        }
+                    }
+                }
+                RenderCommand::StrokePath { style, .. } => {
+                    assert!(
+                        style.dash.is_some(),
+                        "budget-exceeded fallback StrokePath must preserve dash pattern"
+                    );
+                    fallback_stroke_count += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            expanded_fill_count >= 2,
+            "first strokes within budget (including cell) must expand, got {expanded_fill_count}"
+        );
+        assert!(
+            fallback_stroke_count >= 2,
+            "later strokes past cumulative allowance must fall back to StrokePath, got {fallback_stroke_count}"
+        );
+        assert!(
+            total_expanded_pts <= allowance,
+            "cumulative expanded outline points ({total_expanded_pts}) must not exceed allowance ({allowance})"
+        );
+    }
+
+    #[test]
+    fn shading_pattern_falls_back_to_solid_average_when_image_budget_declines() {
+        let stream_obj = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Axial red-to-blue shading pattern applied to:
+        // 1) a fill, 2) an isotropic stroke, and 3) a 4x1 anisotropic stroke.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /Pattern << /PSh 5 0 R >> >> >>"
+                .to_vec(),
+            stream_obj(
+                "",
+                b"/Pattern cs /PSh scn 10 10 30 30 re f \
+                  /Pattern CS /PSh SCN 4 w 10 60 m 90 60 l S \
+                  q 4 0 0 1 0 0 cm 2 w 2 80 m 20 80 l S Q",
+            ),
+            b"<< /Type /Pattern /PatternType 2 /Shading 6 0 R >>".to_vec(),
+            b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+              /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> \
+              /Extend [true true] >>"
+                .to_vec(),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open");
+        let page = doc.page(0).expect("page 0");
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+
+        // Case 1: ImageCache budget (16 bytes) below gradient raster size.
+        let mut tiny_images = ImageCache::new();
+        let tiny_limits = zpdf_core::ParseLimits {
+            max_image_cache_bytes: 16,
+            ..Default::default()
+        };
+        let (dl_budget, _) = ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_images(&mut tiny_images)
+            .with_limits(&tiny_limits)
+            .interpret_with_stats(&content);
+
+        // Case 2: Images disabled / no ImageCache.
+        let (dl_no_img, _) = ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .interpret_with_stats(&content);
+
+        for (label, dl) in [("tiny_budget", &dl_budget), ("no_images", &dl_no_img)] {
+            let mut clip_balance = 0i32;
+            let mut solid_fills = 0usize;
+            let mut solid_strokes = 0usize;
+            for cmd in &dl.commands {
+                match cmd {
+                    RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                        clip_balance += 1
+                    }
+                    RenderCommand::PopClip => clip_balance -= 1,
+                    RenderCommand::FillPath {
+                        paint: Paint::Solid(c),
+                        ..
+                    } => {
+                        assert!(
+                            c.r > 0.2 || c.b > 0.2,
+                            "{label}: shading fill fallback must use gradient average color, got {c:?}"
+                        );
+                        solid_fills += 1;
+                    }
+                    RenderCommand::StrokePath {
+                        paint: Paint::Solid(c),
+                        ..
+                    } => {
+                        assert!(
+                            c.r > 0.2 || c.b > 0.2,
+                            "{label}: shading stroke fallback must use gradient average color, got {c:?}"
+                        );
+                        solid_strokes += 1;
+                    }
+                    RenderCommand::DrawImage(_) | RenderCommand::DrawInlineImage(_) => {
+                        panic!("{label}: declined shading must not emit an image command");
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(clip_balance, 0, "{label}: clips must stay balanced");
+            // 1 fill + 1 expanded anisotropic stroke fill = 2 FillPath, plus 1 isotropic StrokePath.
+            assert_eq!(
+                solid_fills, 2,
+                "{label}: fill and anisotropic stroke must both fall back to visible solid FillPath"
+            );
+            assert_eq!(
+                solid_strokes, 1,
+                "{label}: isotropic stroke must fall back to visible solid StrokePath"
+            );
+        }
+    }
+
+    #[test]
+    fn tiling_cell_cache_distinguishes_type3_inline_image_embedding_in_both_orders() {
+        let stream_obj = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Page-level tiling pattern whose cell paints a 1x1 red inline RGB image.
+        // Without an external ImageCache:
+        // - ordinary page fills omit inline images;
+        // - active Type 3 glyphs embed them via `DrawInlineImage`.
+        // Test BOTH paint orders so neither poisons `tiling_cell_cache` for the other.
+        let run_order = |page_stream: &[u8]| -> (bool, bool) {
+            let mut pat_cell = b"10 0 0 10 0 0 cm BI /W 1 /H 1 /CS /RGB /BPC 8 ID ".to_vec();
+            pat_cell.extend_from_slice(&[255, 0, 0]);
+            pat_cell.extend_from_slice(b" EI");
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R \
+                  /Resources << /Font << /F1 5 0 R >> /Pattern << /PImg 8 0 R >> >> >>"
+                    .to_vec(),
+                stream_obj("", page_stream),
+                // Type 3 font with NO /Resources of its own -> identical resource_scopes to page!
+                b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] \
+                  /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 7 0 R >> \
+                  /Encoding 6 0 R /FirstChar 65 /LastChar 65 /Widths [10] >>"
+                    .to_vec(),
+                b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(),
+                // d0 glyph inherits the page's active /PImg pattern and paints a rect.
+                stream_obj("", b"10 0 d0 0 0 10 10 re f"),
+                stream_obj(
+                    "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                     /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+                    &pat_cell,
+                ),
+            ]);
+
+            let doc = zpdf_document::PdfDocument::open(pdf).expect("open");
+            let page = doc.page(0).expect("page 0");
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+            // Live document, NO external ImageCache.
+            let (dl, _) = ContentInterpreter::new(page.effective_box())
+                .with_document(doc.file(), &page.resources)
+                .with_fonts(&mut fonts)
+                .interpret_with_stats(&content);
+
+            let fills: Vec<(&Path, &std::sync::Arc<TilingPattern>)> = dl
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    RenderCommand::FillPath {
+                        path,
+                        paint: Paint::Tiling(t),
+                        ..
+                    } => Some((path, t)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                fills.len(),
+                2,
+                "expected 1 page fill and 1 Type 3 glyph fill"
+            );
+            // Page fill is at x=[0..20], glyph fill is placed at x=[40..50].
+            let mut page_has_inline = false;
+            let mut glyph_has_inline = false;
+            for (path, tiling) in fills {
+                let x0 = path
+                    .points()
+                    .iter()
+                    .map(|p| p.x)
+                    .fold(f64::INFINITY, f64::min);
+                let has_inline = tiling
+                    .commands
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, RenderCommand::DrawInlineImage(_)));
+                if x0 < 30.0 {
+                    page_has_inline = has_inline;
+                } else {
+                    glyph_has_inline = has_inline;
+                }
+            }
+            (page_has_inline, glyph_has_inline)
+        };
+
+        let (page_first_page, page_first_glyph) =
+            run_order(b"/Pattern cs /PImg scn 0 0 20 20 re f BT /F1 1 Tf 40 0 Td (A) Tj ET");
+        assert!(
+            !page_first_page,
+            "page-first order: page fill without ImageCache must omit inline image"
+        );
+        assert!(
+            page_first_glyph,
+            "page-first order: Type 3 glyph must NOT reuse page cell missing inline image"
+        );
+
+        let (glyph_first_page, glyph_first_glyph) =
+            run_order(b"/Pattern cs /PImg scn BT /F1 1 Tf 40 0 Td (A) Tj ET 0 0 20 20 re f");
+        assert!(
+            glyph_first_glyph,
+            "glyph-first order: Type 3 glyph must embed inline image"
+        );
+        assert!(
+            !glyph_first_page,
+            "glyph-first order: page fill must NOT reuse Type 3 cell carrying DrawInlineImage"
         );
     }
 }

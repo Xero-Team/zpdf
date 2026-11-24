@@ -4275,3 +4275,158 @@ fn pdf_scaled_form_nested_hatch_and_translated_page_hatch_render_accurately() {
         Err(e) => panic!("GPU scaled/translated nested hatch test failed: {e}"),
     }
 }
+
+#[test]
+fn type3_ext_gstate_smask_matches_between_live_and_standalone_replay() {
+    use zpdf::display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
+    use zpdf_core::Matrix;
+
+    // Colored (`d0`) Type 3 glyph 'A' activates `/GSMask gs` (a Luminosity soft
+    // mask whose `/G` transparency group invokes `/HalfForm Do` from `/G`'s own
+    // `/Resources`, painting white over the left half [0..20] and leaving the
+    // right half [20..40] black/transparent), then fills the whole [0..40]x[0..40]
+    // square in red.
+    // Compare live document interpretation against standalone `DrawGlyphRun`
+    // replay (no live PdfFile) across CPU and WGPU: in both paths, the left half
+    // must be red and the right half must remain white.
+    let stream_obj = |dict: &str, data: &[u8]| -> Vec<u8> {
+        let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\nendstream");
+        out
+    };
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 60 60] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", b"BT /F1 1 Tf 10 10 Td (A) Tj ET"), // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 40 40] \
+          /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R >> \
+          /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [40] \
+          /Resources << /ExtGState << /GSMask 7 0 R >> >> >>"
+            .to_vec(), // 5
+        stream_obj("", b"40 0 d0 /GSMask gs 1 0 0 rg 0 0 40 40 re f"), // 6
+        b"<< /Type /ExtGState /SMask << /S /Luminosity /G 8 0 R >> >>".to_vec(), // 7
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 40 40] \
+             /Group << /Type /Group /S /Transparency /CS /DeviceGray >> \
+             /Resources << /XObject << /HalfForm 9 0 R >> >>",
+            b"/HalfForm Do",
+        ), // 8
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 40 40]",
+            b"1 g 0 0 20 40 re f",
+        ), // 9
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for off in offsets {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let doc = zpdf::PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let mut images = zpdf_image::ImageCache::new();
+    let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+
+    // 1) Live document interpretation.
+    let (live_dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+        .with_document(doc.file(), &page.resources)
+        .with_fonts(&mut fonts)
+        .with_images(&mut images)
+        .interpret_with_stats(&content);
+
+    // 2) Standalone `DrawGlyphRun` replay (same loaded Type 3 font with
+    //    `type3_resources`, NO live `PdfFile`).
+    let (font_id, _) = fonts.get_by_name("F1").expect("F1 loaded");
+    let mut standalone_dl = DisplayList::new(page.effective_box());
+    standalone_dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: 65,
+            x: 0.0,
+            y: 0.0,
+            advance: 40.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::translate(10.0, 10.0),
+        h_scale: 1.0,
+    }));
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let assert_half_masked = |label: &str, data: &[u8], w: u32| {
+        // Glyph covers PDF x=[10..50], y=[10..50] -> pixel y=30, left x=20, right x=40.
+        let left = px(data, w, 20, 30);
+        let right = px(data, w, 40, 30);
+        assert!(
+            left[0] > 240 && left[1] < 15 && left[2] < 15,
+            "{label}: unmasked left half must be red, got {left:?}"
+        );
+        assert!(
+            right[0] > 240 && right[1] > 240 && right[2] > 240,
+            "{label}: masked right half must stay white, got {right:?}"
+        );
+    };
+
+    let cpu_live = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&live_dl, 1.0)
+        .expect("cpu live");
+    let cpu_standalone = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&zpdf_image::ImageCache::new())
+        .render_display_list(&standalone_dl, 1.0)
+        .expect("cpu standalone");
+    assert_half_masked("CPU live", &cpu_live.data, cpu_live.width);
+    assert_half_masked("CPU standalone", &cpu_standalone.data, cpu_standalone.width);
+    assert_eq!(
+        cpu_live.data, cpu_standalone.data,
+        "CPU live and standalone Type 3 /ExtGState /SMask renders must match pixel-for-pixel"
+    );
+
+    match render_gpu_shared(&live_dl, Some(&fonts), Some(&images), 1.0) {
+        Ok(gpu_live) => {
+            let gpu_standalone =
+                render_gpu_shared(&standalone_dl, Some(&fonts), None, 1.0).expect("gpu standalone");
+            assert_half_masked("GPU live", &gpu_live.data, gpu_live.width);
+            assert_half_masked("GPU standalone", &gpu_standalone.data, gpu_standalone.width);
+            assert_eq!(
+                gpu_live.data, gpu_standalone.data,
+                "GPU live and standalone Type 3 /ExtGState /SMask renders must match pixel-for-pixel"
+            );
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU Type 3 /ExtGState /SMask test (no adapter)");
+        }
+        Err(e) => panic!("GPU Type 3 /ExtGState /SMask test failed: {e}"),
+    }
+}

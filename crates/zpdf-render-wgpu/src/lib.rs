@@ -2707,7 +2707,7 @@ fn record_tiling_glyph_run(
 /// `Arc<DisplayList>` without pre-recording clones), apply the linear part of
 /// `ctm` and page scale to its `offset`, and carry the /TR transfer LUT.
 #[allow(clippy::too_many_arguments)]
-fn build_mask_ops(
+pub(crate) fn build_mask_ops(
     rec: &mut PageRecorder,
     mask: &zpdf_display_list::SoftMask,
     ctm: &zpdf_core::Matrix,

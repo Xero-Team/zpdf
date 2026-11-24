@@ -6554,8 +6554,22 @@ impl<'a> CpuRenderer<'a> {
                 run.h_scale,
                 &program.font_matrix,
             );
+            let glyph_images = &program.images;
+            let resolve_glyph_img = |id: ImageId| {
+                glyph_images.get(id).map(|img| {
+                    Arc::new(zpdf_display_list::InlineImage {
+                        width: img.width,
+                        height: img.height,
+                        data: img.data.clone(),
+                        has_alpha: img.has_alpha,
+                        is_image_mask: img.is_image_mask,
+                        premultiplied: img.premultiplied,
+                    })
+                })
+            };
             let mut seg_start = 0usize;
             let mut glyph_clip_depth = 0usize;
+            let mut glyph_blend_depth = 0usize;
             let flush_inherited = |r: &mut Self, start: usize, end: usize| {
                 if start >= end {
                     return;
@@ -6601,6 +6615,36 @@ impl<'a> CpuRenderer<'a> {
                         }
                         seg_start = i + 1;
                     }
+                    RenderCommand::PushBlendGroup {
+                        blend_mode,
+                        isolated,
+                        knockout,
+                        alpha,
+                        mask,
+                        ..
+                    } => {
+                        flush_inherited(self, seg_start, i);
+                        let page_mask = mask
+                            .as_ref()
+                            .map(|m| m.transform_with_images(&glyph_to_page, &resolve_glyph_img));
+                        self.push_blend_group(
+                            *blend_mode,
+                            *isolated,
+                            *knockout,
+                            *alpha,
+                            page_mask.as_ref(),
+                        );
+                        glyph_blend_depth += 1;
+                        seg_start = i + 1;
+                    }
+                    RenderCommand::PopBlendGroup => {
+                        flush_inherited(self, seg_start, i);
+                        if glyph_blend_depth > 0 {
+                            self.pop_blend_group();
+                            glyph_blend_depth -= 1;
+                        }
+                        seg_start = i + 1;
+                    }
                     _ if Self::is_type3_explicit_colored(cmd) => {
                         flush_inherited(self, seg_start, i);
                         let t = self.tick();
@@ -6619,6 +6663,10 @@ impl<'a> CpuRenderer<'a> {
                 }
             }
             flush_inherited(self, seg_start, cmds.len());
+            while glyph_blend_depth > 0 {
+                self.pop_blend_group();
+                glyph_blend_depth -= 1;
+            }
             while glyph_clip_depth > 0 {
                 self.pop_clip();
                 glyph_clip_depth -= 1;
@@ -6640,8 +6688,21 @@ impl<'a> CpuRenderer<'a> {
         let h_scale = run.h_scale;
         let font_matrix = program.font_matrix;
         let glyph_images = &program.images;
+        let resolve_glyph_img = |id: ImageId| {
+            glyph_images.get(id).map(|img| {
+                Arc::new(zpdf_display_list::InlineImage {
+                    width: img.width,
+                    height: img.height,
+                    data: img.data.clone(),
+                    has_alpha: img.has_alpha,
+                    is_image_mask: img.is_image_mask,
+                    premultiplied: img.premultiplied,
+                })
+            })
+        };
         let glyph_to_page = Self::type3_glyph_to_page(tm, glyph, font_size, h_scale, &font_matrix);
         let mut glyph_clip_depth = 0usize;
+        let mut glyph_blend_depth = 0usize;
 
         for cmd in commands {
             match cmd {
@@ -6658,6 +6719,32 @@ impl<'a> CpuRenderer<'a> {
                     if glyph_clip_depth > 0 {
                         self.pop_clip();
                         glyph_clip_depth -= 1;
+                    }
+                }
+                RenderCommand::PushBlendGroup {
+                    blend_mode,
+                    isolated,
+                    knockout,
+                    alpha,
+                    mask,
+                    ..
+                } => {
+                    let page_mask = mask
+                        .as_ref()
+                        .map(|m| m.transform_with_images(&glyph_to_page, &resolve_glyph_img));
+                    self.push_blend_group(
+                        *blend_mode,
+                        *isolated,
+                        *knockout,
+                        *alpha,
+                        page_mask.as_ref(),
+                    );
+                    glyph_blend_depth += 1;
+                }
+                RenderCommand::PopBlendGroup => {
+                    if glyph_blend_depth > 0 {
+                        self.pop_blend_group();
+                        glyph_blend_depth -= 1;
                     }
                 }
                 RenderCommand::FillPath {
@@ -6801,6 +6888,10 @@ impl<'a> CpuRenderer<'a> {
                 }
                 _ => {}
             }
+        }
+        while glyph_blend_depth > 0 {
+            self.pop_blend_group();
+            glyph_blend_depth -= 1;
         }
         while glyph_clip_depth > 0 {
             self.pop_clip();

@@ -4716,7 +4716,7 @@ impl<'a> SvgWriter<'a> {
                     return;
                 }
                 if font.is_type3() {
-                    self.emit_type3_run(run, font, color, opacity);
+                    self.emit_type3_run(run, font, color, opacity, depth);
                 } else {
                     self.emit_outline_run(run, font, color, opacity);
                 }
@@ -5193,6 +5193,20 @@ impl<'a> SvgWriter<'a> {
                 (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
             };
             let mut glyph_clips: Vec<(Option<u32>, Option<u32>, Option<SvgRect>)> = Vec::new();
+            let mut glyph_blends: Vec<(BlendMode, bool, f32, Option<u32>, String, usize)> =
+                Vec::new();
+            let resolve_glyph_img = |id: ImageId| {
+                program.images.get(id).map(|img| {
+                    std::sync::Arc::new(zpdf_display_list::InlineImage {
+                        width: img.width,
+                        height: img.height,
+                        data: img.data.clone(),
+                        has_alpha: img.has_alpha,
+                        is_image_mask: img.is_image_mask,
+                        premultiplied: img.premultiplied,
+                    })
+                })
+            };
 
             for cmd in &program.list.commands {
                 if self.check_over_budget() {
@@ -5221,6 +5235,68 @@ impl<'a> SvgWriter<'a> {
                             self.clip = clip;
                             self.stroke_mask = stroke_mask;
                             self.clip_bounds = clip_bounds;
+                        }
+                    }
+                    RenderCommand::PushBlendGroup {
+                        blend_mode,
+                        isolated,
+                        alpha,
+                        mask,
+                        ..
+                    } => {
+                        let eff_alpha = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        let mask_id = mask.as_ref().and_then(|m| {
+                            let page_mask =
+                                m.transform_with_images(&glyph_to_page, &resolve_glyph_img);
+                            self.emit_soft_mask_def(&page_mask, depth)
+                        });
+                        let prev_out = std::mem::take(&mut self.out);
+                        glyph_blends.push((
+                            *blend_mode,
+                            *isolated,
+                            eff_alpha,
+                            mask_id,
+                            prev_out,
+                            parts.len(),
+                        ));
+                    }
+                    RenderCommand::PopBlendGroup => {
+                        if let Some((
+                            blend_mode,
+                            isolated,
+                            group_alpha,
+                            mask_id,
+                            prev_out,
+                            parts_start,
+                        )) = glyph_blends.pop()
+                        {
+                            let inner_inherited = std::mem::replace(&mut self.out, prev_out);
+                            if !inner_inherited.is_empty() {
+                                self.write_blend_group_tag(
+                                    BlendMode::Normal,
+                                    true,
+                                    group_alpha,
+                                    mask_id,
+                                    &inner_inherited,
+                                );
+                            }
+                            for part in &mut parts[parts_start..] {
+                                if let Type3TilingPart::ColoredVector { body, .. } = part {
+                                    let saved = std::mem::take(&mut self.out);
+                                    self.write_blend_group_tag(
+                                        blend_mode,
+                                        isolated,
+                                        group_alpha,
+                                        mask_id,
+                                        body,
+                                    );
+                                    *body = std::mem::replace(&mut self.out, saved);
+                                }
+                            }
                         }
                     }
                     RenderCommand::FillPath {
@@ -5461,19 +5537,53 @@ impl<'a> SvgWriter<'a> {
                                 self.page_width,
                                 self.page_height,
                             );
-                            parts.push(Type3TilingPart::ColoredImage {
-                                key,
-                                program: Rc::clone(&program),
-                                image_id: draw.image_id,
-                                transform,
-                                alpha,
-                                clip: self.clip,
-                                stroke_mask: self.stroke_mask,
-                                bounds,
-                            });
+                            if !glyph_blends.is_empty() {
+                                let saved = std::mem::take(&mut self.out);
+                                self.place_image(key, image, None, &transform, alpha * opacity);
+                                let body = std::mem::replace(&mut self.out, saved);
+                                parts.push(Type3TilingPart::ColoredVector { body, bounds });
+                            } else {
+                                parts.push(Type3TilingPart::ColoredImage {
+                                    key,
+                                    program: Rc::clone(&program),
+                                    image_id: draw.image_id,
+                                    transform,
+                                    alpha,
+                                    clip: self.clip,
+                                    stroke_mask: self.stroke_mask,
+                                    bounds,
+                                });
+                            }
                         }
                     }
                     _ => {}
+                }
+            }
+            while let Some((blend_mode, isolated, group_alpha, mask_id, prev_out, parts_start)) =
+                glyph_blends.pop()
+            {
+                let inner_inherited = std::mem::replace(&mut self.out, prev_out);
+                if !inner_inherited.is_empty() {
+                    self.write_blend_group_tag(
+                        BlendMode::Normal,
+                        true,
+                        group_alpha,
+                        mask_id,
+                        &inner_inherited,
+                    );
+                }
+                for part in &mut parts[parts_start..] {
+                    if let Type3TilingPart::ColoredVector { body, .. } = part {
+                        let saved = std::mem::take(&mut self.out);
+                        self.write_blend_group_tag(
+                            blend_mode,
+                            isolated,
+                            group_alpha,
+                            mask_id,
+                            body,
+                        );
+                        *body = std::mem::replace(&mut self.out, saved);
+                    }
                 }
             }
             while let Some((clip, stroke_mask, clip_bounds)) = glyph_clips.pop() {
@@ -5984,9 +6094,16 @@ impl<'a> SvgWriter<'a> {
     }
 
     /// Type3 glyphs: interpret the glyph's content stream (as the CPU backend
-    /// does) and emit its fills, strokes, glyph-local clips, and images through
-    /// the Type3 transform chain.
-    fn emit_type3_run(&mut self, run: &GlyphRun, font: &LoadedFont, color: &Color, opacity: f32) {
+    /// does) and emit its fills, strokes, glyph-local clips, blend/soft-mask
+    /// groups, and images through the Type3 transform chain.
+    fn emit_type3_run(
+        &mut self,
+        run: &GlyphRun,
+        font: &LoadedFont,
+        color: &Color,
+        opacity: f32,
+        depth: EmitDepth,
+    ) {
         for glyph in &run.glyphs {
             if self.check_over_budget() {
                 break;
@@ -5997,6 +6114,19 @@ impl<'a> SvgWriter<'a> {
             let font_matrix = program.font_matrix;
             let glyph_to_page = Self::type3_glyph_to_page(run, glyph, &font_matrix);
             let mut glyph_clips: Vec<(Option<u32>, Option<u32>, Option<SvgRect>)> = Vec::new();
+            let mut glyph_blends: Vec<(BlendMode, bool, f32, Option<u32>, String)> = Vec::new();
+            let resolve_glyph_img = |id: ImageId| {
+                program.images.get(id).map(|img| {
+                    std::sync::Arc::new(zpdf_display_list::InlineImage {
+                        width: img.width,
+                        height: img.height,
+                        data: img.data.clone(),
+                        has_alpha: img.has_alpha,
+                        is_image_mask: img.is_image_mask,
+                        premultiplied: img.premultiplied,
+                    })
+                })
+            };
 
             for cmd in &program.list.commands {
                 if self.check_over_budget() {
@@ -6025,6 +6155,40 @@ impl<'a> SvgWriter<'a> {
                             self.clip = clip;
                             self.stroke_mask = stroke_mask;
                             self.clip_bounds = clip_bounds;
+                        }
+                    }
+                    RenderCommand::PushBlendGroup {
+                        blend_mode,
+                        isolated,
+                        alpha,
+                        mask,
+                        ..
+                    } => {
+                        let eff_alpha = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        let mask_id = mask.as_ref().and_then(|m| {
+                            let page_mask =
+                                m.transform_with_images(&glyph_to_page, &resolve_glyph_img);
+                            self.emit_soft_mask_def(&page_mask, depth)
+                        });
+                        let prev_out = std::mem::take(&mut self.out);
+                        glyph_blends.push((*blend_mode, *isolated, eff_alpha, mask_id, prev_out));
+                    }
+                    RenderCommand::PopBlendGroup => {
+                        if let Some((blend_mode, isolated, group_alpha, mask_id, prev_out)) =
+                            glyph_blends.pop()
+                        {
+                            let inner_body = std::mem::replace(&mut self.out, prev_out);
+                            self.write_blend_group_tag(
+                                blend_mode,
+                                isolated,
+                                group_alpha,
+                                mask_id,
+                                &inner_body,
+                            );
                         }
                     }
                     RenderCommand::FillPath {
@@ -6130,6 +6294,12 @@ impl<'a> SvgWriter<'a> {
                     }
                     _ => {}
                 }
+            }
+            while let Some((blend_mode, isolated, group_alpha, mask_id, prev_out)) =
+                glyph_blends.pop()
+            {
+                let inner_body = std::mem::replace(&mut self.out, prev_out);
+                self.write_blend_group_tag(blend_mode, isolated, group_alpha, mask_id, &inner_body);
             }
             while let Some((clip, stroke_mask, clip_bounds)) = glyph_clips.pop() {
                 self.clip = clip;
@@ -6900,7 +7070,7 @@ mod tests {
                 })),
             );
             writer.budget_checks = 62;
-            writer.emit_type3_run(&run, &font, &Color::black(), 1.0);
+            writer.emit_type3_run(&run, &font, &Color::black(), 1.0, EmitDepth::default());
             assert_eq!(writer.over_budget, budget.is_some());
             assert_eq!(writer.out.contains("<path"), budget.is_none());
         }
@@ -11943,6 +12113,101 @@ mod tests {
             right.red() > 240 && right.green() > 240 && right.blue() > 240,
             "transparent right half of soft mask inside 9-level nested tile must keep white background, got {:?}",
             [right.red(), right.green(), right.blue(), right.alpha()]
+        );
+    }
+
+    #[test]
+    fn svg_type3_ext_gstate_smask_keeps_masked_half_transparent() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3FormXObject, Type3Resources, Type3SoftMask};
+
+        let mut form_dict = zpdf_core::PdfDict::new();
+        form_dict.insert(
+            zpdf_core::PdfName::new("BBox"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(20.0),
+                zpdf_core::PdfObject::Real(20.0),
+            ]),
+        );
+        let group = Arc::new(Type3FormXObject {
+            dict: form_dict,
+            data: Arc::from(&b"1 g 0 0 10 20 re f"[..]),
+            resources: None,
+        });
+        let mut t3_res = Type3Resources::default();
+        t3_res.ext_g_state_smasks.insert(
+            "GSMask".into(),
+            Type3SoftMask::Dict {
+                is_alpha: false,
+                group,
+                backdrop_luma: 0.0,
+                transfer: None,
+            },
+        );
+        let charproc = b"20 0 d0 /GSMask gs 1 0 0 rg 0 0 20 20 re f";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![20.0],
+                first_char: 0,
+            },
+            "Type3SMaskSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(20.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 20.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        assert!(
+            svg.contains("<mask id=\"m"),
+            "SVG standalone Type 3 replay must emit <mask> for /ExtGState /SMask: {svg}"
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(40, 40).expect("pixmap");
+        let sx = 40.0 / tree.size().width();
+        let sy = 40.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let left = pixmap.pixel(10, 20).expect("left half");
+        let right = pixmap.pixel(30, 20).expect("right half");
+        assert!(
+            left.red() > 240 && left.green() < 15 && left.blue() < 15,
+            "SVG Type 3 /SMask left half must be red, got {:?}",
+            [left.red(), left.green(), left.blue()]
+        );
+        assert!(
+            right.red() > 240 && right.green() > 240 && right.blue() > 240,
+            "SVG Type 3 /SMask right half must remain white, got {:?}",
+            [right.red(), right.green(), right.blue()]
         );
     }
 }

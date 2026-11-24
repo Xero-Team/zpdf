@@ -116,7 +116,17 @@ fn render_glyph_run_colored(
     }
 
     if font.is_type3() {
-        render_type3(rec, font, run, tm, color, image_alpha, map, run.h_scale);
+        render_type3(
+            rec,
+            fonts,
+            font,
+            run,
+            tm,
+            color,
+            image_alpha,
+            map,
+            run.h_scale,
+        );
         return None;
     }
 
@@ -391,6 +401,7 @@ fn scale_premul_color(color: [f32; 4], alpha: f32) -> [f32; 4] {
 #[allow(clippy::too_many_arguments)]
 fn render_type3(
     rec: &mut PageRecorder,
+    fonts: &FontCache,
     font: &LoadedFont,
     run: &GlyphRun,
     tm: &Matrix,
@@ -415,6 +426,7 @@ fn render_type3(
         };
         let glyph_to_page = type3_glyph_to_page(tm, (g.x, g.y), font_size, h_scale, &font_matrix);
         let mut glyph_clip_depth = 0usize;
+        let mut glyph_blend_depth = 0usize;
 
         for cmd in &glyph_dl.commands {
             if !rec.can_record() {
@@ -433,6 +445,49 @@ fn render_type3(
                     if glyph_clip_depth > 0 {
                         rec.pop_clip();
                         glyph_clip_depth -= 1;
+                    }
+                }
+                RenderCommand::PushBlendGroup {
+                    blend_mode,
+                    isolated,
+                    knockout,
+                    alpha,
+                    mask,
+                    ..
+                } => {
+                    let sub = if rec.can_push_blend() {
+                        mask.as_ref().map(|m| {
+                            crate::build_mask_ops(
+                                rec,
+                                m,
+                                &glyph_to_page,
+                                Some(fonts),
+                                Some(&glyph_images),
+                                map,
+                                0,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if !*isolated && !*knockout {
+                        if *blend_mode == zpdf_display_list::BlendMode::Normal
+                            && *alpha >= 1.0
+                            && sub.is_none()
+                        {
+                            rec.push_passthrough_blend();
+                        } else {
+                            rec.push_non_isolated_with_mode(*blend_mode, *alpha, sub);
+                        }
+                    } else {
+                        rec.push_blend(*blend_mode, *alpha, sub);
+                    }
+                    glyph_blend_depth += 1;
+                }
+                RenderCommand::PopBlendGroup => {
+                    if glyph_blend_depth > 0 {
+                        rec.pop_blend();
+                        glyph_blend_depth -= 1;
                     }
                 }
                 RenderCommand::FillPath {
@@ -586,6 +641,10 @@ fn render_type3(
                 _ => {}
             }
         }
+        while glyph_blend_depth > 0 {
+            rec.pop_blend();
+            glyph_blend_depth -= 1;
+        }
         while glyph_clip_depth > 0 {
             rec.pop_clip();
             glyph_clip_depth -= 1;
@@ -678,6 +737,7 @@ pub fn render_type3_tiling_transformed(
         };
         let glyph_to_page = type3_glyph_to_page(&tm, (g.x, g.y), font_size, h_scale, &font_matrix);
         let mut glyph_clip_depth = 0usize;
+        let mut glyph_blend_depth = 0usize;
 
         for cmd in &glyph_dl.commands {
             if !rec.can_record() {
@@ -708,6 +768,54 @@ pub fn render_type3_tiling_transformed(
                             rec.mirror_clip_rebuild_into(&mut mask_ops);
                         }
                         glyph_clip_depth -= 1;
+                    }
+                }
+                RenderCommand::PushBlendGroup {
+                    blend_mode,
+                    isolated,
+                    knockout,
+                    alpha,
+                    mask,
+                    ..
+                } => {
+                    flush_mask_batch!();
+                    if !rec.can_record() {
+                        break;
+                    }
+                    let sub = if rec.can_push_blend() {
+                        mask.as_ref().map(|m| {
+                            crate::build_mask_ops(
+                                rec,
+                                m,
+                                &glyph_to_page,
+                                Some(fonts),
+                                Some(&glyph_images),
+                                map,
+                                0,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if !*isolated && !*knockout {
+                        if *blend_mode == zpdf_display_list::BlendMode::Normal
+                            && *alpha >= 1.0
+                            && sub.is_none()
+                        {
+                            rec.push_passthrough_blend();
+                        } else {
+                            rec.push_non_isolated_with_mode(*blend_mode, *alpha, sub);
+                        }
+                    } else {
+                        rec.push_blend(*blend_mode, *alpha, sub);
+                    }
+                    glyph_blend_depth += 1;
+                }
+                RenderCommand::PopBlendGroup => {
+                    flush_mask_batch!();
+                    if glyph_blend_depth > 0 {
+                        rec.pop_blend();
+                        glyph_blend_depth -= 1;
                     }
                 }
                 RenderCommand::FillPath {
@@ -929,6 +1037,11 @@ pub fn render_type3_tiling_transformed(
                 }
                 _ => {}
             }
+        }
+        while glyph_blend_depth > 0 {
+            flush_mask_batch!();
+            rec.pop_blend();
+            glyph_blend_depth -= 1;
         }
         while glyph_clip_depth > 0 {
             let depth_before = rec.clip_depth();
