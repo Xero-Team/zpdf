@@ -3730,3 +3730,142 @@ fn gpu_and_cpu_type3_nonuniform_4x1_stroke_preserves_anisotropic_widths() {
         }
     }
 }
+
+#[test]
+fn pdf_type3_nonuniform_4x1_tiling_stroke_preserves_anisotropic_widths_cpu_and_gpu() {
+    // Full PDF-level regression through `PdfDocument::open` + `ContentInterpreter`
+    // (`paint_type3_glyph_run`) for a patterned `d1` Type 3 CharProc stroked with
+    // a 2-unit pen under a 4×1 nonuniform text transform (`400 Tz` and `4 0 0 1 8 8 Tm`).
+    // Vertical segment (glyph x=4, y=2..38 -> page x=24, y=10..46) must render
+    // 8 px wide (red left half [20..24], blue right half [24..28]); horizontal
+    // segment (glyph x=12..22, y=20 -> page x=56..96, y=28) must render 2 px tall.
+    let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+        let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\nendstream");
+        out
+    };
+    let build_pdf = |page_stream: &[u8]| -> Vec<u8> {
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 56] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 9 0 R >> >> >>"
+                .to_vec(),
+            stream("", page_stream),
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 30 40] \
+              /FontMatrix [1 0 0 1 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [30] /Resources << >> >>"
+                .to_vec(),
+            b"<< /A 8 0 R >>".to_vec(),
+            b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(),
+            stream(
+                "",
+                b"30 0 0 0 30 40 d1 2 w 4 2 m 4 38 l S 12 20 m 22 20 l S",
+            ),
+            // Two-color 8×8 tiling cell: red [0..4] mod 8, blue [4..8] mod 8,
+            // so page x=20..24 (4..8 mod 8) is blue and x=24..28 (0..4 mod 8) is red
+            // (verifying both 8px width and page-space pattern alignment).
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 8 8] /XStep 8 /YStep 8 /Resources << >>",
+                b"1 0 0 rg 0 0 4 8 re f 0 0 1 rg 4 0 4 8 re f",
+            ),
+        ];
+        let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (idx, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        let count = objects.len() + 1;
+        pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    };
+
+    for (label, page_stream) in [
+        (
+            "tiling_Tz400",
+            &b"/Pattern cs /P1 scn BT /F1 1 Tf 400 Tz 8 8 Td (A) Tj ET"[..],
+        ),
+        (
+            "tiling_Tm4x1",
+            &b"/Pattern cs /P1 scn BT /F1 1 Tf 4 0 0 1 8 8 Tm (A) Tj ET"[..],
+        ),
+    ] {
+        let doc = zpdf::PdfDocument::open(build_pdf(page_stream)).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let mut images = zpdf_image::ImageCache::new();
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content);
+
+        let check = |backend: &str, data: &[u8], w: u32, h: u32| {
+            let is_ink = |x: u32, y: u32| -> bool {
+                let off = ((y * w + x) * 4) as usize;
+                let (r, g, b) = (data[off], data[off + 1], data[off + 2]);
+                g < 80 && (r > 200 || b > 200)
+            };
+            // Vertical stroke crosses row y = 28 across x = [20..28]: expect ~8 px wide.
+            let vert_width = (10..40).filter(|&x| is_ink(x, 28)).count();
+            // Horizontal stroke crosses col x = 74 (red stripe) and x = 78 (blue stripe)
+            // near y = 28: expect ~2 px tall.
+            let horiz_height_red = (0..h).filter(|&y| is_ink(74, y)).count();
+            let horiz_height_blue = (0..h).filter(|&y| is_ink(78, y)).count();
+            assert!(
+                (7..=9).contains(&vert_width),
+                "{backend} ({label}) PDF-interpreted 4x1 Type 3 vertical stroke must be ~8px wide, got {vert_width}px"
+            );
+            assert!(
+                (1..=3).contains(&horiz_height_red) && (1..=3).contains(&horiz_height_blue),
+                "{backend} ({label}) PDF-interpreted 4x1 Type 3 horizontal stroke must be ~2px tall, got red={horiz_height_red}px blue={horiz_height_blue}px"
+            );
+            // Verify the tiling pattern painted both blue (x=22, 6 mod 8) and red (x=26, 2 mod 8) halves of the 8px vertical bar.
+            let left_off = ((28 * w + 22) * 4) as usize;
+            let right_off = ((28 * w + 26) * 4) as usize;
+            assert!(
+                data[left_off + 2] > 200 && data[left_off] < 80,
+                "{backend} ({label}) left half of vertical stroke (x=22) must be blue, got {:?}",
+                &data[left_off..left_off + 4]
+            );
+            assert!(
+                data[right_off] > 200 && data[right_off + 2] < 80,
+                "{backend} ({label}) right half of vertical stroke (x=26) must be red, got {:?}",
+                &data[right_off..right_off + 4]
+            );
+        };
+
+        let cpu = zpdf_render_cpu::CpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_images(&images)
+            .render_display_list(&dl, 1.0)
+            .expect("cpu render");
+        check("CPU", &cpu.data, cpu.width, cpu.height);
+
+        match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+            Ok(gpu) => check("GPU", &gpu.data, gpu.width, gpu.height),
+            Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+                eprintln!(
+                    "skipping GPU PDF-interpreted 4x1 Type 3 tiling stroke test ({label}, no adapter)"
+                );
+            }
+            Err(e) => {
+                panic!("GPU PDF-interpreted 4x1 Type 3 tiling stroke test ({label}) failed: {e}")
+            }
+        }
+    }
+}

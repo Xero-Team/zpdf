@@ -16,6 +16,13 @@ use crate::tokenizer::{BorrowedContentToken as ContentToken, ContentTokenizer};
 /// Cached CMYK→RGB conversion entry
 type CmykCacheEntry = ([f64; 4], (f64, f64, f64));
 
+/// Result of expanding a stroke in user space under an anisotropic CTM.
+enum AnisotropicStroke {
+    Outline(Path),
+    Empty,
+    Fallback,
+}
+
 /// Interprets a PDF content stream and produces a DisplayList.
 pub struct ContentInterpreter<'a> {
     state_stack: Vec<GraphicsState>,
@@ -7111,6 +7118,27 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn paint_stroke(&mut self) {
+        if self.current_path.is_empty() {
+            return;
+        }
+        if self.should_expand_anisotropic_stroke() {
+            if self.rules_active() {
+                let page_path = self.transform_path_to_page_space(&self.current_path);
+                self.capture_stroke_rules(&page_path);
+            }
+            match self.expand_anisotropic_stroke(&self.current_path) {
+                AnisotropicStroke::Outline(outline) => {
+                    self.current_path.clear();
+                    self.emit_stroke_as_filled_outline(outline);
+                    return;
+                }
+                AnisotropicStroke::Empty => {
+                    self.current_path.clear();
+                    return;
+                }
+                AnisotropicStroke::Fallback => {}
+            }
+        }
         if let Some(page_path) = self.take_page_path() {
             self.emit_stroke(page_path);
         }
@@ -7123,10 +7151,352 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn paint_fill_then_stroke(&mut self, rule: FillRule) {
-        if let Some(page_path) = self.take_page_path() {
-            self.fill_page_path(page_path.clone(), rule);
-            self.emit_stroke(page_path);
+        if self.current_path.is_empty() {
+            return;
         }
+        let page_path = self.transform_path_to_page_space(&self.current_path);
+        if self.should_expand_anisotropic_stroke() {
+            let expanded = self.expand_anisotropic_stroke(&self.current_path);
+            self.current_path.clear();
+            self.fill_page_path(page_path.clone(), rule);
+            match expanded {
+                AnisotropicStroke::Outline(outline) => {
+                    self.capture_stroke_rules(&page_path);
+                    self.emit_stroke_as_filled_outline(outline);
+                }
+                AnisotropicStroke::Empty => {}
+                AnisotropicStroke::Fallback => self.emit_stroke(page_path),
+            }
+            return;
+        }
+        self.current_path.clear();
+        self.fill_page_path(page_path.clone(), rule);
+        self.emit_stroke(page_path);
+    }
+
+    /// True when the active stroke has a positive finite user-space width under
+    /// a non-similarity (anisotropic scale or shear) CTM, so scalar width
+    /// scaling would distort directional pen widths. Hairlines (`line_width == 0`)
+    /// stay as `StrokePath` because their device width is independent of CTM.
+    fn should_expand_anisotropic_stroke(&self) -> bool {
+        if !self.current.line_width.is_finite() || self.current.line_width <= 0.0 {
+            return false;
+        }
+        let ctm = &self.current.ctm;
+        if ![ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return false;
+        }
+        let col_x_sq = ctm.a * ctm.a + ctm.b * ctm.b;
+        let col_y_sq = ctm.c * ctm.c + ctm.d * ctm.d;
+        let ref_sq = col_x_sq.max(col_y_sq);
+        if !ref_sq.is_finite() || ref_sq <= 1e-24 {
+            return false;
+        }
+        let dot = ctm.a * ctm.c + ctm.b * ctm.d;
+        (col_x_sq - col_y_sq).abs() > 1e-4 * ref_sq || dot.abs() > 1e-4 * ref_sq
+    }
+
+    /// Stroke `user_path` in isotropic user space (normalized to page-point
+    /// magnitude by the CTM's largest singular value) and transform the
+    /// resulting outline into page space. Preserves exact directional widths,
+    /// elliptical caps/joins, and transformed dash lengths under nonuniform
+    /// scales and shears (e.g., 4×1 Type 3 text transforms or `cm`).
+    fn expand_anisotropic_stroke(&self, user_path: &Path) -> AnisotropicStroke {
+        const RES_SCALE: f32 = 4.0;
+        const MAX_NORM_COORD: f32 = 1e7;
+        const MAX_DASH_REPEATS: f64 = 100_000.0;
+
+        let ctm = &self.current.ctm;
+        let sum_sq = ctm.a * ctm.a + ctm.b * ctm.b + ctm.c * ctm.c + ctm.d * ctm.d;
+        let det = ctm.a * ctm.d - ctm.b * ctm.c;
+        let disc = (sum_sq * sum_sq - 4.0 * det * det).max(0.0).sqrt();
+        let max_scale = (0.5 * (sum_sq + disc)).sqrt();
+        if !max_scale.is_finite() || max_scale <= 1e-12 {
+            return AnisotropicStroke::Fallback;
+        }
+
+        let Some(&origin) = user_path.points().first() else {
+            return AnisotropicStroke::Empty;
+        };
+        if !origin.x.is_finite() || !origin.y.is_finite() {
+            return AnisotropicStroke::Fallback;
+        }
+
+        let width_norm = (self.current.line_width as f64 * max_scale) as f32;
+        if !width_norm.is_finite() || width_norm <= 0.0 || width_norm > MAX_NORM_COORD {
+            return AnisotropicStroke::Fallback;
+        }
+
+        let to_norm = |p: Point| -> Option<(f32, f32)> {
+            if !p.x.is_finite() || !p.y.is_finite() {
+                return None;
+            }
+            let nx = ((p.x - origin.x) * max_scale) as f32;
+            let ny = ((p.y - origin.y) * max_scale) as f32;
+            if !nx.is_finite()
+                || !ny.is_finite()
+                || nx.abs() > MAX_NORM_COORD
+                || ny.abs() > MAX_NORM_COORD
+            {
+                return None;
+            }
+            Some((nx, ny))
+        };
+
+        let mut pb = tiny_skia_path::PathBuilder::new();
+        let mut total_len = 0.0f64;
+        let mut cur: Option<(f32, f32)> = None;
+        let mut sub_start: Option<(f32, f32)> = None;
+        for elem in user_path {
+            match elem {
+                PathElement::MoveTo(p) => {
+                    let Some((nx, ny)) = to_norm(p) else {
+                        return AnisotropicStroke::Fallback;
+                    };
+                    pb.move_to(nx, ny);
+                    cur = Some((nx, ny));
+                    sub_start = Some((nx, ny));
+                }
+                PathElement::LineTo(p) => {
+                    let Some((nx, ny)) = to_norm(p) else {
+                        return AnisotropicStroke::Fallback;
+                    };
+                    if let Some((cx, cy)) = cur {
+                        total_len += ((nx - cx) as f64).hypot((ny - cy) as f64);
+                    }
+                    pb.line_to(nx, ny);
+                    cur = Some((nx, ny));
+                }
+                PathElement::CurveTo(c1, c2, end) => {
+                    let (Some((x1, y1)), Some((x2, y2)), Some((xe, ye))) =
+                        (to_norm(c1), to_norm(c2), to_norm(end))
+                    else {
+                        return AnisotropicStroke::Fallback;
+                    };
+                    if let Some((cx, cy)) = cur {
+                        total_len += ((x1 - cx) as f64).hypot((y1 - cy) as f64)
+                            + ((x2 - x1) as f64).hypot((y2 - y1) as f64)
+                            + ((xe - x2) as f64).hypot((ye - y2) as f64);
+                    }
+                    pb.cubic_to(x1, y1, x2, y2, xe, ye);
+                    cur = Some((xe, ye));
+                }
+                PathElement::Close => {
+                    if let (Some((cx, cy)), Some((sx, sy))) = (cur, sub_start) {
+                        total_len += ((sx - cx) as f64).hypot((sy - cy) as f64);
+                        cur = Some((sx, sy));
+                    }
+                    pb.close();
+                }
+            }
+        }
+        let Some(norm_path) = pb.finish() else {
+            return AnisotropicStroke::Empty;
+        };
+
+        let skia_stroke = tiny_skia_path::Stroke {
+            width: width_norm,
+            miter_limit: if self.current.miter_limit.is_finite() && self.current.miter_limit >= 1.0
+            {
+                self.current.miter_limit
+            } else {
+                1.0
+            },
+            line_cap: match self.current.line_cap {
+                LineCap::Butt => tiny_skia_path::LineCap::Butt,
+                LineCap::Round => tiny_skia_path::LineCap::Round,
+                LineCap::Square => tiny_skia_path::LineCap::Square,
+            },
+            line_join: match self.current.line_join {
+                LineJoin::Miter => tiny_skia_path::LineJoin::Miter,
+                LineJoin::Round => tiny_skia_path::LineJoin::Round,
+                LineJoin::Bevel => tiny_skia_path::LineJoin::Bevel,
+            },
+            dash: None,
+        };
+
+        let dashed_path;
+        let source = if let Some(d) = self.current.dash.as_ref().filter(|d| {
+            !d.array.is_empty()
+                && d.phase.is_finite()
+                && d.array.iter().all(|v| v.is_finite() && *v >= 0.0)
+                && d.array.iter().any(|&v| v > 0.0)
+        }) {
+            let mut array: Vec<f32> = d
+                .array
+                .iter()
+                .map(|&v| (v as f64 * max_scale) as f32)
+                .collect();
+            if array.len() % 2 == 1 {
+                let len = array.len();
+                array.reserve(len);
+                for i in 0..len {
+                    array.push(array[i]);
+                }
+            }
+            let period: f64 = array.iter().map(|&v| v as f64).sum();
+            if period.is_finite()
+                && period > 1e-4
+                && array.iter().all(|v| v.is_finite())
+                && total_len / period <= MAX_DASH_REPEATS
+            {
+                let mut phase = (d.phase as f64 * max_scale).rem_euclid(period) as f32;
+                if !phase.is_finite() || phase >= period as f32 {
+                    phase = 0.0;
+                }
+                if let Some(skia_dash) = tiny_skia_path::StrokeDash::new(array, phase) {
+                    let Some(dashed) = norm_path.dash(&skia_dash, RES_SCALE) else {
+                        return AnisotropicStroke::Empty;
+                    };
+                    dashed_path = dashed;
+                    &dashed_path
+                } else {
+                    &norm_path
+                }
+            } else {
+                &norm_path
+            }
+        } else {
+            &norm_path
+        };
+
+        let Some(stroked) = source.stroke(&skia_stroke, RES_SCALE) else {
+            return AnisotropicStroke::Empty;
+        };
+
+        let inv_norm = 1.0 / max_scale;
+        let ctm_post = Matrix::new(
+            ctm.a * inv_norm,
+            ctm.b * inv_norm,
+            ctm.c * inv_norm,
+            ctm.d * inv_norm,
+            ctm.a * origin.x + ctm.c * origin.y + ctm.e,
+            ctm.b * origin.x + ctm.d * origin.y + ctm.f,
+        );
+        let mut out = Path::new();
+        let mut last = Point::zero();
+        for seg in stroked.segments() {
+            match seg {
+                tiny_skia_path::PathSegment::MoveTo(p) => {
+                    last = Point::new(p.x as f64, p.y as f64);
+                    let mapped = last.transform(&ctm_post);
+                    if !mapped.x.is_finite() || !mapped.y.is_finite() {
+                        return AnisotropicStroke::Fallback;
+                    }
+                    out.move_to(mapped);
+                }
+                tiny_skia_path::PathSegment::LineTo(p) => {
+                    last = Point::new(p.x as f64, p.y as f64);
+                    let mapped = last.transform(&ctm_post);
+                    if !mapped.x.is_finite() || !mapped.y.is_finite() {
+                        return AnisotropicStroke::Fallback;
+                    }
+                    out.line_to(mapped);
+                }
+                tiny_skia_path::PathSegment::QuadTo(p1, p2) => {
+                    let q1 = Point::new(p1.x as f64, p1.y as f64);
+                    let q2 = Point::new(p2.x as f64, p2.y as f64);
+                    let c1 = Point::new(
+                        last.x + (2.0 / 3.0) * (q1.x - last.x),
+                        last.y + (2.0 / 3.0) * (q1.y - last.y),
+                    )
+                    .transform(&ctm_post);
+                    let c2 = Point::new(
+                        q2.x + (2.0 / 3.0) * (q1.x - q2.x),
+                        q2.y + (2.0 / 3.0) * (q1.y - q2.y),
+                    )
+                    .transform(&ctm_post);
+                    let end = q2.transform(&ctm_post);
+                    if ![c1.x, c1.y, c2.x, c2.y, end.x, end.y]
+                        .iter()
+                        .all(|v| v.is_finite())
+                    {
+                        return AnisotropicStroke::Fallback;
+                    }
+                    out.curve_to(c1, c2, end);
+                    last = q2;
+                }
+                tiny_skia_path::PathSegment::CubicTo(p1, p2, p3) => {
+                    let c1 = Point::new(p1.x as f64, p1.y as f64).transform(&ctm_post);
+                    let c2 = Point::new(p2.x as f64, p2.y as f64).transform(&ctm_post);
+                    let end_local = Point::new(p3.x as f64, p3.y as f64);
+                    let end = end_local.transform(&ctm_post);
+                    if ![c1.x, c1.y, c2.x, c2.y, end.x, end.y]
+                        .iter()
+                        .all(|v| v.is_finite())
+                    {
+                        return AnisotropicStroke::Fallback;
+                    }
+                    out.curve_to(c1, c2, end);
+                    last = end_local;
+                }
+                tiny_skia_path::PathSegment::Close => out.close(),
+            }
+        }
+        if out.is_empty() {
+            AnisotropicStroke::Empty
+        } else {
+            AnisotropicStroke::Outline(out)
+        }
+    }
+
+    /// Emit a pre-expanded anisotropic stroke outline using the active stroke
+    /// paint, opacity, overprint, and colour space.
+    fn emit_stroke_as_filled_outline(&mut self, outline: Path) {
+        if cs_produces_no_marks(&self.current.stroke_cs) {
+            return;
+        }
+        if let Some(pat) = self.current.stroke_pattern.clone() {
+            match pat {
+                PatternPaint::Tiling { def, base_ctm } => {
+                    if self.oc_suppressed() {
+                        self.type3_oc_suppressed_mark = true;
+                        return;
+                    }
+                    if let Some(tiling) =
+                        self.build_tiling_pattern_paint(&def, base_ctm, self.current.stroke_color)
+                    {
+                        let cmd = RenderCommand::FillPath {
+                            path: outline,
+                            rule: FillRule::NonZero,
+                            paint: Paint::Tiling(tiling),
+                            alpha: self.current.stroke_alpha,
+                            overprint: None,
+                        };
+                        self.emit_painted(cmd);
+                        return;
+                    }
+                }
+                PatternPaint::Shading(def) => {
+                    if let Some(bounds) = Self::path_bounds(&outline) {
+                        self.display_list.push(RenderCommand::PushClip {
+                            path: outline,
+                            rule: FillRule::NonZero,
+                        });
+                        self.emit_shading_image(&def, bounds);
+                        self.display_list.push(RenderCommand::PopClip);
+                        return;
+                    }
+                }
+            }
+        }
+        let paint = if self.type3_glyph && !self.current.stroke_color_explicit {
+            Paint::Inherited
+        } else {
+            Paint::Solid(self.current.stroke_color)
+        };
+        let cmd = RenderCommand::FillPath {
+            path: outline,
+            rule: FillRule::NonZero,
+            paint,
+            alpha: self.current.stroke_alpha,
+            overprint: self
+                .overprint_descriptor(self.current.stroke_overprint, self.current.stroke_colorant),
+        };
+        self.emit_painted(cmd);
     }
 
     /// Stroke a page-space path. A stroke pattern (tiling or shading) is clipped
@@ -9510,6 +9880,19 @@ impl<'a> ContentInterpreter<'a> {
             if let Some((path, _)) = outline {
                 if fill {
                     self.fill_page_path(path.clone(), FillRule::NonZero);
+                }
+                if self.should_expand_anisotropic_stroke() {
+                    if let Some(inv_ctm) = self.current.ctm.inverse() {
+                        let user_path = path.map_points(|p| p.transform(&inv_ctm));
+                        match self.expand_anisotropic_stroke(&user_path) {
+                            AnisotropicStroke::Outline(stroked) => {
+                                self.emit_stroke_as_filled_outline(stroked);
+                                continue;
+                            }
+                            AnisotropicStroke::Empty => continue,
+                            AnisotropicStroke::Fallback => {}
+                        }
+                    }
                 }
                 self.stroke_page_path(path);
             } else if fill {
@@ -14297,5 +14680,183 @@ mod tests {
                 "recovered /Resources source must stay within budget"
             );
         }
+    }
+
+    #[test]
+    fn type3_d1_anisotropic_stroke_with_tiling_pattern_preserves_axis_widths() {
+        // Real PDF with a Type 3 `d1` CharProc stroking a vertical segment
+        // (x=4, y=2..38) and horizontal segment (x=12..22, y=20) with `2 w`
+        // under a 4×1 nonuniform text transform (`400 Tz` or `4 0 0 1 8 8 Tm`),
+        // painted with a tiling pattern. Vertical stroke must span 8 pt wide
+        // (x=20..28) and horizontal stroke 2 pt tall (y=27..29), NOT 5×5.
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        let run_pdf = |page_stream: &[u8], charproc: &[u8]| -> DisplayList {
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 110 56] /Contents 4 0 R \
+                  /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 9 0 R >> >> >>"
+                    .to_vec(),
+                stream("", page_stream),
+                b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 30 40] \
+                  /FontMatrix [1 0 0 1 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+                  /FirstChar 65 /LastChar 65 /Widths [30] /Resources << >> >>"
+                    .to_vec(),
+                b"<< /A 8 0 R >>".to_vec(),
+                b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(),
+                stream("", charproc),
+                stream(
+                    "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                     /BBox [0 0 8 8] /XStep 8 /YStep 8 /Resources << >>",
+                    b"1 0 0 rg 0 0 4 8 re f 0 0 1 rg 4 0 4 8 re f",
+                ),
+            ]);
+            let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+            let page = doc.page(0).expect("page 0");
+            let mut fonts = doc.load_page_fonts(&page);
+            let mut images = ImageCache::new();
+            let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+            let (dl, _) = ContentInterpreter::new(page.effective_box())
+                .with_document(doc.file(), &page.resources)
+                .with_fonts(&mut fonts)
+                .with_images(&mut images)
+                .interpret_with_stats(&content);
+            dl
+        };
+
+        // 1) Patterned `d1` CharProc under `400 Tz` AND under `4 0 0 1 8 8 Tm`.
+        let charproc = b"30 0 0 0 30 40 d1 2 w 4 2 m 4 38 l S 12 20 m 22 20 l S";
+        for page_stream in [
+            &b"/Pattern cs /P1 scn BT /F1 1 Tf 400 Tz 8 8 Td (A) Tj ET"[..],
+            &b"/Pattern cs /P1 scn BT /F1 1 Tf 4 0 0 1 8 8 Tm (A) Tj ET"[..],
+        ] {
+            let dl = run_pdf(page_stream, charproc);
+            let tiling_fills: Vec<Rect> = dl
+                .commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    RenderCommand::FillPath {
+                        path,
+                        paint: Paint::Tiling(_),
+                        ..
+                    } => ContentInterpreter::path_bounds(path),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                tiling_fills.len(),
+                2,
+                "anisotropic 4x1 Type 3 strokes must emit 2 tiling FillPath outlines"
+            );
+            // Vertical stroke at x=24, y=10..46 -> width=8, height=36.
+            let v = tiling_fills[0];
+            assert!(
+                (v.width() - 8.0).abs() < 0.05 && (v.height() - 36.0).abs() < 0.05,
+                "vertical stroke must be 8x36 pt, got {v:?}"
+            );
+            // Horizontal stroke at x=56..96, y=28 -> width=40, height=2.
+            let h = tiling_fills[1];
+            assert!(
+                (h.width() - 40.0).abs() < 0.05 && (h.height() - 2.0).abs() < 0.05,
+                "horizontal stroke must be 40x2 pt, got {h:?}"
+            );
+        }
+
+        // 2) Isotropic 1×1 transform keeps native `StrokePath` (unchanged).
+        let iso_dl = run_pdf(
+            b"/Pattern cs /P1 scn BT /F1 1 Tf 8 8 Td (A) Tj ET",
+            charproc,
+        );
+        assert_eq!(
+            iso_dl
+                .commands
+                .iter()
+                .filter(|cmd| matches!(
+                    cmd,
+                    RenderCommand::StrokePath {
+                        paint: Paint::Tiling(_),
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "isotropic Type 3 strokes must stay RenderCommand::StrokePath"
+        );
+
+        // 3) Hairline (`0 w`) under 4×1 transform stays `StrokePath { width: 0.0 }`.
+        let hairline_dl = run_pdf(
+            b"/Pattern cs /P1 scn BT /F1 1 Tf 400 Tz 8 8 Td (A) Tj ET",
+            b"30 0 0 0 30 40 d1 0 w 4 2 m 4 38 l S",
+        );
+        assert!(
+            hairline_dl.commands.iter().any(|cmd| matches!(
+                cmd,
+                RenderCommand::StrokePath {
+                    style,
+                    paint: Paint::Tiling(_),
+                    ..
+                } if style.width == 0.0
+            )),
+            "0-width hairline under anisotropic CTM must remain StrokePath with width 0"
+        );
+
+        // 4) Dashed anisotropic stroke transforms dash lengths anisotropically
+        //    ([4 4] 0 d on a 12-unit horizontal segment under 4×1 -> 2 dashes of 16pt each,
+        //    total width 48pt with 16pt gap in the middle).
+        let dashed_dl = run_pdf(
+            b"/Pattern cs /P1 scn BT /F1 1 Tf 400 Tz 8 8 Td (A) Tj ET",
+            b"30 0 0 0 30 40 d1 2 w [4 4] 0 d 0 20 m 12 20 l S",
+        );
+        let dashed_path = dashed_dl
+            .commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                RenderCommand::FillPath {
+                    path,
+                    paint: Paint::Tiling(_),
+                    ..
+                } => Some(path),
+                _ => None,
+            })
+            .expect("dashed anisotropic stroke must expand to FillPath");
+        let subpath_count = dashed_path
+            .iter()
+            .filter(|e| matches!(e, PathElement::MoveTo(_)))
+            .count();
+        assert_eq!(
+            subpath_count, 2,
+            "12-unit segment with [4 4] dash must produce 2 separate dash contours"
+        );
     }
 }
