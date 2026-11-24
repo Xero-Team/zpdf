@@ -7286,36 +7286,372 @@ impl<'a> ContentInterpreter<'a> {
         (col_x_sq - col_y_sq).abs() > 1e-4 * ref_sq || dot.abs() > 1e-4 * ref_sq
     }
 
-    /// Stroke `user_path` in isotropic user space (normalized to page-point
-    /// magnitude by the CTM's largest singular value) and transform the
-    /// resulting outline into page space. Preserves exact directional widths,
-    /// elliptical caps/joins, and transformed dash lengths under nonuniform
-    /// scales and shears (e.g., 4×1 Type 3 text transforms or `cm`).
+    fn largest_singular_value(m: &Matrix) -> f64 {
+        let sum_sq = m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d;
+        let det = m.a * m.d - m.b * m.c;
+        let disc = (sum_sq * sum_sq - 4.0 * det * det).max(0.0).sqrt();
+        (0.5 * (sum_sq + disc)).sqrt()
+    }
+
+    fn split_cubic_half(p0: Point, c1: Point, c2: Point, p3: Point) -> ([Point; 4], [Point; 4]) {
+        let mid = |a: Point, b: Point| Point::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y));
+        let m01 = mid(p0, c1);
+        let m12 = mid(c1, c2);
+        let m23 = mid(c2, p3);
+        let m012 = mid(m01, m12);
+        let m123 = mid(m12, m23);
+        let m0123 = mid(m012, m123);
+        ([p0, m01, m012, m0123], [m0123, m123, m23, p3])
+    }
+
+    fn cubic_gl5_length(p0: Point, c1: Point, c2: Point, p3: Point) -> f64 {
+        const NODES: [f64; 5] = [
+            0.046_910_077_030_668,
+            0.230_765_344_947_158_45,
+            0.5,
+            0.769_234_655_052_841_5,
+            0.953_089_922_969_332,
+        ];
+        const WEIGHTS: [f64; 5] = [
+            0.118_463_442_528_094_54,
+            0.239_314_335_249_683_24,
+            0.284_444_444_444_444_44,
+            0.239_314_335_249_683_24,
+            0.118_463_442_528_094_54,
+        ];
+        let ax = c1.x - p0.x;
+        let ay = c1.y - p0.y;
+        let bx = c2.x - c1.x;
+        let by = c2.y - c1.y;
+        let cx = p3.x - c2.x;
+        let cy = p3.y - c2.y;
+        let mut sum = 0.0;
+        for (&t, &w) in NODES.iter().zip(WEIGHTS.iter()) {
+            let u = 1.0 - t;
+            let dx = 3.0 * (u * u * ax + 2.0 * u * t * bx + t * t * cx);
+            let dy = 3.0 * (u * u * ay + 2.0 * u * t * by + t * t * cy);
+            sum += w * dx.hypot(dy);
+        }
+        sum
+    }
+
+    fn cubic_arc_length(p0: Point, c1: Point, c2: Point, p3: Point, tol: f64) -> Option<f64> {
+        let poly = (c1.x - p0.x).hypot(c1.y - p0.y)
+            + (c2.x - c1.x).hypot(c2.y - c1.y)
+            + (p3.x - c2.x).hypot(p3.y - c2.y);
+        if !poly.is_finite() {
+            return None;
+        }
+        if poly == 0.0 {
+            return Some(0.0);
+        }
+        let mut stack: Vec<(Point, Point, Point, Point, f64, u8)> =
+            vec![(p0, c1, c2, p3, Self::cubic_gl5_length(p0, c1, c2, p3), 0)];
+        let mut total = 0.0f64;
+        let mut splits_left = 1024usize;
+        while let Some((a, b, c, d, whole, depth)) = stack.pop() {
+            if !whole.is_finite() {
+                return None;
+            }
+            if depth >= 12 || splits_left == 0 {
+                total += whole;
+                continue;
+            }
+            let (left, right) = Self::split_cubic_half(a, b, c, d);
+            let l_len = Self::cubic_gl5_length(left[0], left[1], left[2], left[3]);
+            let r_len = Self::cubic_gl5_length(right[0], right[1], right[2], right[3]);
+            let approx = l_len + r_len;
+            if !approx.is_finite() {
+                return None;
+            }
+            if (approx - whole).abs() <= tol.max(approx * 1e-9) {
+                total += approx;
+            } else {
+                splits_left -= 1;
+                stack.push((right[0], right[1], right[2], right[3], r_len, depth + 1));
+                stack.push((left[0], left[1], left[2], left[3], l_len, depth + 1));
+            }
+        }
+        total.is_finite().then_some(total)
+    }
+
+    fn push_skia_segment(pb: &mut tiny_skia_path::PathBuilder, seg: tiny_skia_path::PathSegment) {
+        match seg {
+            tiny_skia_path::PathSegment::MoveTo(p) => pb.move_to(p.x, p.y),
+            tiny_skia_path::PathSegment::LineTo(p) => pb.line_to(p.x, p.y),
+            tiny_skia_path::PathSegment::QuadTo(p1, p2) => pb.quad_to(p1.x, p1.y, p2.x, p2.y),
+            tiny_skia_path::PathSegment::CubicTo(p1, p2, p3) => {
+                pb.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y)
+            }
+            tiny_skia_path::PathSegment::Close => pb.close(),
+        }
+    }
+
+    /// When a partially clipped closed contour has both its trailing dashed
+    /// contour (`dashed_last`) ending at the closing corner `(0, 0)` and its
+    /// initial dashed contour (`dashed_first`) starting at `(0, 0)`, merge
+    /// those two contours into one continuous contour passing through `(0, 0)`
+    /// so stroking produces a proper join instead of two end caps.
+    fn join_dashed_closing_contours(
+        dashed_last: &tiny_skia_path::Path,
+        dashed_first: &tiny_skia_path::Path,
+    ) -> Option<tiny_skia_path::Path> {
+        let split_contours = |path: &tiny_skia_path::Path| {
+            let mut contours: Vec<Vec<tiny_skia_path::PathSegment>> = Vec::new();
+            for seg in path.segments() {
+                match seg {
+                    tiny_skia_path::PathSegment::MoveTo(_) => contours.push(vec![seg]),
+                    _ => {
+                        if let Some(cur) = contours.last_mut() {
+                            cur.push(seg);
+                        }
+                    }
+                }
+            }
+            contours
+        };
+        let last_contours = split_contours(dashed_last);
+        let first_contours = split_contours(dashed_first);
+        let last_c = last_contours.last()?;
+        let first_c = first_contours.first()?;
+        let (ex, ey) = match last_c.last()? {
+            tiny_skia_path::PathSegment::LineTo(p) => (p.x, p.y),
+            tiny_skia_path::PathSegment::QuadTo(_, p) => (p.x, p.y),
+            tiny_skia_path::PathSegment::CubicTo(_, _, p) => (p.x, p.y),
+            tiny_skia_path::PathSegment::MoveTo(_) | tiny_skia_path::PathSegment::Close => {
+                return None;
+            }
+        };
+        let (sx, sy) = match first_c.first()? {
+            tiny_skia_path::PathSegment::MoveTo(p) if first_c.len() >= 2 => (p.x, p.y),
+            _ => return None,
+        };
+        if matches!(first_c.last(), Some(tiny_skia_path::PathSegment::Close)) {
+            return None;
+        }
+        if ex.hypot(ey) > 1e-2 || sx.hypot(sy) > 1e-2 {
+            return None;
+        }
+
+        let mut pb = tiny_skia_path::PathBuilder::new();
+        for c in &last_contours[..last_contours.len() - 1] {
+            for &seg in c {
+                Self::push_skia_segment(&mut pb, seg);
+            }
+        }
+        for &seg in last_c {
+            Self::push_skia_segment(&mut pb, seg);
+        }
+        for &seg in &first_c[1..] {
+            Self::push_skia_segment(&mut pb, seg);
+        }
+        for c in &first_contours[1..] {
+            for &seg in c {
+                Self::push_skia_segment(&mut pb, seg);
+            }
+        }
+        pb.finish()
+    }
+
+    /// Stroke `user_path` in isotropic user space (normalized to final
+    /// page-point magnitude by the largest singular value of
+    /// `shading_space_to_page * ctm`) and transform the resulting outline into
+    /// current display-list space (page space, or cell space inside a tiling
+    /// pattern). Preserves exact directional widths, elliptical caps/joins, and
+    /// transformed dash lengths under nonuniform scales and shears, including
+    /// fine dashes inside magnified pattern tiles and mixed compound/curved
+    /// paths with off-page geometry.
     fn expand_anisotropic_stroke(&self, user_path: &Path) -> AnisotropicStroke {
         const RES_SCALE: f32 = 4.0;
         const MAX_NORM_COORD: f32 = 1e7;
         const MAX_DASH_REPEATS: f64 = 100_000.0;
 
+        #[derive(Clone, Copy)]
+        enum UserPathSeg {
+            Line(Point),
+            Cubic(Point, Point, Point),
+        }
+        struct UserSubpath {
+            start: Point,
+            segments: Vec<UserPathSeg>,
+            closed: bool,
+        }
+        struct ClippedRun {
+            start: Point,
+            segments: Vec<UserPathSeg>,
+            start_phase_user: f64,
+            starts_at_subpath_start: bool,
+            ends_at_subpath_start: bool,
+            closed: bool,
+        }
+        enum VisUserBounds {
+            Uncomputed,
+            Empty,
+            Singular,
+            Rect(Rect),
+        }
+
         let ctm = &self.current.ctm;
-        let sum_sq = ctm.a * ctm.a + ctm.b * ctm.b + ctm.c * ctm.c + ctm.d * ctm.d;
-        let det = ctm.a * ctm.d - ctm.b * ctm.c;
-        let disc = (sum_sq * sum_sq - 4.0 * det * det).max(0.0).sqrt();
-        let max_scale = (0.5 * (sum_sq + disc)).sqrt();
-        if !max_scale.is_finite() || max_scale <= 1e-12 {
+        let ctm_max_scale = Self::largest_singular_value(ctm);
+        if !ctm_max_scale.is_finite() || ctm_max_scale <= 1e-12 {
             return AnisotropicStroke::Fallback;
         }
-
-        let Some(&origin) = user_path.points().first() else {
-            return AnisotropicStroke::Empty;
+        let user_to_page = self.shading_space_to_page.concat(ctm);
+        let page_max_scale = Self::largest_singular_value(&user_to_page);
+        let dl_to_page_scale = Self::largest_singular_value(&self.shading_space_to_page);
+        let mut norm_scale = if page_max_scale.is_finite() && page_max_scale > 1e-12 {
+            page_max_scale
+        } else {
+            ctm_max_scale
         };
-        if !origin.x.is_finite() || !origin.y.is_finite() {
-            return AnisotropicStroke::Fallback;
+
+        // Split into independent PDF subpaths (ISO 32000-1 §8.4.3.6: each
+        // subpath is stroked and dashed independently from its own start).
+        let mut subpaths: Vec<UserSubpath> = Vec::new();
+        let mut cur_sp: Option<UserSubpath> = None;
+        let mut after_close_start: Option<Point> = None;
+        for elem in user_path {
+            match elem {
+                PathElement::MoveTo(p) => {
+                    if !p.x.is_finite() || !p.y.is_finite() {
+                        return AnisotropicStroke::Fallback;
+                    }
+                    if let Some(sp) = cur_sp.take() {
+                        if !sp.segments.is_empty() || sp.closed {
+                            subpaths.push(sp);
+                        }
+                    }
+                    cur_sp = Some(UserSubpath {
+                        start: p,
+                        segments: Vec::new(),
+                        closed: false,
+                    });
+                    after_close_start = None;
+                }
+                PathElement::LineTo(p) => {
+                    if !p.x.is_finite() || !p.y.is_finite() {
+                        return AnisotropicStroke::Fallback;
+                    }
+                    if cur_sp.is_none() {
+                        if let Some(s) = after_close_start.take() {
+                            cur_sp = Some(UserSubpath {
+                                start: s,
+                                segments: Vec::new(),
+                                closed: false,
+                            });
+                        }
+                    }
+                    if let Some(ref mut sp) = cur_sp {
+                        sp.segments.push(UserPathSeg::Line(p));
+                    }
+                }
+                PathElement::CurveTo(c1, c2, end) => {
+                    if ![c1.x, c1.y, c2.x, c2.y, end.x, end.y]
+                        .iter()
+                        .all(|v| v.is_finite())
+                    {
+                        return AnisotropicStroke::Fallback;
+                    }
+                    if cur_sp.is_none() {
+                        if let Some(s) = after_close_start.take() {
+                            cur_sp = Some(UserSubpath {
+                                start: s,
+                                segments: Vec::new(),
+                                closed: false,
+                            });
+                        }
+                    }
+                    if let Some(ref mut sp) = cur_sp {
+                        sp.segments.push(UserPathSeg::Cubic(c1, c2, end));
+                    }
+                }
+                PathElement::Close => {
+                    if let Some(mut sp) = cur_sp.take() {
+                        sp.closed = true;
+                        after_close_start = Some(sp.start);
+                        subpaths.push(sp);
+                    }
+                }
+            }
+        }
+        if let Some(sp) = cur_sp.take() {
+            if !sp.segments.is_empty() || sp.closed {
+                subpaths.push(sp);
+            }
+        }
+        if subpaths.is_empty() {
+            return AnisotropicStroke::Empty;
         }
 
-        let width_norm = (self.current.line_width as f64 * max_scale) as f32;
+        let dash_user = self
+            .current
+            .dash
+            .as_ref()
+            .filter(|d| {
+                !d.array.is_empty()
+                    && d.phase.is_finite()
+                    && d.array.iter().all(|v| v.is_finite() && *v >= 0.0)
+                    && d.array.iter().any(|&v| v > 0.0)
+            })
+            .map(|d| {
+                let mut user_array: Vec<f64> = d.array.iter().map(|&v| v as f64).collect();
+                if user_array.len() % 2 == 1 {
+                    let len = user_array.len();
+                    user_array.reserve(len);
+                    for i in 0..len {
+                        user_array.push(user_array[i]);
+                    }
+                }
+                let period_user: f64 = user_array.iter().sum();
+                let phase_user = if period_user.is_finite() && period_user > 0.0 {
+                    (d.phase as f64).rem_euclid(period_user)
+                } else {
+                    0.0
+                };
+                (user_array, period_user, phase_user)
+            });
+
+        // If a positive dash pattern is still sub-millipoint even after
+        // accounting for the final page scale, lift `norm_scale` so tiny-skia
+        // preserves the gaps instead of collapsing them to a solid stroke.
+        if let Some((_, period_user, _)) = dash_user {
+            if period_user.is_finite() && period_user > 0.0 && period_user * norm_scale < 1e-2 {
+                let max_for_width =
+                    (MAX_NORM_COORD as f64) / (self.current.line_width as f64).max(1e-12);
+                let boosted = (1.0 / period_user).min(max_for_width);
+                if boosted.is_finite() && boosted > norm_scale {
+                    norm_scale = boosted;
+                }
+            }
+        }
+
+        let width_norm = (self.current.line_width as f64 * norm_scale) as f32;
         if !width_norm.is_finite() || width_norm <= 0.0 || width_norm > MAX_NORM_COORD {
             return AnisotropicStroke::Fallback;
         }
+
+        let dash_spec = match dash_user {
+            Some((user_array, period_user, phase_user)) => {
+                if !period_user.is_finite() || period_user <= 0.0 {
+                    return AnisotropicStroke::Fallback;
+                }
+                let norm_array: Vec<f32> = user_array
+                    .iter()
+                    .map(|&v| (v * norm_scale) as f32)
+                    .collect();
+                let period_norm: f64 = norm_array.iter().map(|&v| v as f64).sum();
+                if !period_norm.is_finite()
+                    || period_norm <= 1e-4
+                    || !norm_array.iter().all(|v| v.is_finite())
+                {
+                    // Never silently drop a positive dash pattern into a solid
+                    // stroke; preserve the dash array on deferred StrokePath.
+                    return AnisotropicStroke::Fallback;
+                }
+                Some((norm_array, period_norm, period_user, phase_user))
+            }
+            None => None,
+        };
 
         let skia_stroke = tiny_skia_path::Stroke {
             width: width_norm,
@@ -7338,43 +7674,23 @@ impl<'a> ContentInterpreter<'a> {
             dash: None,
         };
 
-        let dash_spec = self
-            .current
-            .dash
-            .as_ref()
-            .filter(|d| {
-                !d.array.is_empty()
-                    && d.phase.is_finite()
-                    && d.array.iter().all(|v| v.is_finite() && *v >= 0.0)
-                    && d.array.iter().any(|&v| v > 0.0)
-            })
-            .map(|d| {
-                let mut user_array: Vec<f64> = d.array.iter().map(|&v| v as f64).collect();
-                if user_array.len() % 2 == 1 {
-                    let len = user_array.len();
-                    user_array.reserve(len);
-                    for i in 0..len {
-                        user_array.push(user_array[i]);
-                    }
-                }
-                let period_user: f64 = user_array.iter().sum();
-                let norm_array: Vec<f32> =
-                    user_array.iter().map(|&v| (v * max_scale) as f32).collect();
-                let period_norm: f64 = norm_array.iter().map(|&v| v as f64).sum();
-                let phase_user = if period_user.is_finite() && period_user > 0.0 {
-                    (d.phase as f64).rem_euclid(period_user)
-                } else {
-                    0.0
-                };
-                (norm_array, period_norm, period_user, phase_user)
-            });
-
-        let to_norm = |p: Point| -> Option<(f32, f32)> {
-            if !p.x.is_finite() || !p.y.is_finite() {
-                return None;
-            }
-            let nx = ((p.x - origin.x) * max_scale) as f32;
-            let ny = ((p.y - origin.y) * max_scale) as f32;
+        let inv_norm = 1.0 / norm_scale;
+        if !inv_norm.is_finite() {
+            return AnisotropicStroke::Fallback;
+        }
+        let make_ctm_post = |origin: Point| -> Matrix {
+            Matrix::new(
+                ctm.a * inv_norm,
+                ctm.b * inv_norm,
+                ctm.c * inv_norm,
+                ctm.d * inv_norm,
+                ctm.a * origin.x + ctm.c * origin.y + ctm.e,
+                ctm.b * origin.x + ctm.d * origin.y + ctm.f,
+            )
+        };
+        let to_norm = |p: Point, origin: Point| -> Option<(f32, f32)> {
+            let nx = ((p.x - origin.x) * norm_scale) as f32;
+            let ny = ((p.y - origin.y) * norm_scale) as f32;
             if !nx.is_finite()
                 || !ny.is_finite()
                 || nx.abs() > MAX_NORM_COORD
@@ -7384,134 +7700,566 @@ impl<'a> ContentInterpreter<'a> {
             }
             Some((nx, ny))
         };
-
-        let mut pb = tiny_skia_path::PathBuilder::new();
-        let mut total_len = 0.0f64;
-        let mut exceeded_norm_coord = false;
-        let mut cur: Option<(f32, f32)> = None;
-        let mut sub_start: Option<(f32, f32)> = None;
-        for elem in user_path {
-            match elem {
-                PathElement::MoveTo(p) => {
-                    let Some((nx, ny)) = to_norm(p) else {
-                        exceeded_norm_coord = true;
-                        break;
-                    };
-                    pb.move_to(nx, ny);
-                    cur = Some((nx, ny));
-                    sub_start = Some((nx, ny));
-                }
-                PathElement::LineTo(p) => {
-                    let Some((nx, ny)) = to_norm(p) else {
-                        exceeded_norm_coord = true;
-                        break;
-                    };
-                    if let Some((cx, cy)) = cur {
-                        total_len += ((nx - cx) as f64).hypot((ny - cy) as f64);
+        let build_skia_path = |origin: Point,
+                               start: Point,
+                               segs: &[UserPathSeg],
+                               closed: bool|
+         -> Result<Option<tiny_skia_path::Path>, ()> {
+            let Some((sx, sy)) = to_norm(start, origin) else {
+                return Err(());
+            };
+            let mut pb = tiny_skia_path::PathBuilder::new();
+            pb.move_to(sx, sy);
+            for &seg in segs {
+                match seg {
+                    UserPathSeg::Line(p) => {
+                        let Some((nx, ny)) = to_norm(p, origin) else {
+                            return Err(());
+                        };
+                        pb.line_to(nx, ny);
                     }
-                    pb.line_to(nx, ny);
-                    cur = Some((nx, ny));
-                }
-                PathElement::CurveTo(c1, c2, end) => {
-                    let (Some((x1, y1)), Some((x2, y2)), Some((xe, ye))) =
-                        (to_norm(c1), to_norm(c2), to_norm(end))
-                    else {
-                        exceeded_norm_coord = true;
-                        break;
-                    };
-                    if let Some((cx, cy)) = cur {
-                        total_len += ((x1 - cx) as f64).hypot((y1 - cy) as f64)
-                            + ((x2 - x1) as f64).hypot((y2 - y1) as f64)
-                            + ((xe - x2) as f64).hypot((ye - y2) as f64);
+                    UserPathSeg::Cubic(c1, c2, end) => {
+                        let (Some((x1, y1)), Some((x2, y2)), Some((xe, ye))) = (
+                            to_norm(c1, origin),
+                            to_norm(c2, origin),
+                            to_norm(end, origin),
+                        ) else {
+                            return Err(());
+                        };
+                        pb.cubic_to(x1, y1, x2, y2, xe, ye);
                     }
-                    pb.cubic_to(x1, y1, x2, y2, xe, ye);
-                    cur = Some((xe, ye));
-                }
-                PathElement::Close => {
-                    if let (Some((cx, cy)), Some((sx, sy))) = (cur, sub_start) {
-                        total_len += ((sx - cx) as f64).hypot((sy - cy) as f64);
-                        cur = Some((sx, sy));
-                    }
-                    pb.close();
                 }
             }
-        }
-
-        if let Some((ref array, period_norm, period_user, phase_user)) = dash_spec {
-            let valid_macro_dash = period_norm.is_finite()
-                && period_norm > 1e-4
-                && period_user.is_finite()
-                && period_user > 0.0
-                && array.iter().all(|v| v.is_finite());
-            if valid_macro_dash
-                && (exceeded_norm_coord || total_len / period_norm > MAX_DASH_REPEATS)
-            {
-                // Limit expansion to the visible clipped span while advancing
-                // dash phase across skipped off-page prefixes (never silently
-                // turning a long clipped dashed line solid).
-                return self.expand_clipped_anisotropic_dashed_stroke(
-                    user_path,
-                    max_scale,
-                    &skia_stroke,
-                    array,
-                    period_norm,
-                    period_user,
-                    phase_user,
-                    RES_SCALE,
-                    MAX_NORM_COORD,
-                    MAX_DASH_REPEATS,
-                );
+            if closed {
+                pb.close();
             }
-        }
-
-        if exceeded_norm_coord {
-            return AnisotropicStroke::Fallback;
-        }
-        let Some(norm_path) = pb.finish() else {
-            return AnisotropicStroke::Empty;
+            Ok(pb.finish())
+        };
+        let make_skia_dash = |phase_user: f64| -> Option<tiny_skia_path::StrokeDash> {
+            let (ref norm_array, period_norm, _, _) = dash_spec.as_ref()?;
+            let mut phase = (phase_user * norm_scale).rem_euclid(*period_norm) as f32;
+            if !phase.is_finite() || phase >= *period_norm as f32 {
+                phase = 0.0;
+            }
+            tiny_skia_path::StrokeDash::new(norm_array.clone(), phase)
+        };
+        let stroke_into = |path: &tiny_skia_path::Path, origin: Point, out: &mut Path| -> bool {
+            let Some(stroked) = path.stroke(&skia_stroke, RES_SCALE) else {
+                return true;
+            };
+            let ctm_post = make_ctm_post(origin);
+            Self::append_transformed_skia_path(&stroked, &ctm_post, out)
         };
 
-        let dashed_path;
-        let source = if let Some((array, period_norm, _, phase_user)) = dash_spec {
-            if period_norm.is_finite() && period_norm > 1e-4 && array.iter().all(|v| v.is_finite())
-            {
-                let mut phase = (phase_user * max_scale).rem_euclid(period_norm) as f32;
-                if !phase.is_finite() || phase >= period_norm as f32 {
-                    phase = 0.0;
-                }
-                if let Some(skia_dash) = tiny_skia_path::StrokeDash::new(array, phase) {
-                    let Some(dashed) = norm_path.dash(&skia_dash, RES_SCALE) else {
-                        return AnisotropicStroke::Empty;
+        let mut vis_user_cache = VisUserBounds::Uncomputed;
+        let compute_vis_user = |cache: &mut VisUserBounds| -> Option<Rect> {
+            if matches!(cache, VisUserBounds::Uncomputed) {
+                *cache = 'compute: {
+                    let Some(inv_ctm) = ctm.inverse() else {
+                        break 'compute VisUserBounds::Singular;
                     };
-                    dashed_path = dashed;
-                    &dashed_path
-                } else {
-                    &norm_path
+                    let mut vis_dl = self.display_list.page_rect.normalize();
+                    if let Some(clip) = self.current.clip_bounds {
+                        let c = clip.normalize();
+                        let ix0 = vis_dl.x0.max(c.x0);
+                        let iy0 = vis_dl.y0.max(c.y0);
+                        let ix1 = vis_dl.x1.min(c.x1);
+                        let iy1 = vis_dl.y1.min(c.y1);
+                        if ix1 <= ix0 || iy1 <= iy0 {
+                            break 'compute VisUserBounds::Empty;
+                        }
+                        vis_dl = Rect::new(ix0, iy0, ix1, iy1);
+                    }
+                    let reach = match self.current.line_join {
+                        LineJoin::Miter => self.current.miter_limit.clamp(1.0, 100.0) as f64,
+                        _ => std::f64::consts::SQRT_2,
+                    };
+                    let width_dl = self.current.line_width as f64 * ctm_max_scale;
+                    let margin_dl = if dl_to_page_scale.is_finite() && dl_to_page_scale > 1e-12 {
+                        2.0 / dl_to_page_scale
+                    } else {
+                        2.0
+                    };
+                    let pad = width_dl * 0.5 * reach.max(std::f64::consts::SQRT_2) + margin_dl;
+                    let padded = Rect::new(
+                        vis_dl.x0 - pad,
+                        vis_dl.y0 - pad,
+                        vis_dl.x1 + pad,
+                        vis_dl.y1 + pad,
+                    );
+                    let corners = [
+                        Point::new(padded.x0, padded.y0).transform(&inv_ctm),
+                        Point::new(padded.x1, padded.y0).transform(&inv_ctm),
+                        Point::new(padded.x0, padded.y1).transform(&inv_ctm),
+                        Point::new(padded.x1, padded.y1).transform(&inv_ctm),
+                    ];
+                    let (mut ux0, mut uy0) = (f64::INFINITY, f64::INFINITY);
+                    let (mut ux1, mut uy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                    for c in &corners {
+                        if !c.x.is_finite() || !c.y.is_finite() {
+                            break 'compute VisUserBounds::Singular;
+                        }
+                        ux0 = ux0.min(c.x);
+                        uy0 = uy0.min(c.y);
+                        ux1 = ux1.max(c.x);
+                        uy1 = uy1.max(c.y);
+                    }
+                    VisUserBounds::Rect(Rect::new(ux0, uy0, ux1, uy1))
+                };
+            }
+            match *cache {
+                VisUserBounds::Rect(r) => Some(r),
+                _ => None,
+            }
+        };
+
+        let mut out = Path::new();
+        let mut cumulative_dashes = 0.0f64;
+
+        for sp in &subpaths {
+            // Fast path: try building this subpath directly in its own local
+            // normalized coordinates without clipping.
+            let mut pb = tiny_skia_path::PathBuilder::new();
+            pb.move_to(0.0, 0.0);
+            let mut cur = sp.start;
+            let mut upper_len_user = 0.0f64;
+            let mut exceeded_norm = false;
+            for &seg in &sp.segments {
+                match seg {
+                    UserPathSeg::Line(p) => {
+                        let Some((nx, ny)) = to_norm(p, sp.start) else {
+                            exceeded_norm = true;
+                            break;
+                        };
+                        upper_len_user += (p.x - cur.x).hypot(p.y - cur.y);
+                        pb.line_to(nx, ny);
+                        cur = p;
+                    }
+                    UserPathSeg::Cubic(c1, c2, end) => {
+                        let (Some((x1, y1)), Some((x2, y2)), Some((xe, ye))) = (
+                            to_norm(c1, sp.start),
+                            to_norm(c2, sp.start),
+                            to_norm(end, sp.start),
+                        ) else {
+                            exceeded_norm = true;
+                            break;
+                        };
+                        upper_len_user += (c1.x - cur.x).hypot(c1.y - cur.y)
+                            + (c2.x - c1.x).hypot(c2.y - c1.y)
+                            + (end.x - c2.x).hypot(end.y - c2.y);
+                        pb.cubic_to(x1, y1, x2, y2, xe, ye);
+                        cur = end;
+                    }
+                }
+            }
+            if !exceeded_norm && sp.closed {
+                upper_len_user += (sp.start.x - cur.x).hypot(sp.start.y - cur.y);
+                pb.close();
+            }
+
+            let sp_dashes = dash_spec
+                .as_ref()
+                .map(|&(_, _, period_user, _)| upper_len_user / period_user)
+                .unwrap_or(0.0);
+            let fits_fast_path = !exceeded_norm
+                && upper_len_user.is_finite()
+                && (dash_spec.is_none()
+                    || (sp_dashes.is_finite()
+                        && cumulative_dashes + sp_dashes <= MAX_DASH_REPEATS));
+            let try_clip = !fits_fast_path || (dash_spec.is_some() && sp_dashes > 1024.0);
+
+            let vis_user_for_clip = if try_clip {
+                match compute_vis_user(&mut vis_user_cache) {
+                    Some(r) => Some(r),
+                    None if matches!(vis_user_cache, VisUserBounds::Empty) => continue,
+                    None if fits_fast_path => None,
+                    None => return AnisotropicStroke::Fallback,
                 }
             } else {
-                &norm_path
+                None
+            };
+
+            let Some(vis_user) = vis_user_for_clip else {
+                cumulative_dashes += sp_dashes;
+                let Some(norm_path) = pb.finish() else {
+                    continue;
+                };
+                if let Some((_, _, _, phase_user)) = dash_spec {
+                    let Some(skia_dash) = make_skia_dash(phase_user) else {
+                        return AnisotropicStroke::Fallback;
+                    };
+                    let Some(dashed) = norm_path.dash(&skia_dash, RES_SCALE) else {
+                        continue;
+                    };
+                    if !stroke_into(&dashed, sp.start, &mut out) {
+                        return AnisotropicStroke::Fallback;
+                    }
+                } else if !stroke_into(&norm_path, sp.start, &mut out) {
+                    return AnisotropicStroke::Fallback;
+                }
+                continue;
+            };
+
+            // Whole-subpath convex-hull culling: off-page lines or curves
+            // disjoint from `vis_user` contribute no visible pixels.
+            let (mut bx0, mut by0, mut bx1, mut by1) =
+                (sp.start.x, sp.start.y, sp.start.x, sp.start.y);
+            for &seg in &sp.segments {
+                match seg {
+                    UserPathSeg::Line(p) => {
+                        bx0 = bx0.min(p.x);
+                        by0 = by0.min(p.y);
+                        bx1 = bx1.max(p.x);
+                        by1 = by1.max(p.y);
+                    }
+                    UserPathSeg::Cubic(c1, c2, end) => {
+                        for p in [c1, c2, end] {
+                            bx0 = bx0.min(p.x);
+                            by0 = by0.min(p.y);
+                            bx1 = bx1.max(p.x);
+                            by1 = by1.max(p.y);
+                        }
+                    }
+                }
             }
-        } else {
-            &norm_path
-        };
+            if bx1 < vis_user.x0 || bx0 > vis_user.x1 || by1 < vis_user.y0 || by0 > vis_user.y1 {
+                continue;
+            }
 
-        let Some(stroked) = source.stroke(&skia_stroke, RES_SCALE) else {
-            return AnisotropicStroke::Empty;
-        };
+            let period_user = dash_spec.as_ref().map(|&(_, _, pu, _)| pu);
+            let initial_phase_user = dash_spec.as_ref().map(|&(_, _, _, ph)| ph).unwrap_or(0.0);
+            let phase_tol = period_user.map_or(1.0, |p| (p * 1e-4).max(1e-9));
 
-        let inv_norm = 1.0 / max_scale;
-        let ctm_post = Matrix::new(
-            ctm.a * inv_norm,
-            ctm.b * inv_norm,
-            ctm.c * inv_norm,
-            ctm.d * inv_norm,
-            ctm.a * origin.x + ctm.c * origin.y + ctm.e,
-            ctm.b * origin.x + ctm.d * origin.y + ctm.f,
-        );
-        let mut out = Path::new();
-        if !Self::append_transformed_skia_path(&stroked, &ctm_post, &mut out) {
-            return AnisotropicStroke::Fallback;
+            struct ClipCtx<'a> {
+                vis_user: Rect,
+                period_user: Option<f64>,
+                phase_tol: f64,
+                max_dash_repeats: f64,
+                phase: f64,
+                cumulative_dashes: &'a mut f64,
+                any_clipped: bool,
+                at_subpath_start: bool,
+                active_run: Option<ClippedRun>,
+                visible_runs: Vec<ClippedRun>,
+            }
+            impl<'a> ClipCtx<'a> {
+                fn push_line(&mut self, a: Point, b: Point) -> Result<(), ()> {
+                    let seg_len = (b.x - a.x).hypot(b.y - a.y);
+                    if !seg_len.is_finite() {
+                        return Err(());
+                    }
+                    if let Some((t0, t1)) =
+                        ContentInterpreter::clip_segment_to_rect(a, b, self.vis_user)
+                    {
+                        if t0 > 0.0 || t1 < 1.0 {
+                            self.any_clipped = true;
+                        }
+                        let p0 = Point::new(a.x + t0 * (b.x - a.x), a.y + t0 * (b.y - a.y));
+                        let p1 = Point::new(a.x + t1 * (b.x - a.x), a.y + t1 * (b.y - a.y));
+                        if let Some(pu) = self.period_user {
+                            let vis_dashes = ((t1 - t0) * seg_len) / pu;
+                            *self.cumulative_dashes += vis_dashes;
+                            if !self.cumulative_dashes.is_finite()
+                                || *self.cumulative_dashes > self.max_dash_repeats
+                            {
+                                return Err(());
+                            }
+                        }
+                        if t0 > 0.0 || self.active_run.is_none() {
+                            if let Some(prev) = self.active_run.take() {
+                                self.visible_runs.push(prev);
+                            }
+                            let start_phase = match self.period_user {
+                                Some(pu) => (self.phase + t0 * seg_len).rem_euclid(pu),
+                                None => 0.0,
+                            };
+                            self.active_run = Some(ClippedRun {
+                                start: p0,
+                                segments: vec![UserPathSeg::Line(p1)],
+                                start_phase_user: start_phase,
+                                starts_at_subpath_start: self.at_subpath_start && t0 == 0.0,
+                                ends_at_subpath_start: false,
+                                closed: false,
+                            });
+                        } else if let Some(ref mut run) = self.active_run {
+                            run.segments.push(UserPathSeg::Line(p1));
+                        }
+                        if t1 < 1.0 {
+                            if let Some(prev) = self.active_run.take() {
+                                self.visible_runs.push(prev);
+                            }
+                        }
+                    } else {
+                        self.any_clipped = true;
+                        if let Some(prev) = self.active_run.take() {
+                            self.visible_runs.push(prev);
+                        }
+                    }
+                    self.at_subpath_start = false;
+                    if let Some(pu) = self.period_user {
+                        self.phase = (self.phase + seg_len).rem_euclid(pu);
+                    }
+                    Ok(())
+                }
+
+                fn push_cubic(
+                    &mut self,
+                    p0: Point,
+                    c1: Point,
+                    c2: Point,
+                    p3: Point,
+                    depth: u8,
+                    nodes_left: &mut usize,
+                ) -> Result<(), ()> {
+                    let min_x = p0.x.min(c1.x).min(c2.x).min(p3.x);
+                    let max_x = p0.x.max(c1.x).max(c2.x).max(p3.x);
+                    let min_y = p0.y.min(c1.y).min(c2.y).min(p3.y);
+                    let max_y = p0.y.max(c1.y).max(c2.y).max(p3.y);
+                    if max_x < self.vis_user.x0
+                        || min_x > self.vis_user.x1
+                        || max_y < self.vis_user.y0
+                        || min_y > self.vis_user.y1
+                    {
+                        self.any_clipped = true;
+                        if let Some(prev) = self.active_run.take() {
+                            self.visible_runs.push(prev);
+                        }
+                        self.at_subpath_start = false;
+                        if let Some(pu) = self.period_user {
+                            let len = ContentInterpreter::cubic_arc_length(
+                                p0,
+                                c1,
+                                c2,
+                                p3,
+                                self.phase_tol,
+                            )
+                            .ok_or(())?;
+                            self.phase = (self.phase + len).rem_euclid(pu);
+                        }
+                        return Ok(());
+                    }
+                    if min_x >= self.vis_user.x0
+                        && max_x <= self.vis_user.x1
+                        && min_y >= self.vis_user.y0
+                        && max_y <= self.vis_user.y1
+                    {
+                        let len = if let Some(pu) = self.period_user {
+                            let l = ContentInterpreter::cubic_arc_length(
+                                p0,
+                                c1,
+                                c2,
+                                p3,
+                                self.phase_tol,
+                            )
+                            .ok_or(())?;
+                            *self.cumulative_dashes += l / pu;
+                            if !self.cumulative_dashes.is_finite()
+                                || *self.cumulative_dashes > self.max_dash_repeats
+                            {
+                                return Err(());
+                            }
+                            Some((l, pu))
+                        } else {
+                            None
+                        };
+                        if let Some(ref mut run) = self.active_run {
+                            run.segments.push(UserPathSeg::Cubic(c1, c2, p3));
+                        } else {
+                            self.active_run = Some(ClippedRun {
+                                start: p0,
+                                segments: vec![UserPathSeg::Cubic(c1, c2, p3)],
+                                start_phase_user: self.phase,
+                                starts_at_subpath_start: self.at_subpath_start,
+                                ends_at_subpath_start: false,
+                                closed: false,
+                            });
+                        }
+                        self.at_subpath_start = false;
+                        if let Some((l, pu)) = len {
+                            self.phase = (self.phase + l).rem_euclid(pu);
+                        }
+                        return Ok(());
+                    }
+                    if depth < 20 && *nodes_left > 0 {
+                        *nodes_left -= 1;
+                        let (left, right) = ContentInterpreter::split_cubic_half(p0, c1, c2, p3);
+                        self.push_cubic(left[0], left[1], left[2], left[3], depth + 1, nodes_left)?;
+                        self.push_cubic(
+                            right[0],
+                            right[1],
+                            right[2],
+                            right[3],
+                            depth + 1,
+                            nodes_left,
+                        )
+                    } else {
+                        self.push_line(p0, p3)
+                    }
+                }
+            }
+
+            let mut ctx = ClipCtx {
+                vis_user,
+                period_user,
+                phase_tol,
+                max_dash_repeats: MAX_DASH_REPEATS,
+                phase: initial_phase_user,
+                cumulative_dashes: &mut cumulative_dashes,
+                any_clipped: false,
+                at_subpath_start: true,
+                active_run: None,
+                visible_runs: Vec::new(),
+            };
+            let mut cur_pt = sp.start;
+            for &seg in &sp.segments {
+                match seg {
+                    UserPathSeg::Line(p) => {
+                        if ctx.push_line(cur_pt, p).is_err() {
+                            return AnisotropicStroke::Fallback;
+                        }
+                        cur_pt = p;
+                    }
+                    UserPathSeg::Cubic(c1, c2, end) => {
+                        let mut nodes_left = 2048usize;
+                        if ctx
+                            .push_cubic(cur_pt, c1, c2, end, 0, &mut nodes_left)
+                            .is_err()
+                        {
+                            return AnisotropicStroke::Fallback;
+                        }
+                        cur_pt = end;
+                    }
+                }
+            }
+            if sp.closed {
+                let needs_closing_seg = cur_pt.x != sp.start.x || cur_pt.y != sp.start.y;
+                if needs_closing_seg && ctx.push_line(cur_pt, sp.start).is_err() {
+                    return AnisotropicStroke::Fallback;
+                }
+                if !ctx.any_clipped && ctx.visible_runs.is_empty() {
+                    if let Some(ref mut run) = ctx.active_run {
+                        if needs_closing_seg {
+                            run.segments.pop();
+                        }
+                        run.closed = true;
+                    }
+                } else if let Some(ref mut run) = ctx.active_run {
+                    run.ends_at_subpath_start = true;
+                }
+            }
+            if let Some(run) = ctx.active_run.take() {
+                ctx.visible_runs.push(run);
+            }
+            let mut visible_runs = ctx.visible_runs;
+            if visible_runs.is_empty() {
+                continue;
+            }
+
+            // If a partially clipped closed contour both starts and ends
+            // unclipped at `sp.start`, preserve the closing corner join.
+            if sp.closed
+                && visible_runs.len() >= 2
+                && visible_runs[0].starts_at_subpath_start
+                && visible_runs.last().is_some_and(|r| r.ends_at_subpath_start)
+            {
+                let last_run = visible_runs.pop().unwrap();
+                let first_run = visible_runs.remove(0);
+                if dash_spec.is_some() {
+                    let Ok(last_path) =
+                        build_skia_path(sp.start, last_run.start, &last_run.segments, false)
+                    else {
+                        return AnisotropicStroke::Fallback;
+                    };
+                    let Ok(first_path) =
+                        build_skia_path(sp.start, first_run.start, &first_run.segments, false)
+                    else {
+                        return AnisotropicStroke::Fallback;
+                    };
+                    let dashed_last = match last_path {
+                        Some(p) => {
+                            let Some(d) = make_skia_dash(last_run.start_phase_user) else {
+                                return AnisotropicStroke::Fallback;
+                            };
+                            p.dash(&d, RES_SCALE)
+                        }
+                        None => None,
+                    };
+                    let dashed_first = match first_path {
+                        Some(p) => {
+                            let Some(d) = make_skia_dash(first_run.start_phase_user) else {
+                                return AnisotropicStroke::Fallback;
+                            };
+                            p.dash(&d, RES_SCALE)
+                        }
+                        None => None,
+                    };
+                    match (dashed_last, dashed_first) {
+                        (Some(dl), Some(df)) => {
+                            if let Some(joined) = Self::join_dashed_closing_contours(&dl, &df) {
+                                if !stroke_into(&joined, sp.start, &mut out) {
+                                    return AnisotropicStroke::Fallback;
+                                }
+                            } else {
+                                if !stroke_into(&dl, sp.start, &mut out)
+                                    || !stroke_into(&df, sp.start, &mut out)
+                                {
+                                    return AnisotropicStroke::Fallback;
+                                }
+                            }
+                        }
+                        (Some(dl), None) => {
+                            if !stroke_into(&dl, sp.start, &mut out) {
+                                return AnisotropicStroke::Fallback;
+                            }
+                        }
+                        (None, Some(df)) => {
+                            if !stroke_into(&df, sp.start, &mut out) {
+                                return AnisotropicStroke::Fallback;
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                } else {
+                    let mut merged_segs = last_run.segments;
+                    merged_segs.extend_from_slice(&first_run.segments);
+                    let Ok(merged_path) =
+                        build_skia_path(sp.start, last_run.start, &merged_segs, false)
+                    else {
+                        return AnisotropicStroke::Fallback;
+                    };
+                    if let Some(p) = merged_path {
+                        if !stroke_into(&p, sp.start, &mut out) {
+                            return AnisotropicStroke::Fallback;
+                        }
+                    }
+                }
+            }
+
+            for run in visible_runs {
+                let Ok(mini_path) =
+                    build_skia_path(run.start, run.start, &run.segments, run.closed)
+                else {
+                    return AnisotropicStroke::Fallback;
+                };
+                let Some(mini_path) = mini_path else {
+                    continue;
+                };
+                if dash_spec.is_some() {
+                    let Some(skia_dash) = make_skia_dash(run.start_phase_user) else {
+                        return AnisotropicStroke::Fallback;
+                    };
+                    let Some(dashed) = mini_path.dash(&skia_dash, RES_SCALE) else {
+                        continue;
+                    };
+                    if !stroke_into(&dashed, run.start, &mut out) {
+                        return AnisotropicStroke::Fallback;
+                    }
+                } else if !stroke_into(&mini_path, run.start, &mut out) {
+                    return AnisotropicStroke::Fallback;
+                }
+            }
         }
+
         if out.is_empty() {
             AnisotropicStroke::Empty
         } else {
@@ -7623,240 +8371,6 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         Some((t0, t1))
-    }
-
-    /// Expand a dashed anisotropic polyline clipped to the active page/clip
-    /// bounds while advancing the dash phase accurately across skipped off-page
-    /// prefixes. Falls back to deferred `StrokePath` (preserving the dash array
-    /// and phase) if the path contains curves or if even the visible span
-    /// exceeds the dash repeat limit.
-    #[allow(clippy::too_many_arguments)]
-    fn expand_clipped_anisotropic_dashed_stroke(
-        &self,
-        user_path: &Path,
-        max_scale: f64,
-        skia_stroke: &tiny_skia_path::Stroke,
-        norm_dash_array: &[f32],
-        period_norm: f64,
-        period_user: f64,
-        initial_phase_user: f64,
-        res_scale: f32,
-        max_norm_coord: f32,
-        max_dash_repeats: f64,
-    ) -> AnisotropicStroke {
-        let ctm = &self.current.ctm;
-        let Some(inv_ctm) = ctm.inverse() else {
-            return AnisotropicStroke::Fallback;
-        };
-        let mut vis_page = self.display_list.page_rect.normalize();
-        if let Some(clip) = self.current.clip_bounds {
-            let c = clip.normalize();
-            let ix0 = vis_page.x0.max(c.x0);
-            let iy0 = vis_page.y0.max(c.y0);
-            let ix1 = vis_page.x1.min(c.x1);
-            let iy1 = vis_page.y1.min(c.y1);
-            if ix1 <= ix0 || iy1 <= iy0 {
-                return AnisotropicStroke::Empty;
-            }
-            vis_page = Rect::new(ix0, iy0, ix1, iy1);
-        }
-        let reach = match self.current.line_join {
-            LineJoin::Miter => self.current.miter_limit.clamp(1.0, 100.0) as f64,
-            _ => std::f64::consts::SQRT_2,
-        };
-        let pad = (skia_stroke.width as f64 * 0.5 * reach.max(std::f64::consts::SQRT_2)) + 2.0;
-        let padded_page = Rect::new(
-            vis_page.x0 - pad,
-            vis_page.y0 - pad,
-            vis_page.x1 + pad,
-            vis_page.y1 + pad,
-        );
-        let corners = [
-            Point::new(padded_page.x0, padded_page.y0).transform(&inv_ctm),
-            Point::new(padded_page.x1, padded_page.y0).transform(&inv_ctm),
-            Point::new(padded_page.x0, padded_page.y1).transform(&inv_ctm),
-            Point::new(padded_page.x1, padded_page.y1).transform(&inv_ctm),
-        ];
-        let (mut ux0, mut uy0) = (f64::INFINITY, f64::INFINITY);
-        let (mut ux1, mut uy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for c in &corners {
-            if !c.x.is_finite() || !c.y.is_finite() {
-                return AnisotropicStroke::Fallback;
-            }
-            ux0 = ux0.min(c.x);
-            uy0 = uy0.min(c.y);
-            ux1 = ux1.max(c.x);
-            uy1 = uy1.max(c.y);
-        }
-        let vis_user = Rect::new(ux0, uy0, ux1, uy1);
-
-        let mut visible_runs: Vec<(Vec<Point>, f64)> = Vec::new();
-        let mut active_run: Option<(Vec<Point>, f64)> = None;
-        let mut cur: Option<Point> = None;
-        let mut sub_start: Option<Point> = None;
-        let mut cur_phase = initial_phase_user;
-        let mut total_vis_len = 0.0f64;
-
-        let push_segment = |a: Point,
-                            b: Point,
-                            phase: &mut f64,
-                            total_vis_len: &mut f64,
-                            active_run: &mut Option<(Vec<Point>, f64)>,
-                            visible_runs: &mut Vec<(Vec<Point>, f64)>|
-         -> Result<(), ()> {
-            if !a.x.is_finite() || !a.y.is_finite() || !b.x.is_finite() || !b.y.is_finite() {
-                return Err(());
-            }
-            let seg_len = (b.x - a.x).hypot(b.y - a.y);
-            if !seg_len.is_finite() {
-                return Err(());
-            }
-            if let Some((t0, t1)) = Self::clip_segment_to_rect(a, b, vis_user) {
-                let p0 = Point::new(a.x + t0 * (b.x - a.x), a.y + t0 * (b.y - a.y));
-                let p1 = Point::new(a.x + t1 * (b.x - a.x), a.y + t1 * (b.y - a.y));
-                *total_vis_len += (t1 - t0) * seg_len;
-                if !total_vis_len.is_finite() || *total_vis_len / period_user > max_dash_repeats {
-                    return Err(());
-                }
-                if t0 > 0.0 || active_run.is_none() {
-                    if let Some(prev) = active_run.take() {
-                        visible_runs.push(prev);
-                    }
-                    let start_phase = (*phase + t0 * seg_len).rem_euclid(period_user);
-                    *active_run = Some((vec![p0, p1], start_phase));
-                } else if let Some((ref mut pts, _)) = active_run {
-                    pts.push(p1);
-                }
-                if t1 < 1.0 {
-                    if let Some(prev) = active_run.take() {
-                        visible_runs.push(prev);
-                    }
-                }
-            } else if let Some(prev) = active_run.take() {
-                visible_runs.push(prev);
-            }
-            *phase = (*phase + seg_len).rem_euclid(period_user);
-            Ok(())
-        };
-
-        for elem in user_path {
-            match elem {
-                PathElement::MoveTo(p) => {
-                    if !p.x.is_finite() || !p.y.is_finite() {
-                        return AnisotropicStroke::Fallback;
-                    }
-                    if let Some(prev) = active_run.take() {
-                        visible_runs.push(prev);
-                    }
-                    cur = Some(p);
-                    sub_start = Some(p);
-                    cur_phase = initial_phase_user;
-                }
-                PathElement::LineTo(p) => {
-                    if let Some(prev) = cur {
-                        if push_segment(
-                            prev,
-                            p,
-                            &mut cur_phase,
-                            &mut total_vis_len,
-                            &mut active_run,
-                            &mut visible_runs,
-                        )
-                        .is_err()
-                        {
-                            return AnisotropicStroke::Fallback;
-                        }
-                    }
-                    cur = Some(p);
-                }
-                PathElement::CurveTo(_, _, _) => {
-                    // Preserve curves with their dash pattern on deferred StrokePath.
-                    return AnisotropicStroke::Fallback;
-                }
-                PathElement::Close => {
-                    if let (Some(prev), Some(start)) = (cur, sub_start) {
-                        if push_segment(
-                            prev,
-                            start,
-                            &mut cur_phase,
-                            &mut total_vis_len,
-                            &mut active_run,
-                            &mut visible_runs,
-                        )
-                        .is_err()
-                        {
-                            return AnisotropicStroke::Fallback;
-                        }
-                        cur = Some(start);
-                    }
-                    if let Some(prev) = active_run.take() {
-                        visible_runs.push(prev);
-                    }
-                }
-            }
-        }
-        if let Some(prev) = active_run.take() {
-            visible_runs.push(prev);
-        }
-        if visible_runs.is_empty() {
-            return AnisotropicStroke::Empty;
-        }
-
-        let inv_norm = 1.0 / max_scale;
-        let mut out = Path::new();
-        for (pts, run_phase_user) in visible_runs {
-            let Some(&run_origin) = pts.first() else {
-                continue;
-            };
-            let mut pb = tiny_skia_path::PathBuilder::new();
-            pb.move_to(0.0, 0.0);
-            for &p in &pts[1..] {
-                let nx = ((p.x - run_origin.x) * max_scale) as f32;
-                let ny = ((p.y - run_origin.y) * max_scale) as f32;
-                if !nx.is_finite()
-                    || !ny.is_finite()
-                    || nx.abs() > max_norm_coord
-                    || ny.abs() > max_norm_coord
-                {
-                    return AnisotropicStroke::Fallback;
-                }
-                pb.line_to(nx, ny);
-            }
-            let Some(mini_path) = pb.finish() else {
-                continue;
-            };
-            let mut run_phase = (run_phase_user * max_scale).rem_euclid(period_norm) as f32;
-            if !run_phase.is_finite() || run_phase >= period_norm as f32 {
-                run_phase = 0.0;
-            }
-            let Some(skia_dash) =
-                tiny_skia_path::StrokeDash::new(norm_dash_array.to_vec(), run_phase)
-            else {
-                return AnisotropicStroke::Fallback;
-            };
-            let Some(dashed) = mini_path.dash(&skia_dash, res_scale) else {
-                continue;
-            };
-            let Some(stroked) = dashed.stroke(skia_stroke, res_scale) else {
-                continue;
-            };
-            let ctm_post = Matrix::new(
-                ctm.a * inv_norm,
-                ctm.b * inv_norm,
-                ctm.c * inv_norm,
-                ctm.d * inv_norm,
-                ctm.a * run_origin.x + ctm.c * run_origin.y + ctm.e,
-                ctm.b * run_origin.x + ctm.d * run_origin.y + ctm.f,
-            );
-            if !Self::append_transformed_skia_path(&stroked, &ctm_post, &mut out) {
-                return AnisotropicStroke::Fallback;
-            }
-        }
-        if out.is_empty() {
-            AnisotropicStroke::Empty
-        } else {
-            AnisotropicStroke::Outline(out)
-        }
     }
 
     /// Emit a pre-expanded anisotropic stroke outline using the active stroke
@@ -15768,6 +16282,387 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&pself_0.commands, &pself_5.commands),
             "self-contained Form-local tile must still share cached cell DisplayList across translations"
+        );
+    }
+
+    #[test]
+    fn anisotropic_clipped_dashed_mixed_curve_and_closed_join_and_magnified_tile() {
+        let collect_contours = |path: &Path| -> Vec<Vec<Point>> {
+            let mut contours: Vec<Vec<Point>> = Vec::new();
+            for elem in path {
+                match elem {
+                    PathElement::MoveTo(p) => contours.push(vec![p]),
+                    PathElement::LineTo(p) => {
+                        if let Some(c) = contours.last_mut() {
+                            c.push(p);
+                        }
+                    }
+                    PathElement::CurveTo(c1, c2, end) => {
+                        if let Some(c) = contours.last_mut() {
+                            c.extend_from_slice(&[c1, c2, end]);
+                        }
+                    }
+                    PathElement::Close => {}
+                }
+            }
+            contours
+        };
+        let contour_bounds = |pts: &[Point]| -> (f64, f64, f64, f64) {
+            let (mut x0, mut y0, mut x1, mut y1) = (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            );
+            for p in pts {
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            (x0, y0, x1, y1)
+        };
+
+        // 1) Mixed compound path: 4x1 CTM, 2-unit pen, [5 5] 0 d, long off-page
+        //    horizontal line PLUS an off-page cubic subpath. Must NOT fall back
+        //    to StrokePath (which would turn 20pt x 2pt dashes into 12.5pt x 5pt).
+        let mixed_stream = b"q 4 0 0 1 0 0 cm 2 w [5 5] 0 d \
+                             -1000000 30 m 1000000 30 l \
+                             -1000000 -500 m -999990 -480 -999980 -480 -999970 -500 c S Q";
+        let (mixed_dl, _) = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 60.0))
+            .interpret_with_stats(mixed_stream);
+        assert!(
+            !mixed_dl
+                .commands
+                .iter()
+                .any(|c| matches!(c, RenderCommand::StrokePath { .. })),
+            "off-page cubic subpath must not force anisotropic dashed stroke to StrokePath fallback"
+        );
+        let mixed_path = mixed_dl
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath { path, .. } => Some(path),
+                _ => None,
+            })
+            .expect("mixed path must expand to FillPath");
+        let mixed_boxes: Vec<(f64, f64, f64, f64)> = collect_contours(mixed_path)
+            .iter()
+            .map(|c| contour_bounds(c))
+            .filter(|&(_, y0, _, y1)| y1 >= 0.0 && y0 <= 60.0)
+            .collect();
+        assert!(
+            mixed_boxes.len() >= 3,
+            "expected >= 3 visible horizontal dashes, got {mixed_boxes:?}"
+        );
+        for &(x0, y0, x1, y1) in &mixed_boxes {
+            let w = x1 - x0;
+            let h = y1 - y0;
+            assert!(
+                (h - 2.0).abs() < 0.05,
+                "4x1 horizontal dash thickness must stay 2pt (not averaged 5pt), got {h}"
+            );
+            assert!(
+                (w - 20.0).abs() < 0.1 || x0 <= 0.5 || x1 >= 99.5,
+                "4x1 interior horizontal dash length must stay 20pt (not 12.5pt), got {w} in [{x0}..{x1}]"
+            );
+        }
+
+        // Also test a huge off-page cubic subpath that itself exceeds MAX_DASH_REPEATS
+        // alongside the visible horizontal line: must cull off-page cubic and keep 20pt x 2pt dashes.
+        let huge_cubic_stream = b"q 4 0 0 1 0 0 cm 2 w [5 5] 0 d \
+                                  -1000000 30 m 1000000 30 l \
+                                  -1000000 -500 m -500000 -480 500000 -480 1000000 -500 c S Q";
+        let (huge_cubic_dl, _) = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 60.0))
+            .interpret_with_stats(huge_cubic_stream);
+        assert!(
+            !huge_cubic_dl
+                .commands
+                .iter()
+                .any(|c| matches!(c, RenderCommand::StrokePath { .. })),
+            "huge off-page cubic subpath must not force StrokePath fallback"
+        );
+        let huge_cubic_path = huge_cubic_dl
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath { path, .. } => Some(path),
+                _ => None,
+            })
+            .expect("huge off-page cubic compound path must expand to FillPath");
+        let huge_boxes: Vec<(f64, f64, f64, f64)> = collect_contours(huge_cubic_path)
+            .iter()
+            .map(|c| contour_bounds(c))
+            .collect();
+        assert!(
+            huge_boxes.len() >= 3
+                && huge_boxes
+                    .iter()
+                    .all(|&(_, y0, _, y1)| (y1 - y0 - 2.0).abs() < 0.05),
+            "culled off-page cubic must leave only 2pt-tall visible dashes, got {huge_boxes:?}"
+        );
+
+        // Also test a SINGLE subpath containing an off-page cubic followed by a
+        // long line crossing the page AND a visible cubic!
+        let single_curve_stream = b"q 4 0 0 1 0 0 cm 2 w [5 5] 0 d \
+                                    -1000000 30 m -999995 30 -999990 30 -999980 30 c \
+                                    10 30 l 12 40 16 40 18 30 c 1000000 30 l S Q";
+        let (single_dl, _) = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 60.0))
+            .interpret_with_stats(single_curve_stream);
+        assert!(
+            single_dl
+                .commands
+                .iter()
+                .any(|c| matches!(c, RenderCommand::FillPath { .. }))
+                && !single_dl
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, RenderCommand::StrokePath { .. })),
+            "single subpath mixing long off-page lines and cubics must expand anisotropically without StrokePath fallback"
+        );
+
+        // 2a) Compound path: long off-page subpath + fully visible closed
+        //     rectangle whose dash crosses the starting corner (5, 10) -> page (20, 10).
+        //     Under 4x1, width 2, butt caps (0 J), miter join (0 j), [15 5] 5 d:
+        //     the miter corner extends to page (16, 9) and must stay ONE joined
+        //     contour covering x=16, y=9 rather than two butt caps missing (16..20, 9..10).
+        let closed_compound = b"q 4 0 0 1 0 0 cm 2 w 0 J 0 j [15 5] 5 d \
+                                -1000000 200 m 1000000 200 l \
+                                5 10 10 20 re S Q";
+        let (closed_dl, _) = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 60.0))
+            .interpret_with_stats(closed_compound);
+        let closed_path = closed_dl
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath { path, .. } => Some(path),
+                _ => None,
+            })
+            .expect("compound closed rectangle must expand to FillPath");
+        let has_miter_corner = |path: &Path| {
+            collect_contours(path).iter().any(|pts| {
+                pts.iter()
+                    .any(|p| (p.x - 16.0).abs() < 0.05 && (p.y - 9.0).abs() < 0.05)
+            })
+        };
+        assert!(
+            has_miter_corner(closed_path),
+            "closed rectangle alongside long off-page subpath must preserve miter join at (16, 9)"
+        );
+
+        // 2b) Single partially-clipped closed subpath starting at visible corner
+        //     (5, 10) -> page (20, 10) and detouring off-page to x=1_000_005:
+        //     perimeter = 2_000_040 (exact multiple of period 20), so the closing
+        //     dash meets the starting dash at (20, 10) and must form a miter join
+        //     reaching (16, 9)!
+        let closed_detour = b"q 4 0 0 1 0 0 cm 2 w 0 J 0 j [15 5] 5 d \
+                              5 10 m 1000005 10 l 1000005 30 l 5 30 l h S Q";
+        let (detour_dl, _) = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 60.0))
+            .interpret_with_stats(closed_detour);
+        let detour_path = detour_dl
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath { path, .. } => Some(path),
+                _ => None,
+            })
+            .expect("partially-clipped closed contour must expand to FillPath");
+        assert!(
+            has_miter_corner(detour_path),
+            "partially-clipped closed contour whose dash crosses its starting corner must keep its miter join at (16, 9)"
+        );
+
+        // 3) Fine dashes inside a 100,000x magnified tiling pattern under a 4x1 cm:
+        //    cell-space horizontal dash period is 0.00008 (<= 1e-4), which becomes
+        //    8pt (4pt on, 4pt off) in page space under the 100,000x pattern matrix.
+        let stream_obj = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+        let mag_pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 80] /Contents 4 0 R \
+              /Resources << /Pattern << /PMag 5 0 R >> >> >>"
+                .to_vec(),
+            stream_obj("", b"/Pattern cs /PMag scn 0 0 80 80 re f"),
+            stream_obj(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /Matrix [100000 0 0 100000 0 0] \
+                 /BBox [0 0 0.0004 0.0004] /XStep 0.0004 /YStep 0.0004 /Resources << >>",
+                b"q 4 0 0 1 0 0 cm 1 0 0 RG 0.00002 w [0.00001 0.00001] 0 d \
+                  0 0.0002 m 0.0001 0.0002 l S Q",
+            ),
+        ]);
+        let doc = zpdf_document::PdfDocument::open(mag_pdf).expect("open mag pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let mut images = ImageCache::new();
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let (mag_dl, _) = ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content);
+        let mag_tile = mag_dl
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath {
+                    paint: Paint::Tiling(t),
+                    ..
+                } => Some(t),
+                _ => None,
+            })
+            .expect("expected magnified Paint::Tiling");
+        let cell_dash_path = mag_tile
+            .commands
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath { path, .. } => Some(path),
+                _ => None,
+            })
+            .expect(
+                "anisotropic dashed stroke inside 100,000x magnified tile must expand to FillPath",
+            );
+        let cell_dashes: Vec<(f64, f64, f64, f64)> = collect_contours(cell_dash_path)
+            .iter()
+            .map(|c| contour_bounds(c))
+            .collect();
+        assert_eq!(
+            cell_dashes.len(),
+            5,
+            "0.0001-user-unit line under 4x1 cm with [0.00001 0.00001] dash inside 100,000x tile must emit 5 separate dashes, got {cell_dashes:?}"
+        );
+        for &(x0, y0, x1, y1) in &cell_dashes {
+            let page_w = (x1 - x0) * 100_000.0;
+            let page_h = (y1 - y0) * 100_000.0;
+            assert!(
+                (page_w - 4.0).abs() < 0.05 && (page_h - 2.0).abs() < 0.05,
+                "magnified tile dash must measure 4pt x 2pt in page space, got {page_w} x {page_h}"
+            );
+        }
+    }
+
+    #[test]
+    fn type3_standalone_replay_draws_shallow_form_image_after_deep_alias() {
+        // Standalone Type 3 CharProc replay (without a live PdfFile) using the
+        // pre-resolved Type3Resources from font_loader: when /Resources visits
+        // an 8-deep Form chain to a shared Form BEFORE a direct shallow alias
+        // to that same Form, replaying the glyph that invokes the shallow alias
+        // must still resolve and emit the Form's image XObject.
+        let mut objs: Vec<String> = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),         // 1
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(), // 2
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Contents 4 0 R \
+               /Resources << /Font << /F1 5 0 R >> >> >>"
+                .into(), // 3
+            "<< /Length 26 >>\nstream\nBT /F1 1 Tf (A) Tj ET\nendstream".into(), // 4
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] \
+               /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R >> \
+               /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [10] \
+               /Resources << /XObject << /DeepChain 7 0 R /Shallow 15 0 R >> >> >>"
+                .into(), // 5
+            "<< /Length 19 >>\nstream\n10 0 d0 /Shallow Do\nendstream".into(), // 6
+        ];
+        // Objects 7..=14: 8-deep chain reaching shared Form 15 at depth 8.
+        for obj_num in 7..=14u32 {
+            let next = obj_num + 1;
+            objs.push(format!(
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+                   /Resources << /XObject << /Next {next} 0 R >> >> /Length 8 >>\n\
+                 stream\n/Next Do\nendstream"
+            ));
+        }
+        // Object 15: shared Form defining /LeafImg (obj 16).
+        objs.push(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+               /Resources << /XObject << /LeafImg 16 0 R >> >> /Length 27 >>\n\
+             stream\n10 0 0 10 0 0 cm /LeafImg Do\nendstream"
+                .into(),
+        );
+        // Object 16: 2x2 opaque red RGB image.
+        objs.push(
+            "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 \
+               /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length 12 >>\n\
+             stream\n\x7f\x00\x00\x7f\x00\x00\x7f\x00\x00\x7f\x00\x00\nendstream"
+                .into(),
+        );
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objs.len());
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            pdf.extend_from_slice(body.as_bytes());
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes(),
+        );
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objs.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let fonts = doc.load_page_fonts(&page);
+        let (_, font) = fonts
+            .get_by_name("F1")
+            .expect("Type 3 font F1 must be loaded");
+        let (_, charproc_bytes, _) = font.type3_glyph_entry(65).expect("glyph A");
+        let t3_res = font
+            .type3_resources()
+            .expect("Type 3 font must retain /Resources");
+        let mut images = ImageCache::new();
+        let (replay_dl, _) = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .with_images(&mut images)
+            .with_type3_resources(Some(t3_res))
+            .for_type3_glyph()
+            .interpret_with_stats(&charproc_bytes);
+        assert!(
+            replay_dl
+                .commands
+                .iter()
+                .any(|c| matches!(c, RenderCommand::DrawImage(_) | RenderCommand::DrawInlineImage(_))),
+            "standalone Type 3 replay of /Shallow Do must emit the image from Form 15's /Resources, got {:?}",
+            replay_dl.commands
         );
     }
 }

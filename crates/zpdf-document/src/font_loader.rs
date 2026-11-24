@@ -1376,14 +1376,14 @@ fn load_type3_font(
     // `/Name Do`, `/GS gs`, or named color spaces replay without a live PdfFile.
     let type3_resources = resolve_dict(file, dict, "Resources").and_then(|res_dict| {
         let mut seen_images = std::collections::HashMap::new();
-        let mut seen_forms = std::collections::HashMap::new();
+        let mut form_cache = Type3FormCache::default();
         let mut active_forms = std::collections::HashSet::new();
-        let resolved = resolve_type3_resources(
+        let (resolved, _) = resolve_type3_resources(
             file,
             &res_dict,
             &mut remaining,
             &mut seen_images,
-            &mut seen_forms,
+            &mut form_cache,
             &mut active_forms,
             0,
         );
@@ -1586,6 +1586,27 @@ fn type3_map_entry_bytes<V>(name: &str) -> u64 {
     )
 }
 
+#[derive(Default)]
+struct Type3FormCache {
+    /// Decoded Form stream bytes shared across depth-limited and complete
+    /// resolutions of the same Form object ID so stream bytes are charged once.
+    streams: std::collections::HashMap<ObjectId, std::sync::Arc<[u8]>>,
+    /// Forms whose entire resource subtree resolved without hitting the depth
+    /// cap or an active ancestor cycle; safe to reuse at any depth.
+    complete: std::collections::HashMap<ObjectId, std::sync::Arc<zpdf_font::Type3FormXObject>>,
+    /// Forms whose subtree hit the depth cap (without hitting an ancestor
+    /// cycle), keyed by `(ObjectId, depth)` so DAGs at the same depth share one
+    /// truncated Form without poisoning shallower aliases.
+    depth_limited:
+        std::collections::HashMap<(ObjectId, u8), std::sync::Arc<zpdf_font::Type3FormXObject>>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Type3ResourceLimits {
+    hit_depth_limit: bool,
+    hit_cycle: bool,
+}
+
 fn resolve_type3_resources(
     file: &PdfFile,
     res_dict: &zpdf_core::PdfDict,
@@ -1594,18 +1615,28 @@ fn resolve_type3_resources(
         ObjectId,
         std::sync::Arc<zpdf_font::Type3ImageXObject>,
     >,
-    seen_forms: &mut std::collections::HashMap<
-        ObjectId,
-        std::sync::Arc<zpdf_font::Type3FormXObject>,
-    >,
+    form_cache: &mut Type3FormCache,
     active_forms: &mut std::collections::HashSet<ObjectId>,
     depth: u8,
-) -> zpdf_font::Type3Resources {
+) -> (zpdf_font::Type3Resources, Type3ResourceLimits) {
     use std::sync::Arc;
-    if depth > 8 || *remaining == 0 {
-        return zpdf_font::Type3Resources::default();
+    if depth > 8 {
+        return (
+            zpdf_font::Type3Resources::default(),
+            Type3ResourceLimits {
+                hit_depth_limit: true,
+                hit_cycle: false,
+            },
+        );
+    }
+    if *remaining == 0 {
+        return (
+            zpdf_font::Type3Resources::default(),
+            Type3ResourceLimits::default(),
+        );
     }
     let mut out = zpdf_font::Type3Resources::default();
+    let mut limits = Type3ResourceLimits::default();
 
     if let Some(xobj_dict) = resolve_dict(file, res_dict, "XObject") {
         for (name, obj) in &xobj_dict.0 {
@@ -1636,7 +1667,7 @@ fn resolve_type3_resources(
                     }
                 }
                 "Form" => {
-                    if let Some(cached) = seen_forms.get(id) {
+                    if let Some(cached) = form_cache.complete.get(id) {
                         *remaining -= entry_cost;
                         out.xobjects.insert(
                             name.0.clone(),
@@ -1644,13 +1675,33 @@ fn resolve_type3_resources(
                         );
                         continue;
                     }
+                    if let Some(cached) = form_cache.depth_limited.get(&(*id, depth)) {
+                        *remaining -= entry_cost;
+                        limits.hit_depth_limit = true;
+                        out.xobjects.insert(
+                            name.0.clone(),
+                            zpdf_font::Type3XObject::Form(Arc::clone(cached)),
+                        );
+                        continue;
+                    }
                     if !active_forms.insert(*id) {
+                        limits.hit_cycle = true;
                         continue;
                     }
                     let saved_rem = *remaining;
                     let after_entry = *remaining - entry_cost;
-                    let decoded = file.resolve_stream_data_with_limit(*id, after_entry);
-                    if let Ok(data) = decoded {
+                    let decoded_stream: Option<(Arc<[u8]>, u64)> =
+                        if let Some(cached_data) = form_cache.streams.get(id) {
+                            Some((Arc::clone(cached_data), 0))
+                        } else {
+                            file.resolve_stream_data_with_limit(*id, after_entry)
+                                .ok()
+                                .map(|raw| {
+                                    let len = raw.len() as u64;
+                                    (Arc::from(raw), len)
+                                })
+                        };
+                    if let Some((data, data_charge)) = decoded_stream {
                         let mut form_dict = zpdf_core::PdfDict::new();
                         for key in ["BBox", "Matrix", "Group"] {
                             if let Some(v) = stream.dict.get(key) {
@@ -1663,7 +1714,7 @@ fn resolve_type3_resources(
                         let struct_bytes =
                             std::mem::size_of::<zpdf_font::Type3FormXObject>() as u64;
                         let form_cost = after_entry
-                            .checked_sub(data.len() as u64)
+                            .checked_sub(data_charge)
                             .and_then(|r| r.checked_sub(struct_bytes))
                             .and_then(|r| {
                                 zpdf_font::estimated_pdf_dict_bytes_within(&form_dict, r)
@@ -1671,25 +1722,41 @@ fn resolve_type3_resources(
                             });
                         if let Some(next_rem) = form_cost {
                             *remaining = next_rem;
+                            form_cache
+                                .streams
+                                .entry(*id)
+                                .or_insert_with(|| Arc::clone(&data));
+                            let mut form_limits = Type3ResourceLimits::default();
                             let form_res =
                                 resolve_dict(file, &stream.dict, "Resources").and_then(|rd| {
-                                    let r = resolve_type3_resources(
+                                    let (r, sub_limits) = resolve_type3_resources(
                                         file,
                                         &rd,
                                         remaining,
                                         seen_images,
-                                        seen_forms,
+                                        form_cache,
                                         active_forms,
                                         depth + 1,
                                     );
+                                    form_limits = sub_limits;
                                     (!r.is_empty()).then(|| Arc::new(r))
                                 });
+                            limits.hit_depth_limit |= form_limits.hit_depth_limit;
+                            limits.hit_cycle |= form_limits.hit_cycle;
                             let form = Arc::new(zpdf_font::Type3FormXObject {
                                 dict: form_dict,
-                                data: Arc::from(data),
+                                data,
                                 resources: form_res,
                             });
-                            seen_forms.insert(*id, Arc::clone(&form));
+                            if !form_limits.hit_cycle {
+                                if form_limits.hit_depth_limit {
+                                    form_cache
+                                        .depth_limited
+                                        .insert((*id, depth), Arc::clone(&form));
+                                } else {
+                                    form_cache.complete.insert(*id, Arc::clone(&form));
+                                }
+                            }
                             out.xobjects
                                 .insert(name.0.clone(), zpdf_font::Type3XObject::Form(form));
                         } else {
@@ -1753,7 +1820,7 @@ fn resolve_type3_resources(
         }
     }
 
-    out
+    (out, limits)
 }
 
 enum EmbeddedFontFile {
@@ -2401,6 +2468,97 @@ mod tests {
             font_big.estimated_cache_bytes() >= base_est + res_est,
             "font estimated_cache_bytes ({}) must include Type3Resources metadata ({res_est} over base {base_est})",
             font_big.estimated_cache_bytes()
+        );
+    }
+
+    #[test]
+    fn type3_deep_form_alias_does_not_poison_complete_shallow_alias() {
+        // Object layout:
+        // 1: Catalog
+        // 2: Type 3 font whose /Resources visits /DeepChain (obj 4) BEFORE /Shallow (obj 12)
+        // 3: CharProc drawing /Shallow Do
+        // 4..11: 8-deep Form chain (depths 0..7) leading to shared Form 12 at depth 8
+        // 12: Shared Form whose /Resources defines /LeafImg (obj 13)
+        // 13: 2x2 opaque red RGB image
+        // When visited via /DeepChain at depth 8, Form 12's child /Resources
+        // lookup hits depth 9 (> 8) and returns empty. The subsequent direct
+        // /Shallow reference at depth 0 MUST NOT reuse that depth-truncated Form
+        // and MUST retain /LeafImg in its resources.
+        let mut objs: Vec<String> = vec![
+            "<< /Type /Catalog >>".into(), // 1
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] \
+               /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 3 0 R >> \
+               /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [10] \
+               /Resources << /XObject << /DeepChain 4 0 R /Shallow 12 0 R >> >> >>"
+                .into(), // 2
+            "<< /Length 19 >>\nstream\n10 0 d0 /Shallow Do\nendstream".into(), // 3
+        ];
+        // Objects 4..=11 chain to the next Form (4->5->...->11->12).
+        for obj_num in 4..=11u32 {
+            let next = obj_num + 1;
+            objs.push(format!(
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+                   /Resources << /XObject << /Next {next} 0 R >> >> /Length 8 >>\n\
+                 stream\n/Next Do\nendstream"
+            ));
+        }
+        // Object 12: shared Form defining /LeafImg in its own /Resources.
+        objs.push(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+               /Resources << /XObject << /LeafImg 13 0 R >> >> /Length 27 >>\n\
+             stream\n10 0 0 10 0 0 cm /LeafImg Do\nendstream"
+                .into(),
+        );
+        // Object 13: 2x2 red DeviceRGB image (12 raw bytes).
+        objs.push(
+            "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 \
+               /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length 12 >>\n\
+             stream\n\x7f\x00\x00\x7f\x00\x00\x7f\x00\x00\x7f\x00\x00\nendstream"
+                .into(),
+        );
+        let obj_refs: Vec<&str> = objs.iter().map(String::as_str).collect();
+        let pdf = crate::test_util::build_pdf(&obj_refs);
+        let file = PdfFile::parse(pdf).expect("parse");
+        let font = load_single_font(&file, ObjectId(2, 0)).expect("load type3");
+        let res = font
+            .type3_resources()
+            .expect("type3 font must retain resolved /Resources");
+
+        // The deep alias at depth 8 was depth-truncated (`resources: None`).
+        let mut cursor = res.xobjects.get("DeepChain");
+        for step in 0..8 {
+            let Some(zpdf_font::Type3XObject::Form(f)) = cursor else {
+                panic!("expected Form at deep chain step {step}");
+            };
+            cursor = f.resources.as_ref().and_then(|r| r.xobjects.get("Next"));
+        }
+        let Some(zpdf_font::Type3XObject::Form(deep_leaf)) = cursor else {
+            panic!("expected shared Form at depth 8 of DeepChain");
+        };
+        assert!(
+            deep_leaf.resources.is_none(),
+            "depth-8 leaf should have been truncated by depth limit"
+        );
+
+        // The shallow alias at depth 0 MUST resolve completely with /LeafImg!
+        let Some(zpdf_font::Type3XObject::Form(shallow)) = res.xobjects.get("Shallow") else {
+            panic!("expected /Shallow Form XObject");
+        };
+        let shallow_res = shallow
+            .resources
+            .as_ref()
+            .expect("/Shallow Form must retain its /Resources after deep alias was visited first");
+        assert!(
+            matches!(
+                shallow_res.xobjects.get("LeafImg"),
+                Some(zpdf_font::Type3XObject::Image(_))
+            ),
+            "/Shallow Form must retain /LeafImg Image XObject"
+        );
+        // Both aliases share the same decoded Form stream buffer Arc.
+        assert!(
+            std::sync::Arc::ptr_eq(&deep_leaf.data, &shallow.data),
+            "depth-limited and complete aliases should share decoded stream bytes"
         );
     }
 }

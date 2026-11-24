@@ -6187,7 +6187,7 @@ fn tiling_cell_uses_page_backdrop(
     depth: u8,
     cache: &mut TilingBackdropCache,
 ) -> bool {
-    if depth >= 16 {
+    if depth > 16 {
         return true;
     }
     let key = (std::sync::Arc::as_ptr(cell) as usize, depth);
@@ -6205,9 +6205,6 @@ fn command_uses_tiling_backdrop_depth(
     depth: u8,
     cache: &mut TilingBackdropCache,
 ) -> bool {
-    if depth >= 16 {
-        return true;
-    }
     match cmd {
         RenderCommand::FillPath {
             paint: Paint::Tiling(tiling),
@@ -6224,7 +6221,12 @@ fn command_uses_tiling_backdrop_depth(
             alpha.is_finite()
                 && *alpha > 0.0
                 && !overprint.is_some_and(|op| op.active == 0)
-                && tiling_cell_uses_page_backdrop(&tiling.commands, font_cache, depth + 1, cache)
+                && tiling_cell_uses_page_backdrop(
+                    &tiling.commands,
+                    font_cache,
+                    depth.saturating_add(1),
+                    cache,
+                )
         }
         RenderCommand::DrawGlyphRun(run) => {
             if let Paint::Tiling(tiling) = &run.paint {
@@ -6237,7 +6239,7 @@ fn command_uses_tiling_backdrop_depth(
                     && tiling_cell_uses_page_backdrop(
                         &tiling.commands,
                         font_cache,
-                        depth + 1,
+                        depth.saturating_add(1),
                         cache,
                     )
             } else {
@@ -22511,12 +22513,15 @@ mod export_tests {
     #[test]
     fn shared_nested_normal_tiling_dag_memoizes_backdrop_scans() {
         use std::sync::Arc;
-        use zpdf_display_list::{FillRule, Path, TilingPattern};
+        use zpdf_display_list::{FillRule, GlyphRun, Path, PositionedGlyph, TilingPattern};
 
-        // 15-level diamond DAG where each level paints 16 references to the same
-        // child `Arc<DisplayList>` (16^15 ≈ 1.15e18 naive paths!), all Normal.
+        // 16-level diamond DAG (the full supported interpreter nesting depth)
+        // where each intermediate level paints 16 references to the same child
+        // `Arc<DisplayList>` (16^15 ≈ 1.15e18 naive paths!), all Normal.
         // Memoizing backdrop checks by `(Arc::as_ptr(&cell), depth)` completes in
-        // O(unique cell commands) instead of traversing exponential paths.
+        // O(unique cell commands), inspects the 16th tile's solid mark without
+        // falsely requiring a slide backdrop, and exports cleanly even when
+        // overlapping outline-less native text.
         let mut sq = Path::new();
         sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
         let mut child_arc = Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0)));
@@ -22527,7 +22532,7 @@ mod export_tests {
             alpha: 1.0,
             overprint: None,
         });
-        for _ in 0..14 {
+        for _ in 0..15 {
             let child = Arc::new(TilingPattern {
                 commands: Arc::clone(&child_arc),
                 bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
@@ -22549,7 +22554,7 @@ mod export_tests {
             child_arc = Arc::new(parent);
         }
         let root_tiling = Arc::new(TilingPattern {
-            commands: child_arc,
+            commands: Arc::clone(&child_arc),
             bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
             x_step: 10.0,
             y_step: 10.0,
@@ -22557,30 +22562,88 @@ mod export_tests {
             tiling_type: 1,
         });
 
-        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        // Add overlapping native text backed by an outline-less standard font
+        // before the 16-level Normal tile: if the 16th level were falsely
+        // flagged as backdrop-dependent, the exporter would require a slide
+        // backdrop and reject the slide over the outline-less text.
+        let mut fonts = FontCache::new();
+        let ph_id = fonts.insert(
+            "F1".into(),
+            LoadedFont::new_standard("Helvetica".into()).expect("Helvetica font"),
+        );
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id: ph_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 8.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(2.0, 4.0),
+            h_scale: 1.0,
+        }));
+        let mut cover = Path::new();
+        cover.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
         dl.push(RenderCommand::FillPath {
-            path: sq,
+            path: cover.clone(),
             rule: FillRule::NonZero,
-            paint: Paint::Tiling(root_tiling),
+            paint: Paint::Tiling(Arc::clone(&root_tiling)),
             alpha: 1.0,
             overprint: None,
         });
 
         let mut cache = TilingBackdropCache::default();
-        let fonts = FontCache::new();
         assert!(
-            !command_uses_tiling_backdrop(&dl.commands[0], &fonts, &mut cache),
-            "Normal-only 15-level DAG must report false for page backdrop dependence"
+            !command_uses_tiling_backdrop(&dl.commands[1], &fonts, &mut cache),
+            "Normal-only 16-level DAG must inspect the 16th tile and report false for page backdrop dependence"
         );
-        // 14 intermediate levels × 16 commands + 1 leaf command = 225 unique commands.
+        // 15 intermediate levels × 16 commands + 1 leaf command = 241 unique commands.
         assert!(
-            cache.commands_scanned <= 250,
-            "memoized backdrop scan must visit each (cell, depth) once (<= 250), got {}",
+            cache.commands_scanned <= 260,
+            "memoized backdrop scan must visit each (cell, depth) once (<= 260), got {}",
             cache.commands_scanned
         );
 
-        // Verify full PPTX slide export also stays bounded across all export passes
-        // (native_only_texts scan, isolated_inner_blends, and convert_command).
+        // Descending beyond the supported 16 levels (17 levels) MUST still
+        // trigger the conservative backdrop-dependent fallback.
+        let mut level17_parent = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        level17_parent.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&root_tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let level17_tiling = Arc::new(TilingPattern {
+            commands: Arc::new(level17_parent),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+        let level17_cmd = RenderCommand::FillPath {
+            path: cover,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(level17_tiling),
+            alpha: 1.0,
+            overprint: None,
+        };
+        let mut cache17 = TilingBackdropCache::default();
+        assert!(
+            command_uses_tiling_backdrop(&level17_cmd, &fonts, &mut cache17),
+            "17-level tiling chain beyond the 16-level limit must conservatively require a backdrop"
+        );
+
+        // Verify full PPTX slide export succeeds over the outline-less native
+        // text and stays bounded across all export passes.
         let (slide, stats) = display_list_to_slide_internal(
             &dl,
             0,
@@ -22590,11 +22653,24 @@ mod export_tests {
             Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
             None,
         )
-        .expect("slide export must succeed promptly");
-        assert_eq!(slide.elements.len(), 1);
+        .expect("16-level Normal tiling over outline-less native text must export cleanly");
         assert!(
-            stats.tiling_backdrop_cmd_scans <= 300,
-            "full PPTX export must share memoized backdrop scans across passes (<= 300), got {}",
+            slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::TextBox { .. })),
+            "native text box must be preserved under a Normal 16-level tiling pattern"
+        );
+        assert!(
+            slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::Image { .. })),
+            "16-level Normal tiling pattern must emit its tile overlay image"
+        );
+        assert!(
+            stats.tiling_backdrop_cmd_scans <= 320,
+            "full PPTX export must share memoized backdrop scans across passes (<= 320), got {}",
             stats.tiling_backdrop_cmd_scans
         );
     }

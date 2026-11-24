@@ -113,7 +113,7 @@ pub fn display_list_to_svg(
         writer.out.push_str("\"/>\n");
     }
 
-    writer.emit_commands(&display_list.commands, 0);
+    writer.emit_commands(&display_list.commands, EmitDepth::default());
     writer.flush_pending_backdrop();
     writer.flush_disjoint_backdrop();
 
@@ -294,9 +294,38 @@ enum ImageDefKey {
     },
 }
 
+/// Independent nesting depths for soft-mask (`MAX_MASK_DEPTH`) and
+/// tiling-pattern (`MAX_TILING_DEPTH`) definitions so nested tiles up to depth
+/// 16 do not exhaust the 8-level soft-mask budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+struct EmitDepth {
+    mask: u8,
+    tile: u8,
+}
+
+impl EmitDepth {
+    fn is_top_level(self) -> bool {
+        self.mask == 0 && self.tile == 0
+    }
+
+    fn enter_mask(self) -> Self {
+        Self {
+            mask: self.mask.saturating_add(1),
+            tile: self.tile,
+        }
+    }
+
+    fn enter_tile(self) -> Self {
+        Self {
+            mask: self.mask,
+            tile: self.tile.saturating_add(1),
+        }
+    }
+}
+
 /// Identity of a soft-mask def: the shared mask list plus the parameters
-/// written around it, and the nesting depth it was written at (masks nested
-/// past [`MAX_MASK_DEPTH`] are left out of it).
+/// written around it, and the nesting depths it was written at (masks nested
+/// past [`MAX_MASK_DEPTH`] or tiles past [`MAX_TILING_DEPTH`] are left out).
 #[derive(PartialEq, Eq, Hash)]
 struct MaskDefKey {
     commands: *const DisplayList,
@@ -304,7 +333,7 @@ struct MaskDefKey {
     offset: [u32; 2],
     backdrop_luma: u32,
     origin_scale: [u64; 3],
-    depth: u8,
+    depth: EmitDepth,
 }
 
 /// Identity of a tiling-pattern `<pattern>` def.
@@ -318,7 +347,7 @@ struct PatternDefKey {
     steps: [u64; 2],
     tile_dims: [u64; 2],
     matrix: [u64; 6],
-    depth: u8,
+    depth: EmitDepth,
 }
 
 /// Cap on separate `(overlap_copy × blend_segment)` SVG passes for one
@@ -650,12 +679,12 @@ impl<'a> SvgWriter<'a> {
         (push_prims, trailing_reserve, pop_prims)
     }
 
-    fn emit_commands(&mut self, commands: &[RenderCommand], depth: u8) {
+    fn emit_commands(&mut self, commands: &[RenderCommand], depth: EmitDepth) {
         let mut frames: Vec<Frame<'a>> = Vec::new();
         let mut idx = 0usize;
         while idx < commands.len() {
             let cmd = &commands[idx];
-            if depth == 0 {
+            if depth.is_top_level() {
                 self.current_page_cmd_idx = Some(idx);
             }
             if self.check_over_budget() {
@@ -702,7 +731,7 @@ impl<'a> SvgWriter<'a> {
                         prev_bounds: self.clip_bounds,
                     };
                     self.push_clip(path, rule);
-                    if depth == 0 {
+                    if depth.is_top_level() {
                         self.active_clip_cmd_indices.push(idx);
                     }
                     frames.push(frame);
@@ -714,7 +743,7 @@ impl<'a> SvgWriter<'a> {
                         prev_bounds: self.clip_bounds,
                     };
                     self.push_clip_stroke(path, style);
-                    if depth == 0 {
+                    if depth.is_top_level() {
                         self.active_clip_cmd_indices.push(idx);
                     }
                     frames.push(frame);
@@ -728,7 +757,7 @@ impl<'a> SvgWriter<'a> {
                         self.clip = *prev_clip;
                         self.stroke_mask = *prev_mask;
                         self.clip_bounds = *prev_bounds;
-                        if depth == 0 {
+                        if depth.is_top_level() {
                             self.active_clip_cmd_indices.pop();
                         }
                         frames.pop();
@@ -769,7 +798,7 @@ impl<'a> SvgWriter<'a> {
                     let group_prims = push_prims
                         .saturating_add(trailing_reserve)
                         .saturating_add(pop_prims);
-                    if depth == 0
+                    if depth.is_top_level()
                         && is_non_isolated_group
                         && (self.pending_backdrop.is_some() || !self.out.is_empty())
                         && self.enqueue_backdrop_step(
@@ -794,7 +823,7 @@ impl<'a> SvgWriter<'a> {
                             mask_id,
                             trailing_reserve,
                         });
-                    } else if depth == 0
+                    } else if depth.is_top_level()
                         && is_non_isolated_group
                         && self.non_isolated_filter_depth == 0
                         && self.svg_backdrop_diverged_depth == 0
@@ -849,7 +878,10 @@ impl<'a> SvgWriter<'a> {
                             prev_backdrop_cpu,
                             prev_backdrop_cpu_start_idx,
                             prev_backdrop_cpu_transparent,
-                        ) = if depth == 0 && *isolated && self.non_isolated_ancestor_depth > 0 {
+                        ) = if depth.is_top_level()
+                            && *isolated
+                            && self.non_isolated_ancestor_depth > 0
+                        {
                             (
                                 true,
                                 self.backdrop_cpu.take(),
@@ -999,13 +1031,13 @@ impl<'a> SvgWriter<'a> {
                     self.clip = prev_clip;
                     self.stroke_mask = prev_mask;
                     self.clip_bounds = prev_bounds;
-                    if depth == 0 {
+                    if depth.is_top_level() {
                         self.active_clip_cmd_indices.pop();
                     }
                 }
             }
         }
-        if depth == 0 {
+        if depth.is_top_level() {
             self.current_page_cmd_idx = None;
         }
     }
@@ -1030,8 +1062,8 @@ impl<'a> SvgWriter<'a> {
     /// (every pixel has `alpha == 1.0`), so identity-backdrop associative tile
     /// collapsing (`#ffffff` for `Multiply`, `#000000` for `Screen`) cannot
     /// paint unpainted tile pixels onto a transparent canvas.
-    fn opaque_backdrop(&self, depth: u8) -> bool {
-        depth == 0 && self.has_opaque_background && self.isolated_depth == 0
+    fn opaque_backdrop(&self, depth: EmitDepth) -> bool {
+        depth.is_top_level() && self.has_opaque_background && self.isolated_depth == 0
     }
 
     /// Cached per-export check of `tiling.is_backdrop_dependent()`.
@@ -1171,9 +1203,9 @@ impl<'a> SvgWriter<'a> {
         overlap_shift: Option<(i64, i64)>,
         copy_blend_mode: BlendMode,
         seg_bounds: Option<zpdf_core::Rect>,
-        depth: u8,
+        depth: EmitDepth,
     ) -> Option<u32> {
-        if depth >= MAX_TILING_DEPTH || commands.commands.is_empty() {
+        if depth.tile >= MAX_TILING_DEPTH || commands.commands.is_empty() {
             return None;
         }
         let g = self.compute_tiling_pattern_geometry(tiling)?;
@@ -1271,10 +1303,10 @@ impl<'a> SvgWriter<'a> {
                         self.out,
                         "<g style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
                     );
-                    self.emit_commands(&commands.commands, depth + 1);
+                    self.emit_commands(&commands.commands, depth.enter_tile());
                     self.out.push_str("</g>\n");
                 } else {
-                    self.emit_commands(&commands.commands, depth + 1);
+                    self.emit_commands(&commands.commands, depth.enter_tile());
                 }
                 drew_any = true;
             }
@@ -1314,7 +1346,7 @@ impl<'a> SvgWriter<'a> {
         css_name: &str,
         tile_w: f64,
         tile_h: f64,
-        depth: u8,
+        depth: EmitDepth,
     ) {
         for step in steps {
             match step {
@@ -1323,7 +1355,7 @@ impl<'a> SvgWriter<'a> {
                         self.out,
                         "<g style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
                     );
-                    self.emit_commands(&seg.commands.commands, depth + 1);
+                    self.emit_commands(&seg.commands.commands, depth.enter_tile());
                     self.out.push_str("</g>\n");
                 }
                 zpdf_display_list::TilingBlendStep::OpacityGroup {
@@ -1342,7 +1374,7 @@ impl<'a> SvgWriter<'a> {
                     let mask_id = mask.as_ref().map(|m_seg| {
                         let mid = self.fresh_id();
                         let saved_out = std::mem::take(&mut self.out);
-                        self.emit_commands(&m_seg.commands.commands, depth + 1);
+                        self.emit_commands(&m_seg.commands.commands, depth.enter_tile().enter_mask());
                         let mask_body = std::mem::replace(&mut self.out, saved_out);
                         let _ = write!(
                             self.defs,
@@ -1376,9 +1408,9 @@ impl<'a> SvgWriter<'a> {
         tiling: &zpdf_display_list::TilingPattern,
         steps: &[zpdf_display_list::TilingBlendStep],
         mode: BlendMode,
-        depth: u8,
+        depth: EmitDepth,
     ) -> Option<u32> {
-        if depth >= MAX_TILING_DEPTH || steps.is_empty() {
+        if depth.tile >= MAX_TILING_DEPTH || steps.is_empty() {
             return None;
         }
         let identity = match mode {
@@ -1485,7 +1517,7 @@ impl<'a> SvgWriter<'a> {
         dj: i64,
         remaining: &mut usize,
         exhausted: &mut bool,
-        depth: u8,
+        depth: EmitDepth,
     ) {
         for step in steps {
             if *exhausted || self.check_over_budget() {
@@ -1506,10 +1538,10 @@ impl<'a> SvgWriter<'a> {
                             self.out,
                             "<g style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
                         );
-                        self.emit_commands(&seg.commands.commands, depth + 1);
+                        self.emit_commands(&seg.commands.commands, depth.enter_tile());
                         self.out.push_str("</g>\n");
                     } else {
-                        self.emit_commands(&seg.commands.commands, depth + 1);
+                        self.emit_commands(&seg.commands.commands, depth.enter_tile());
                     }
                 }
                 zpdf_display_list::TilingBlendStep::OpacityGroup {
@@ -1548,9 +1580,9 @@ impl<'a> SvgWriter<'a> {
         &mut self,
         tiling: &zpdf_display_list::TilingPattern,
         steps: &[zpdf_display_list::TilingBlendStep],
-        depth: u8,
+        depth: EmitDepth,
     ) -> Option<(u32, u32, u32)> {
-        if depth >= MAX_TILING_DEPTH || steps.is_empty() {
+        if depth.tile >= MAX_TILING_DEPTH || steps.is_empty() {
             return None;
         }
         let g = self.compute_tiling_pattern_geometry(tiling)?;
@@ -1714,7 +1746,7 @@ impl<'a> SvgWriter<'a> {
         steps: &[zpdf_display_list::TilingBlendStep],
         overlap_shift: Option<(i64, i64)>,
         opaque_bg: bool,
-        depth: u8,
+        depth: EmitDepth,
         remaining: &mut usize,
         exhausted: &mut bool,
         ops: &mut Vec<TilingPlanOp>,
@@ -1846,7 +1878,7 @@ impl<'a> SvgWriter<'a> {
     fn emit_tiling_plan(
         &mut self,
         tiling: &zpdf_display_list::TilingPattern,
-        depth: u8,
+        depth: EmitDepth,
     ) -> TilingPassPlan {
         if self.tiling_is_backdrop_dependent(tiling) {
             if let Some(steps) = tiling.blend_steps() {
@@ -1900,7 +1932,7 @@ impl<'a> SvgWriter<'a> {
                         }
                     }
                     if total_passes > MAX_SVG_TILING_BLEND_PASSES {
-                        if depth == 0
+                        if depth.is_top_level()
                             && !has_opacity_group
                             && zpdf_display_list::TilingBlendStep::is_affine_in_backdrop(&steps)
                         {
@@ -3914,12 +3946,12 @@ impl<'a> SvgWriter<'a> {
         opacity: f32,
         affected: SvgRect,
         disjoint_rect: SvgRect,
-        depth: u8,
+        depth: EmitDepth,
     ) {
         let plan = self.emit_tiling_plan(tiling, depth);
         match plan {
             TilingPassPlan::Affine { t_id, k_id, mk_id } => {
-                if depth == 0 {
+                if depth.is_top_level() {
                     let shape_id = self.fresh_id();
                     let placement = self.placement_attrs();
                     let _ = write!(
@@ -3975,7 +4007,7 @@ impl<'a> SvgWriter<'a> {
                     _ => None,
                 };
                 if single_pattern.is_none() {
-                    if depth == 0 {
+                    if depth.is_top_level() {
                         let placement = self.placement_attrs();
                         let mut shape_body = String::with_capacity(d.len() + placement.len() + 64);
                         let _ = write!(shape_body, "<path d=\"{d}\" fill=\"#ffffff\"");
@@ -4004,7 +4036,7 @@ impl<'a> SvgWriter<'a> {
                     // backdrop yet, nested inside a pattern/mask, or past the
                     // filter/snapshot budget): evaluate all passes at 1.0 inside
                     // one isolated group and apply `opacity` ONCE.
-                    if depth == 0 {
+                    if depth.is_top_level() {
                         self.flush_pending_backdrop();
                     }
                     let clip_id = self.fresh_id();
@@ -4034,7 +4066,9 @@ impl<'a> SvgWriter<'a> {
                 let Some((id, blend_mode)) = single_pattern else {
                     return;
                 };
-                if depth == 0 && self.pending_backdrop.is_some() && blend_mode != BlendMode::Normal
+                if depth.is_top_level()
+                    && self.pending_backdrop.is_some()
+                    && blend_mode != BlendMode::Normal
                 {
                     let ov_id = self.fresh_id();
                     let placement = self.placement_attrs();
@@ -4073,7 +4107,14 @@ impl<'a> SvgWriter<'a> {
         }
     }
 
-    fn emit_fill(&mut self, path: &Path, rule: &FillRule, paint: &Paint, alpha: f32, depth: u8) {
+    fn emit_fill(
+        &mut self,
+        path: &Path,
+        rule: &FillRule,
+        paint: &Paint,
+        alpha: f32,
+        depth: EmitDepth,
+    ) {
         match paint {
             Paint::Solid(color) => {
                 let opacity = (color.a * alpha).clamp(0.0, 1.0);
@@ -4134,7 +4175,7 @@ impl<'a> SvgWriter<'a> {
         style: &StrokeStyle,
         paint: &Paint,
         alpha: f32,
-        depth: u8,
+        depth: EmitDepth,
     ) {
         match paint {
             Paint::Solid(color) => {
@@ -4175,7 +4216,7 @@ impl<'a> SvgWriter<'a> {
                 let plan = self.emit_tiling_plan(tiling, depth);
                 match plan {
                     TilingPassPlan::Affine { t_id, k_id, mk_id } => {
-                        if depth == 0 {
+                        if depth.is_top_level() {
                             let shape_id = self.fresh_id();
                             let placement = self.placement_attrs();
                             let _ = write!(
@@ -4232,7 +4273,7 @@ impl<'a> SvgWriter<'a> {
                             _ => None,
                         };
                         if single_pattern.is_none() {
-                            if depth == 0 {
+                            if depth.is_top_level() {
                                 let placement = self.placement_attrs();
                                 let mut shape_body =
                                     String::with_capacity(d.len() + placement.len() + 96);
@@ -4260,7 +4301,7 @@ impl<'a> SvgWriter<'a> {
                             }
 
                             // Bounded isolated single-opacity fallback for strokes.
-                            if depth == 0 {
+                            if depth.is_top_level() {
                                 self.flush_pending_backdrop();
                             }
                             let mask_id = self.fresh_id();
@@ -4298,7 +4339,7 @@ impl<'a> SvgWriter<'a> {
                         let Some((id, blend_mode)) = single_pattern else {
                             return;
                         };
-                        if depth == 0
+                        if depth.is_top_level()
                             && self.pending_backdrop.is_some()
                             && blend_mode != BlendMode::Normal
                         {
@@ -4504,7 +4545,7 @@ impl<'a> SvgWriter<'a> {
         prev_backdrop_cpu_start_idx: usize,
         prev_backdrop_cpu_transparent: bool,
         swapped_backdrop_cpu: bool,
-        depth: u8,
+        depth: EmitDepth,
     ) {
         if !open {
             return;
@@ -4527,7 +4568,10 @@ impl<'a> SvgWriter<'a> {
         if !isolated {
             self.svg_backdrop_diverged_depth = self.svg_backdrop_diverged_depth.saturating_sub(1);
         }
-        if depth == 0 && blend_css(blend_mode).is_some() && self.pending_backdrop.is_some() {
+        if depth.is_top_level()
+            && blend_css(blend_mode).is_some()
+            && self.pending_backdrop.is_some()
+        {
             let ov_id = self.fresh_id();
             let _ = write!(self.defs, "<g id=\"ov{ov_id}\"");
             if alpha < 1.0 {
@@ -4558,8 +4602,8 @@ impl<'a> SvgWriter<'a> {
     /// Emit an ExtGState soft mask as an SVG `<mask>` def and return its id.
     /// SVG masks are luminance-based by default, which is exactly PDF's
     /// luminosity soft mask; alpha masks use `mask-type:alpha`.
-    fn emit_soft_mask_def(&mut self, mask: &SoftMask, depth: u8) -> Option<u32> {
-        if depth >= MAX_MASK_DEPTH {
+    fn emit_soft_mask_def(&mut self, mask: &SoftMask, depth: EmitDepth) -> Option<u32> {
+        if depth.mask >= MAX_MASK_DEPTH {
             tracing::warn!("soft-mask nesting exceeds depth budget; mask dropped");
             return None;
         }
@@ -4623,7 +4667,7 @@ impl<'a> SvgWriter<'a> {
             push_num(&mut self.out, -dy);
             self.out.push_str(")\">\n");
         }
-        self.emit_commands(&mask.commands.commands, depth + 1);
+        self.emit_commands(&mask.commands.commands, depth.enter_mask());
         self.flush_pending_backdrop();
         self.flush_disjoint_backdrop();
         if translated {
@@ -4654,7 +4698,7 @@ impl<'a> SvgWriter<'a> {
 
     // -- text --
 
-    fn emit_glyph_run(&mut self, run: &GlyphRun, depth: u8) {
+    fn emit_glyph_run(&mut self, run: &GlyphRun, depth: EmitDepth) {
         if run.overprint.is_some() {
             self.warn_overprint();
         }
@@ -5063,7 +5107,7 @@ impl<'a> SvgWriter<'a> {
         font: &LoadedFont,
         tiling: &zpdf_display_list::TilingPattern,
         opacity: f32,
-        depth: u8,
+        depth: EmitDepth,
     ) {
         enum Type3TilingPart {
             InheritedShape {
@@ -5513,7 +5557,7 @@ impl<'a> SvgWriter<'a> {
         };
 
         let plan = self.emit_tiling_plan(tiling, depth);
-        let plan_can_fallback = depth == 0
+        let plan_can_fallback = depth.is_top_level()
             && match &plan {
                 TilingPassPlan::Affine { .. } => true,
                 TilingPassPlan::Ops(ops) => {
@@ -5617,7 +5661,7 @@ impl<'a> SvgWriter<'a> {
                         match &plan {
                             TilingPassPlan::Affine { t_id, k_id, mk_id } => {
                                 let (t_id, k_id, mk_id) = (*t_id, *k_id, *mk_id);
-                                if depth == 0 {
+                                if depth.is_top_level() {
                                     let affine_prims = if self.non_isolated_ga_depth > 0 {
                                         18
                                     } else {
@@ -5736,7 +5780,7 @@ impl<'a> SvgWriter<'a> {
                                     }
                                     _ => None,
                                 };
-                                if depth == 0
+                                if depth.is_top_level()
                                     && (single_pattern.is_none()
                                         || (self.pending_backdrop.is_some()
                                             && single_pattern
@@ -11785,6 +11829,120 @@ mod tests {
         assert!(
             !svg.contains("<g id=\"r"),
             "single-pass Normal patterned Type 3 runs must not create rollback staging defs"
+        );
+    }
+
+    #[test]
+    fn svg_soft_mask_inside_deep_nested_tiling_keeps_transparent_half() {
+        // 9-level nested tiling pattern (tile depth reaches 9 > MAX_MASK_DEPTH = 8,
+        // still within MAX_TILING_DEPTH = 16). Inside the innermost tile, a
+        // luminosity soft mask paints only the left half white and leaves the
+        // right half black/transparent over a full-tile red fill. Because mask
+        // depth is tracked independently of tile depth, the soft mask must be
+        // emitted and the right half must remain transparent (white background).
+        let tile_rect = Rect::new(0.0, 0.0, 20.0, 20.0);
+        let mut mask_dl = DisplayList::new(tile_rect);
+        mask_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let half_mask = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: std::sync::Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let mut inner_cell = DisplayList::new(tile_rect);
+        inner_cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: tile_rect,
+            alpha: 1.0,
+            mask: Some(half_mask),
+        });
+        inner_cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        inner_cell.push(RenderCommand::PopBlendGroup);
+
+        let mut tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(inner_cell),
+            bbox: tile_rect,
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+        for _ in 0..8 {
+            let mut parent = DisplayList::new(tile_rect);
+            parent.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 20.0, 20.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+                commands: std::sync::Arc::new(parent),
+                bbox: tile_rect,
+                x_step: 20.0,
+                y_step: 20.0,
+                matrix: zpdf_core::Matrix::identity(),
+                tiling_type: 1,
+            });
+        }
+
+        let mut dl = DisplayList::new(tile_rect);
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        assert!(
+            svg.contains("<mask id=\"m"),
+            "soft mask inside 9th-level nested tiling pattern must not be dropped at MAX_MASK_DEPTH: {svg}"
+        );
+
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(40, 40).expect("pixmap");
+        let sx = 40.0 / tree.size().width();
+        let sy = 40.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let left = pixmap.pixel(10, 20).expect("left half in bounds");
+        let right = pixmap.pixel(30, 20).expect("right half in bounds");
+        assert!(
+            left.red() > 240 && left.green() < 15 && left.blue() < 15,
+            "masked left half inside 9-level nested tile must be red, got {:?}",
+            [left.red(), left.green(), left.blue(), left.alpha()]
+        );
+        assert!(
+            right.red() > 240 && right.green() > 240 && right.blue() > 240,
+            "transparent right half of soft mask inside 9-level nested tile must keep white background, got {:?}",
+            [right.red(), right.green(), right.blue(), right.alpha()]
         );
     }
 }
