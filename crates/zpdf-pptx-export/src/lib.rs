@@ -216,15 +216,16 @@ struct ConversionStats {
     peak_flatten_rebaser_mask_entries: usize,
     peak_flatten_rebaser_mask_bytes: usize,
     flatten_cpu_mask_cache_invalidations: usize,
+    queued_clip_stack_allocations: usize,
     backdrop_groups_completed: usize,
 }
 
-fn display_list_to_slide_internal(
-    display_list: &DisplayList,
+fn display_list_to_slide_internal<'a>(
+    display_list: &'a DisplayList,
     page_index: usize,
-    font_cache: &FontCache,
-    image_cache: &ImageCache,
-    options: &ConversionOptions,
+    font_cache: &'a FontCache,
+    image_cache: &'a ImageCache,
+    options: &'a ConversionOptions,
     render_budget: Option<std::time::Duration>,
     #[cfg(test)] expire_backdrop_after_groups: Option<usize>,
 ) -> Result<(PptxSlide, ConversionStats)> {
@@ -237,6 +238,7 @@ fn display_list_to_slide_internal(
         elements: Vec::new(),
         image_counter: 0,
         clip_stack: Vec::new(),
+        shared_clip_stack: None,
         backdrop_mgr: BackdropManager::new(render_budget),
         render_budget,
         stats: ConversionStats::default(),
@@ -381,18 +383,26 @@ struct FullPageBackdrop<'a> {
     cursor: usize,
 }
 
-struct PendingTiledSnapshot {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TileGroupKey {
+    tx_tier: u8,
+    gx: i32,
+    ty_tier: u8,
+    gy: i32,
+}
+
+struct PendingTiledSnapshot<'a> {
     element_idx: usize,
     start_idx: usize,
     end_idx: usize,
-    clip_stack: Vec<RenderCommand>,
+    clip_stack: std::rc::Rc<[&'a RenderCommand]>,
     crop_rect: Rect,
 }
 
-struct PendingTileGroup {
+struct PendingTileGroup<'a> {
     tile_rect: Rect,
     tile_scale: f32,
-    snapshots: Vec<PendingTiledSnapshot>,
+    snapshots: Vec<PendingTiledSnapshot<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -662,8 +672,8 @@ impl BackdropIndex {
 
 struct BackdropManager<'a> {
     full_page: Option<FullPageBackdrop<'a>>,
-    pending_groups: Vec<PendingTileGroup>,
-    grid_groups: std::collections::HashMap<(i32, i32), usize>,
+    pending_groups: Vec<PendingTileGroup<'a>>,
+    grid_groups: std::collections::HashMap<TileGroupKey, usize>,
     render_budget: Option<std::time::Duration>,
 }
 
@@ -695,7 +705,8 @@ struct SlideConverter<'a> {
     options: &'a ConversionOptions,
     elements: Vec<SlideElement>,
     image_counter: usize,
-    clip_stack: Vec<RenderCommand>,
+    clip_stack: Vec<&'a RenderCommand>,
+    shared_clip_stack: Option<std::rc::Rc<[&'a RenderCommand]>>,
     backdrop_mgr: BackdropManager<'a>,
     render_budget: Option<std::time::Duration>,
     stats: ConversionStats,
@@ -714,7 +725,7 @@ enum ActiveClip {
 }
 
 impl<'a> SlideConverter<'a> {
-    fn convert_display_list(&mut self, display_list: &DisplayList) -> Result<()> {
+    fn convert_display_list(&mut self, display_list: &'a DisplayList) -> Result<()> {
         let commands = &display_list.commands;
         let expanded = display_list.expanded_glyph_runs();
         let isolated_inner_blends = compute_isolated_inner_non_normal_blends(commands);
@@ -896,7 +907,7 @@ impl<'a> SlideConverter<'a> {
             return ActiveClip::None;
         }
         let mut combined: Option<Rect> = None;
-        for clip in &self.clip_stack {
+        for &clip in &self.clip_stack {
             let RenderCommand::PushClip { path, .. } = clip else {
                 return ActiveClip::Complex;
             };
@@ -942,16 +953,31 @@ impl<'a> SlideConverter<'a> {
         }
     }
 
-    fn track_clip(&mut self, cmd: &RenderCommand) {
+    fn track_clip(&mut self, cmd: &'a RenderCommand) {
         match cmd {
             RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
-                self.clip_stack.push(cmd.clone());
+                self.clip_stack.push(cmd);
+                self.shared_clip_stack = None;
             }
             RenderCommand::PopClip => {
                 self.clip_stack.pop();
+                self.shared_clip_stack = None;
             }
             _ => {}
         }
+    }
+
+    fn snapshot_clip_stack(&mut self, count_allocation: bool) -> std::rc::Rc<[&'a RenderCommand]> {
+        if let Some(shared) = &self.shared_clip_stack {
+            return std::rc::Rc::clone(shared);
+        }
+        let shared: std::rc::Rc<[&'a RenderCommand]> =
+            std::rc::Rc::from(self.clip_stack.as_slice());
+        self.shared_clip_stack = Some(std::rc::Rc::clone(&shared));
+        if count_allocation && !self.clip_stack.is_empty() {
+            self.stats.queued_clip_stack_allocations += 1;
+        }
+        shared
     }
 
     fn find_matching_pop_blend(commands: &[RenderCommand], push_idx: usize) -> Option<usize> {
@@ -998,47 +1024,92 @@ impl<'a> SlideConverter<'a> {
         None
     }
 
-    fn choose_tile_window(
-        &self,
-        crop_rect: Rect,
-        crop_scale: f32,
-    ) -> (Option<(i32, i32)>, Rect, f32) {
-        let crop_max_dim = crop_rect.width().max(crop_rect.height());
-        if crop_max_dim <= BACKDROP_TILE_PT {
-            let tile_scale = fit_scale_to_max_dim(BACKDROP_TILE_PT).unwrap_or(crop_scale);
-            let ox = self.page_rect.x0;
-            let oy = self.page_rect.y0;
-            let gx0 = ((crop_rect.x0 - ox) / BACKDROP_TILE_PT).floor();
-            let gx1 = ((crop_rect.x1 - ox) / BACKDROP_TILE_PT).floor();
-            let gy0 = ((crop_rect.y0 - oy) / BACKDROP_TILE_PT).floor();
-            let gy1 = ((crop_rect.y1 - oy) / BACKDROP_TILE_PT).floor();
-            if gx0 == gx1 && gy0 == gy1 && gx0.is_finite() && gy0.is_finite() {
-                let candidate = Rect::new(
-                    ox + gx0 * BACKDROP_TILE_PT,
-                    oy + gy0 * BACKDROP_TILE_PT,
-                    ox + (gx0 + 1.0) * BACKDROP_TILE_PT,
-                    oy + (gy0 + 1.0) * BACKDROP_TILE_PT,
-                );
-                let tile_rect = intersect_rect(candidate, self.page_rect).unwrap_or(crop_rect);
-                return (Some((gx0 as i32, gy0 as i32)), tile_rect, tile_scale);
-            }
-            let cx = 0.5 * (crop_rect.x0 + crop_rect.x1);
-            let cy = 0.5 * (crop_rect.y0 + crop_rect.y1);
-            let half = BACKDROP_TILE_PT * 0.5;
-            let mut x0 = (cx - half).max(self.page_rect.x0);
-            let mut x1 = (x0 + BACKDROP_TILE_PT).min(self.page_rect.x1);
-            x0 = (x1 - BACKDROP_TILE_PT).max(self.page_rect.x0);
-            x1 = x1.max(crop_rect.x1);
-            let mut y0 = (cy - half).max(self.page_rect.y0);
-            let mut y1 = (y0 + BACKDROP_TILE_PT).min(self.page_rect.y1);
-            y0 = (y1 - BACKDROP_TILE_PT).max(self.page_rect.y0);
-            y1 = y1.max(crop_rect.y1);
-            let candidate = Rect::new(x0, y0, x1, y1);
-            let tile_rect = intersect_rect(candidate, self.page_rect).unwrap_or(crop_rect);
-            (None, tile_rect, tile_scale)
-        } else {
-            (None, crop_rect, crop_scale)
+    fn canonical_axis_window(
+        a0: f64,
+        a1: f64,
+        origin: f64,
+        page_max: f64,
+    ) -> Option<(u8, i32, f64, f64)> {
+        let len = a1 - a0;
+        if !(a0.is_finite() && a1.is_finite() && len.is_finite() && len >= 0.0) {
+            return None;
         }
+        // Tier 0: fits completely inside a single aligned 512pt grid cell (zero overlap).
+        if len <= BACKDROP_TILE_PT {
+            let g0 = ((a0 - origin) / BACKDROP_TILE_PT).floor();
+            let g1 = if a1 > a0 {
+                ((a1 - origin) / BACKDROP_TILE_PT).ceil() - 1.0
+            } else {
+                g0
+            };
+            if g0 == g1 && g0.is_finite() && g0 >= i32::MIN as f64 && g0 <= i32::MAX as f64 {
+                let w0 = (origin + g0 * BACKDROP_TILE_PT).max(origin);
+                let w1 = (origin + (g0 + 1.0) * BACKDROP_TILE_PT).min(page_max);
+                if w0 <= a0 + 1e-6 && a1 <= w1 + 1e-6 {
+                    return Some((0, g0 as i32, w0, w1));
+                }
+            }
+            // Tier 1: <= 512pt crop straddling a 512pt grid line -> half-stepped 1024pt
+            // window (step 512pt, win 1024pt; at most 2 windows overlap any point).
+            let step = BACKDROP_TILE_PT;
+            let win = BACKDROP_TILE_PT * 2.0;
+            let g = ((a0 - origin) / step).floor();
+            if g.is_finite() && g >= i32::MIN as f64 && g <= i32::MAX as f64 {
+                let w0 = (origin + g * step).max(origin);
+                let w1 = (origin + g * step + win).min(page_max);
+                if w0 <= a0 + 1e-6 && a1 <= w1 + 1e-6 {
+                    return Some((1, g as i32, w0, w1));
+                }
+            }
+        }
+        // Tier 2+: crops wider than 512pt (and boundary-precision fallbacks).
+        // Window sizes double from 1024pt (1024, 2048, 4096, ...) with `step = win / 4`
+        // so every interval of length <= `0.75 * win` fits inside one canonical window,
+        // bounding overlapping windows per coordinate to <= 4 per tier.
+        let mut win = BACKDROP_TILE_PT * 2.0;
+        for tier in 2u8..=24u8 {
+            let step = win * 0.25;
+            if len <= win - step {
+                let g = ((a0 - origin) / step).floor();
+                if g.is_finite() && g >= i32::MIN as f64 && g <= i32::MAX as f64 {
+                    let w0 = (origin + g * step).max(origin);
+                    let w1 = (origin + g * step + win).min(page_max);
+                    if w0 <= a0 + 1e-6 && a1 <= w1 + 1e-6 {
+                        return Some((tier, g as i32, w0, w1));
+                    }
+                }
+            }
+            win *= 2.0;
+        }
+        None
+    }
+
+    fn choose_tile_window(&self, crop_rect: Rect) -> Option<(TileGroupKey, Rect, f32)> {
+        let (tx_tier, gx, x0, x1) = Self::canonical_axis_window(
+            crop_rect.x0,
+            crop_rect.x1,
+            self.page_rect.x0,
+            self.page_rect.x1,
+        )?;
+        let (ty_tier, gy, y0, y1) = Self::canonical_axis_window(
+            crop_rect.y0,
+            crop_rect.y1,
+            self.page_rect.y0,
+            self.page_rect.y1,
+        )?;
+        let tile_rect = Rect::new(x0, y0, x1, y1);
+        let tile_max_dim = tile_rect.width().max(tile_rect.height());
+        let tile_scale = fit_scale_to_max_dim(tile_max_dim)?;
+        Some((
+            TileGroupKey {
+                tx_tier,
+                gx,
+                ty_tier,
+                gy,
+            },
+            tile_rect,
+            tile_scale,
+        ))
     }
 
     fn ensure_full_page_backdrop(
@@ -1074,7 +1145,9 @@ impl<'a> SlideConverter<'a> {
         start_idx: usize,
         end_idx: usize,
         crop_rect: Rect,
-        crop_scale: f32,
+        key: TileGroupKey,
+        tile_rect: Rect,
+        tile_scale: f32,
     ) {
         let element_idx = self.elements.len();
         // Reserve exact paint-order Z-index in `self.elements`; filled or removed
@@ -1091,33 +1164,17 @@ impl<'a> SlideConverter<'a> {
             element_idx,
             start_idx,
             end_idx,
-            clip_stack: self.clip_stack.clone(),
+            clip_stack: self.snapshot_clip_stack(true),
             crop_rect,
         };
-        let (grid_key, tile_rect, tile_scale) = self.choose_tile_window(crop_rect, crop_scale);
-        if let Some(cell) = grid_key {
-            if let Some(&group_idx) = self.backdrop_mgr.grid_groups.get(&cell) {
-                self.backdrop_mgr.pending_groups[group_idx]
-                    .snapshots
-                    .push(snap);
-                return;
-            }
-            let group_idx = self.backdrop_mgr.pending_groups.len();
-            self.backdrop_mgr.grid_groups.insert(cell, group_idx);
-            self.backdrop_mgr.pending_groups.push(PendingTileGroup {
-                tile_rect,
-                tile_scale,
-                snapshots: vec![snap],
-            });
+        if let Some(&group_idx) = self.backdrop_mgr.grid_groups.get(&key) {
+            self.backdrop_mgr.pending_groups[group_idx]
+                .snapshots
+                .push(snap);
             return;
         }
-        if let Some(group) = self.backdrop_mgr.pending_groups.iter_mut().find(|g| {
-            g.tile_scale >= crop_scale - 1e-6
-                && rect_contains_with_eps(g.tile_rect, crop_rect, 1e-4)
-        }) {
-            group.snapshots.push(snap);
-            return;
-        }
+        let group_idx = self.backdrop_mgr.pending_groups.len();
+        self.backdrop_mgr.grid_groups.insert(key, group_idx);
         self.backdrop_mgr.pending_groups.push(PendingTileGroup {
             tile_rect,
             tile_scale,
@@ -1128,7 +1185,7 @@ impl<'a> SlideConverter<'a> {
     fn render_pass1_coverage(
         &mut self,
         group_cmds: &[RenderCommand],
-        clip_stack: &[RenderCommand],
+        clip_stack: &[&RenderCommand],
         sub_render_rect: Rect,
         scale: f32,
     ) -> Result<zpdf_render_cpu::RenderedPage> {
@@ -1148,7 +1205,7 @@ impl<'a> SlideConverter<'a> {
                 background: zpdf_display_list::Color::rgba(0.0, 0.0, 0.0, 0.0),
             })
             .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
-        for clip in clip_stack {
+        for &clip in clip_stack {
             renderer
                 .execute(clip)
                 .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
@@ -1194,8 +1251,34 @@ impl<'a> SlideConverter<'a> {
         let mut empty_slots: Vec<usize> = Vec::new();
 
         for group in groups {
+            let Some(first_snap) = group.snapshots.first() else {
+                continue;
+            };
+            let mut union = first_snap.crop_rect;
+            for snap in &group.snapshots[1..] {
+                union = Rect::new(
+                    union.x0.min(snap.crop_rect.x0),
+                    union.y0.min(snap.crop_rect.y0),
+                    union.x1.max(snap.crop_rect.x1),
+                    union.y1.max(snap.crop_rect.y1),
+                );
+            }
+            // Tighten the tile surface to the union of its queued snapshots
+            // snapped outward onto the tile's device-pixel grid so narrow
+            // strips or sparse tiles allocate and blend only needed pixels.
+            let gs = group.tile_scale as f64;
+            let gx0 = ((union.x0 - group.tile_rect.x0) * gs).floor().max(0.0);
+            let gy0 = ((group.tile_rect.y1 - union.y1) * gs).floor().max(0.0);
+            let gx1 = ((union.x1 - group.tile_rect.x0) * gs).ceil().max(gx0 + 1.0);
+            let gy1 = ((group.tile_rect.y1 - union.y0) * gs).ceil().max(gy0 + 1.0);
+            let tight_rect = Rect::new(
+                (group.tile_rect.x0 + gx0 / gs).max(group.tile_rect.x0),
+                (group.tile_rect.y1 - gy1 / gs).max(group.tile_rect.y0),
+                (group.tile_rect.x0 + gx1 / gs).min(group.tile_rect.x1),
+                (group.tile_rect.y1 - gy0 / gs).min(group.tile_rect.y1),
+            );
             let Some(mut surface) = BackdropSurface::open(
-                group.tile_rect,
+                tight_rect,
                 group.tile_scale,
                 self.font_cache,
                 self.image_cache,
@@ -1381,7 +1464,7 @@ impl<'a> SlideConverter<'a> {
         // Tighten to every active caller clip and any leading clip inside the
         // group so disjoint clipped artwork exits immediately and partial clips
         // keep full resolution over only the visible region.
-        for clip in &self.clip_stack {
+        for &clip in &self.clip_stack {
             let Some(tightened) = tighten_rect_to_clip(raw_bounds, clip) else {
                 return Ok(());
             };
@@ -1426,11 +1509,18 @@ impl<'a> SlideConverter<'a> {
                 return Ok(());
             };
             if crop_scale > page_scale + 1e-6 {
-                // Small/medium crop on a large sheet: batch snapshots per tile
-                // so each tile renders in a single monotonic forward pass with
-                // bounded memory and zero eviction replay.
-                self.enqueue_tiled_backdrop_snapshot(start_idx, end_idx, crop_rect, crop_scale);
-                return Ok(());
+                if let Some((key, tile_rect, tile_scale)) = self.choose_tile_window(crop_rect) {
+                    if tile_scale > page_scale + 1e-6 {
+                        // Small/medium/wide crop on a large sheet: batch snapshots
+                        // on canonical hierarchical grid windows so every window
+                        // renders in a single monotonic forward pass with bounded
+                        // memory and linear command visits.
+                        self.enqueue_tiled_backdrop_snapshot(
+                            start_idx, end_idx, crop_rect, key, tile_rect, tile_scale,
+                        );
+                        return Ok(());
+                    }
+                }
             }
 
             let Some((bg_rect, bg_scale, bg_w, bg_h)) =
@@ -1460,7 +1550,7 @@ impl<'a> SlideConverter<'a> {
             }
             let sub_render_rect = Rect::new(sub_x0, sub_y0, sub_x1, sub_y1);
 
-            let clips = self.clip_stack.clone();
+            let clips = self.snapshot_clip_stack(false);
             let mut rendered =
                 self.render_pass1_coverage(group_cmds, &clips, sub_render_rect, bg_scale)?;
             if rendered.data.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
@@ -1599,7 +1689,7 @@ impl<'a> SlideConverter<'a> {
                 background: zpdf_display_list::Color::rgba(0.0, 0.0, 0.0, 0.0),
             })
             .map_err(|e| zpdf_core::Error::StreamDecode(format!("PPTX mask render: {e}")))?;
-        for clip in &self.clip_stack {
+        for &clip in &self.clip_stack {
             let prepared = rebaser.prepare_command(clip);
             let exec_res = renderer
                 .execute(prepared.as_ref())
@@ -9927,6 +10017,111 @@ mod export_tests {
                 );
             }
         }
+
+        // Also cover shifted, overlapping fills wider than one 512pt tile (600pt and 1200pt)
+        // at two sequence lengths (10 vs 80) so coalesced grid windows prevent quadratic replay.
+        let build_shifted_wide = |count: usize, width: f64, step_x: f64| -> DisplayList {
+            let mut dl = DisplayList::new(page_rect);
+            let mut bg = zpdf_display_list::Path::new();
+            bg.rect(page_rect);
+            dl.push(RenderCommand::FillPath {
+                path: bg,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            for i in 0..count {
+                let x0 = 20.0 + i as f64 * step_x;
+                let r = Rect::new(x0, 20.0, x0 + width, 32.0);
+                dl.push(RenderCommand::PushBlendGroup {
+                    blend_mode: zpdf_display_list::BlendMode::Multiply,
+                    isolated: true,
+                    knockout: false,
+                    bounds: r,
+                    alpha: 1.0,
+                    mask: None,
+                });
+                let mut p = zpdf_display_list::Path::new();
+                p.rect(r);
+                dl.push(RenderCommand::FillPath {
+                    path: p,
+                    rule: zpdf_display_list::FillRule::NonZero,
+                    paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+                dl.push(RenderCommand::PopBlendGroup);
+            }
+            dl
+        };
+
+        for (width, step_x, min_px_w, label) in [
+            (600.0, 4.0, 1100u32, "600pt shifted overlapping fills"),
+            (1200.0, 8.0, 1100u32, "1200pt shifted overlapping fills"),
+        ] {
+            let dl_w_small = build_shifted_wide(10, width, step_x);
+            let dl_w_large = build_shifted_wide(80, width, step_x);
+            let (slide_ws, stats_ws) = display_list_to_slide_internal(
+                &dl_w_small,
+                0,
+                &FontCache::new(),
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+                Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+                None,
+            )
+            .expect("small wide shifted export");
+            let (slide_wl, stats_wl) = display_list_to_slide_internal(
+                &dl_w_large,
+                0,
+                &FontCache::new(),
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+                Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+                None,
+            )
+            .expect("large wide shifted export");
+
+            assert_eq!(slide_ws.elements.len(), 11);
+            assert_eq!(slide_wl.elements.len(), 81);
+            assert!(
+                stats_wl.peak_backdrop_pixels <= MAX_BACKDROP_CACHE_PIXELS,
+                "{label}: peak backdrop pixels must stay <= {MAX_BACKDROP_CACHE_PIXELS}, got {}",
+                stats_wl.peak_backdrop_pixels
+            );
+            // Under per-crop windows, 8x overlapping fills would grow ~59x (3240 vs 55);
+            // canonical coalesced windows keep replay strictly bounded (<= 4 windows per point).
+            assert!(
+                stats_wl.backdrop_command_visits <= stats_ws.backdrop_command_visits * 20,
+                "{label}: shifted overlapping wide fills must scale linearly, small={} large={}",
+                stats_ws.backdrop_command_visits,
+                stats_wl.backdrop_command_visits
+            );
+            assert!(
+                stats_wl.backdrop_command_visits <= 4 * (1 + 80 * 3) + 20,
+                "{label}: coalesced windows must replay each overlapping fill at most 4x, got {}",
+                stats_wl.backdrop_command_visits
+            );
+            let SlideElement::Image { image_data, .. } =
+                slide_ws.elements.last().expect("wide fill image")
+            else {
+                panic!("{label}: expected SlideElement::Image");
+            };
+            let rgba = image::load_from_memory(image_data)
+                .expect("decode wide PNG")
+                .to_rgba8();
+            let (w, h) = rgba.dimensions();
+            assert!(
+                w >= min_px_w,
+                "{label}: wide crop must stay high resolution (>= {min_px_w}px wide), got {w}x{h}"
+            );
+            assert_eq!(
+                rgba.get_pixel(w / 2, h / 2).0,
+                [0, 0, 0, 255],
+                "{label}: red Multiply over blue must blend to black"
+            );
+        }
     }
 
     #[test]
@@ -10592,5 +10787,112 @@ mod export_tests {
                 "{pass_name}: x=19 outside [20..60] must remain unmasked ({expected_outside:?})"
             );
         }
+    }
+
+    #[test]
+    fn queued_tiled_snapshots_share_caller_clip_stack_without_cloning_clip_paths() {
+        let page_rect = Rect::new(0.0, 0.0, 8192.0, 8192.0);
+        let mut dl = DisplayList::new(page_rect);
+
+        // Detailed non-rectangular polygon clip (~4,000 vertices) covering [0..4000]x[0..4000]
+        // minus a chamfered corner, so `clip_stack` is active for every queued tiled label.
+        let mut detailed_clip = zpdf_display_list::Path::new();
+        detailed_clip.move_to(zpdf_core::Point::new(0.0, 0.0));
+        for i in 1..=1000 {
+            detailed_clip.line_to(zpdf_core::Point::new(i as f64 * 4.0, 0.0));
+        }
+        for i in 1..=1000 {
+            detailed_clip.line_to(zpdf_core::Point::new(4000.0, i as f64 * 3.9));
+        }
+        for i in 1..=1000 {
+            detailed_clip.line_to(zpdf_core::Point::new(4000.0 - i as f64 * 4.0, 4000.0));
+        }
+        for i in 1..=1000 {
+            detailed_clip.line_to(zpdf_core::Point::new(0.0, 4000.0 - i as f64 * 4.0));
+        }
+        detailed_clip.close();
+
+        let push_label = |dl: &mut DisplayList, x0: f64, y0: f64| {
+            let r = Rect::new(x0, y0, x0 + 16.0, y0 + 16.0);
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: r,
+                alpha: 1.0,
+                mask: None,
+            });
+            let mut p = zpdf_display_list::Path::new();
+            p.rect(r);
+            dl.push(RenderCommand::FillPath {
+                path: p,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+        };
+
+        // State 1: 60 labels across multiple tiles under the single detailed clip.
+        dl.push(RenderCommand::PushClip {
+            path: detailed_clip,
+            rule: zpdf_display_list::FillRule::NonZero,
+        });
+        for i in 0..60 {
+            let x0 = 20.0 + (i % 6) as f64 * 600.0;
+            let y0 = 20.0 + (i / 6) as f64 * 40.0;
+            push_label(&mut dl, x0, y0);
+        }
+
+        // State 2: nested inner clip covering [0..2000]^2 with 20 labels inside + 1 clipped out.
+        let mut inner_clip = zpdf_display_list::Path::new();
+        inner_clip.rect(Rect::new(0.0, 0.0, 2000.0, 2000.0));
+        dl.push(RenderCommand::PushClip {
+            path: inner_clip,
+            rule: zpdf_display_list::FillRule::NonZero,
+        });
+        for i in 0..20 {
+            push_label(
+                &mut dl,
+                50.0 + (i % 4) as f64 * 400.0,
+                800.0 + (i / 4) as f64 * 40.0,
+            );
+        }
+        // Outside inner clip [0..2000]^2 -> dropped cleanly without producing an element.
+        push_label(&mut dl, 3000.0, 3000.0);
+        dl.push(RenderCommand::PopClip);
+
+        // State 3: back to the outer detailed clip with 20 more labels.
+        for i in 0..20 {
+            push_label(
+                &mut dl,
+                50.0 + (i % 4) as f64 * 600.0,
+                1400.0 + (i / 4) as f64 * 40.0,
+            );
+        }
+        dl.push(RenderCommand::PopClip);
+
+        let (slide, stats) = display_list_to_slide_internal(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("shared clip stack export");
+
+        assert_eq!(
+            slide.elements.len(),
+            100,
+            "60 + 20 + 20 visible labels must export while the clipped-out label is omitted"
+        );
+        assert_eq!(
+            stats.queued_clip_stack_allocations, 3,
+            "100 queued snapshots across 3 clip states must allocate only 3 shared clip-stack handles, got {}",
+            stats.queued_clip_stack_allocations
+        );
     }
 }
