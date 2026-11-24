@@ -2692,30 +2692,38 @@ fn compute_isolated_inner_non_normal_blends(
     }) {
         return flags;
     }
-    let mut stack: Vec<(usize, bool)> = Vec::new();
+    let mut stack: Vec<(usize, bool, bool)> = Vec::new();
     for (idx, cmd) in commands.iter().enumerate() {
         match cmd {
-            RenderCommand::PushBlendGroup { blend_mode, .. } => {
+            RenderCommand::PushBlendGroup {
+                blend_mode,
+                isolated,
+                ..
+            } => {
                 let non_normal = *blend_mode != zpdf_display_list::BlendMode::Normal;
                 if non_normal {
-                    if let Some((_, has_inner)) = stack.last_mut() {
+                    if let Some((_, _, has_inner)) = stack.last_mut() {
                         *has_inner = true;
                     }
                 }
-                stack.push((idx, false));
+                // An isolated Normal group supplies its own backdrop and resolves
+                // inner non-Normal blends and partial-colorant overprints itself,
+                // so its internal dependency must not propagate to an outer Form.
+                let isolates_inner = !non_normal && *isolated;
+                stack.push((idx, isolates_inner, false));
             }
             RenderCommand::PopBlendGroup => {
-                if let Some((push_idx, has_inner)) = stack.pop() {
+                if let Some((push_idx, isolates_inner, has_inner)) = stack.pop() {
                     flags[push_idx] = has_inner;
-                    if has_inner {
-                        if let Some((_, parent_inner)) = stack.last_mut() {
+                    if has_inner && !isolates_inner {
+                        if let Some((_, _, parent_inner)) = stack.last_mut() {
                             *parent_inner = true;
                         }
                     }
                 }
             }
             other if command_has_renderable_overprint(other, font_cache) => {
-                if let Some((_, has_inner)) = stack.last_mut() {
+                if let Some((_, _, has_inner)) = stack.last_mut() {
                     *has_inner = true;
                 }
             }
@@ -12141,7 +12149,11 @@ mod export_tests {
         // overlapped respectively by:
         // 1. a page-level yellow-only overprinting rectangle [60..120]x[30..94]
         // 2. a page-level yellow-only overprinting thick stroke [180..235] at y=62
-        // 3. a page-level yellow-only overprinting Type 1 Helvetica text run "(MM)" straddling x=314.
+        // 3. a page-level yellow-only overprinting TrueType text run "(AA)" using a
+        //    deterministic embedded/registered test face straddling x=314.
+        const PRIMARY_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+
         let pdf = assemble(&[
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
@@ -12156,7 +12168,7 @@ mod export_tests {
                   BT /F1 80 Tf 250 30 Td (C) Tj ET \
                   q /GSop gs 0 0 1 0 k 60 30 60 64 re f Q \
                   q /GSop gs 0 0 1 0 K 24 w 180 62 m 235 62 l S Q \
-                  q /GSop gs 0 0 1 0 k BT /F2 72 Tf 270 36 Td (MM) Tj ET Q",
+                  q /GSop gs 0 0 1 0 k BT /F2 72 Tf 270 36 Td (AA) Tj ET Q",
             ), // 4
             b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
               /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
@@ -12165,11 +12177,19 @@ mod export_tests {
             b"<< /A 8 0 R /B 8 0 R /C 8 0 R >>".to_vec(),  // 6
             b"<< /Type /Encoding /Differences [65 /A /B /C] >>".to_vec(), // 7
             stream("", b"1000 0 d0 0 0 800 800 re f"),     // 8
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 9
+            b"<< /Type /Font /Subtype /TrueType /BaseFont /PptxOverprintFace \
+              /Encoding /WinAnsiEncoding >>"
+                .to_vec(), // 9
             b"<< /Type /ExtGState /op true /OP true /OPM 1 >>".to_vec(), // 10
         ]);
 
-        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+        provider
+            .register_with_aliases(PRIMARY_TTF, 0, &["PptxOverprintFace"])
+            .expect("register test face");
+        let doc = zpdf_document::PdfDocument::open(pdf)
+            .expect("open pdf")
+            .with_font_provider(provider);
         let page = doc.page(0).expect("page 0");
         let mut fonts = doc.load_page_fonts(&page);
         let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
@@ -12301,10 +12321,12 @@ mod export_tests {
             pdf
         };
 
-        // Single `(AB) Tj` under caller black (`0 0 0 rg`, no overprint):
-        // - /A enables black overprint locally (`/GSop gs 0 0 0 1 k`) -> same RGB black,
-        //   different overprint state -> splits out of the verified run and renders as artwork.
-        // - /B inherits caller's normal black -> stays an editable TextBox("B")!
+        // Single `(AB) Tj` under caller DeviceGray `0.5 g` (no overprint):
+        // - /A enables `/op true /OPM 1` locally without changing color -> identical RGB
+        //   (0.5, 0.5, 0.5) and alpha 1.0 as caller, differing ONLY in `overprint` ->
+        //   `overprint_matches` splits A out so it renders overprint artwork (dark cyan
+        //   over the cyan backdrop).
+        // - /B inherits caller's normal `0.5 g` -> stays an editable TextBox("B")!
         let pdf = assemble(&[
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
@@ -12313,7 +12335,7 @@ mod export_tests {
                 .to_vec(), // 3
             stream(
                 "",
-                b"0 1 1 rg 0 0 240 120 re f 0 0 0 rg BT /F1 60 Tf 20 30 Td (AB) Tj ET",
+                b"0 1 1 rg 0 0 240 120 re f 0.5 g BT /F1 60 Tf 20 30 Td (AB) Tj ET",
             ), // 4
             b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
               /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
@@ -12322,7 +12344,7 @@ mod export_tests {
                 .to_vec(), // 5
             b"<< /A 8 0 R /B 9 0 R >>".to_vec(),           // 6
             b"<< /Type /Encoding /Differences [65 /A /B] >>".to_vec(), // 7
-            stream("", b"1000 0 d0 /GSop gs 0 0 0 1 k 0 0 800 800 re f"), // 8
+            stream("", b"1000 0 d0 /GSop gs 0 0 800 800 re f"), // 8
             stream("", b"1000 0 d0 0 0 800 800 re f"),     // 9
             b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 10
         ]);
@@ -12359,13 +12381,25 @@ mod export_tests {
             "unaffected letter B in (AB) Tj must remain an editable TextBox while overprinting A stays artwork: {:?}",
             slide.elements
         );
+        let SlideElement::Image { image_data, .. } = slide
+            .elements
+            .iter()
+            .find(|e| matches!(e.base(), SlideElement::Image { .. }))
+            .expect("overprinting letter A must export as a backdrop-composited Image")
+        else {
+            unreachable!()
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let center = rgba.get_pixel(rgba.width() / 2, rgba.height() / 2).0;
+        // 0.5 g (K=0.5) overprint on cyan (C=1) -> C=1, K=0.5 -> dark cyan ~(0, 128, 128).
         assert!(
-            slide
-                .elements
-                .iter()
-                .any(|e| matches!(e.base(), SlideElement::Image { .. })),
-            "overprinting letter A must export as a backdrop-composited Image: {:?}",
-            slide.elements
+            center[3] == 255
+                && center[0] < 15
+                && (115..=140).contains(&center[1])
+                && (115..=140).contains(&center[2]),
+            "0.5 g overprint letter A over cyan backdrop must composite to dark cyan, got {center:?}"
         );
     }
 
@@ -12478,6 +12512,136 @@ mod export_tests {
             vec![("Hello", (0, 0, 0)), ("InsideForm", (0, 0, 0))],
             "overprinting metrics-only Helvetica must preserve native black TextBoxes while omitting zero-ink text: {:?}",
             slide.elements
+        );
+    }
+
+    #[test]
+    fn outer_isolated_form_keeps_heading_editable_when_child_isolated_form_overprints() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Opaque isolated Normal outer Form (/OuterFm) contains:
+        // 1. an ordinary editable heading "(Heading)" in Helvetica, and
+        // 2. an opaque isolated Normal child Form (/InnerFm) containing a cyan rectangle
+        //    and a yellow-only overprinting Type 3 glyph.
+        // Because /InnerFm isolates and resolves its own overprint, the dependency must
+        // stop at /InnerFm so /OuterFm is NOT flattened and "(Heading)" stays a TextBox.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R \
+              /Resources << /XObject << /OuterFm 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"/OuterFm Do"),                    // 4
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 400 200] \
+                 /Group << /Type /Group /S /Transparency /I true /K false >> \
+                 /Resources << /Font << /FH 11 0 R >> /XObject << /InnerFm 6 0 R >> >>",
+                b"0 0 0 rg BT /FH 24 Tf 20 160 Td (Heading) Tj ET /InnerFm Do",
+            ), // 5
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [20 20 220 140] \
+                 /Group << /Type /Group /S /Transparency /I true /K false >> \
+                 /Resources << /Font << /F1 7 0 R >> >>",
+                b"0 1 1 rg 20 20 200 120 re f BT /F1 80 Tf 60 40 Td (A) Tj ET",
+            ), // 6
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 8 0 R /Encoding 9 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] \
+              /Resources << /ExtGState << /GSop 12 0 R >> >> >>"
+                .to_vec(), // 7
+            b"<< /ovp 10 0 R >>".to_vec(),                 // 8
+            b"<< /Type /Encoding /Differences [65 /ovp] >>".to_vec(), // 9
+            stream("", b"1000 0 d0 /GSop gs 0 0 1 0 k 0 0 800 800 re f"), // 10
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 11
+            b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 12
+        ]);
+
+        let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+        let doc = zpdf_document::PdfDocument::open(pdf)
+            .expect("open pdf")
+            .with_font_provider(provider);
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("nested isolated form export");
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "expected editable Heading TextBox + flattened child Form Image: {:?}",
+            slide.elements
+        );
+        assert!(
+            matches!(
+                slide.elements[0].base(),
+                SlideElement::TextBox { text, .. } if text == "Heading"
+            ),
+            "outer isolated Form heading must remain an editable TextBox: {:?}",
+            slide.elements[0]
+        );
+        let SlideElement::Image {
+            x_emu,
+            y_emu,
+            image_data,
+            ..
+        } = &slide.elements[1]
+        else {
+            panic!(
+                "child isolated Form must flatten to SlideElement::Image, got {:?}",
+                slide.elements[1]
+            );
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode child Form PNG")
+            .to_rgba8();
+        let x_pt = *x_emu as f64 / 12700.0;
+        let y_pt = *y_emu as f64 / 12700.0;
+        let overlap_px = rgba
+            .get_pixel(
+                ((90.0 - x_pt) * 2.0).round() as u32,
+                ((130.0 - y_pt) * 2.0).round() as u32,
+            )
+            .0;
+        assert!(
+            overlap_px[3] == 255 && overlap_px[0] < 15 && overlap_px[1] > 240 && overlap_px[2] < 15,
+            "child isolated Form overprint overlap must be green, got {overlap_px:?}"
         );
     }
 }
