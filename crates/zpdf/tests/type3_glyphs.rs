@@ -1659,3 +1659,240 @@ fn type3_glyph_with_dropped_inline_image_excluded_from_expanded_runs() {
         "glyph /B whose inline bitmap was dropped must be excluded from expanded text metadata"
     );
 }
+
+#[test]
+fn type3_explicit_g0_char_proc_renders_glyph() {
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 60 60] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", b"1 0 0 rg BT /F1 40 Tf 10 10 Td (A) Tj ET"), // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /g0 8 0 R >>".to_vec(),                   // 6
+        b"<< /Type /Encoding /Differences [65 /g0] >>".to_vec(), // 7
+        stream_obj("", b"1000 0 d0 0 0 1000 1000 re f"), // 8
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .interpret(&content_bytes);
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&dl, 1.0)
+        .expect("render");
+    assert_eq!(
+        px(&rendered, 30, 30),
+        [255, 0, 0],
+        "explicitly encoded /g0 CharProc must render instead of being skipped"
+    );
+}
+
+#[test]
+fn type3_color_xobject_uses_source_dimensions_in_both_draw_orders_without_image_cache() {
+    // 64x64 RGB Image XObject with alternating 2px vertical red/blue stripes.
+    // Downscaling to 10x10 averages the stripes into purple; keeping the 64x64
+    // source for a 40x40 draw preserves distinct red and blue detail.
+    let mut rgb = Vec::with_capacity(64 * 64 * 3);
+    for _y in 0..64 {
+        for x in 0..64 {
+            if (x / 2) % 2 == 0 {
+                rgb.extend_from_slice(&[255, 0, 0]);
+            } else {
+                rgb.extend_from_slice(&[0, 0, 255]);
+            }
+        }
+    }
+    let color_xobj = stream_obj(
+        "/Type /XObject /Subtype /Image /Width 64 /Height 64 \
+         /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &rgb,
+    );
+
+    // Test both small->large->small->large and large->small->large->small draw orders.
+    for small_first in [true, false] {
+        let content: &[u8] = if small_first {
+            b"BT /F1 10 Tf 0 0 Td (A) Tj ET\n\
+              BT /F1 40 Tf 20 0 Td (A) Tj ET\n\
+              BT /F1 10 Tf 70 0 Td (A) Tj ET\n\
+              BT /F1 40 Tf 90 0 Td (A) Tj ET"
+        } else {
+            b"BT /F1 40 Tf 20 0 Td (A) Tj ET\n\
+              BT /F1 10 Tf 0 0 Td (A) Tj ET\n\
+              BT /F1 40 Tf 90 0 Td (A) Tj ET\n\
+              BT /F1 10 Tf 70 0 Td (A) Tj ET"
+        };
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 50] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream_obj("", content),                       // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] \
+              /Resources << /XObject << /Img 9 0 R >> >> >>"
+                .to_vec(), // 5
+            b"<< /A 8 0 R >>".to_vec(),                    // 6
+            b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+            stream_obj("", b"1000 0 d0 1000 0 0 1000 0 0 cm /Img Do"), // 8
+            color_xobj.clone(),                            // 9
+        ]);
+
+        let doc = PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+        // No ImageCache attached, with_image_downscale(1.0) active.
+        let dl = ContentInterpreter::new(page.media_box)
+            .with_fonts(&mut fonts)
+            .with_document(doc.file(), &page.resources)
+            .with_image_downscale(1.0)
+            .interpret(&content_bytes);
+
+        let draws: Vec<_> = dl
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                zpdf::display_list::RenderCommand::DrawInlineImage(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            draws.len(),
+            4,
+            "expected 4 draws (small_first={small_first})"
+        );
+
+        let (small1, large1, small2, large2) = if small_first {
+            (draws[0], draws[1], draws[2], draws[3])
+        } else {
+            (draws[1], draws[0], draws[3], draws[2])
+        };
+        assert!(
+            small1.image.width < 64 && small1.image.height < 64,
+            "10x10 draw must downscale below 64x64 (small_first={small_first}), got {}x{}",
+            small1.image.width,
+            small1.image.height
+        );
+        assert_eq!(
+            (large1.image.width, large1.image.height),
+            (64, 64),
+            "40x40 draw must retain 64x64 source instead of reusing 10x10 thumbnail (small_first={small_first})"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&small1.image, &small2.image),
+            "repeat 10x10 draw must hit the no-cache inline cache (small_first={small_first})"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&large1.image, &large2.image),
+            "repeat 40x40 draw must hit the no-cache inline cache (small_first={small_first})"
+        );
+    }
+}
+
+#[test]
+fn type3_xobject_oversized_footprint_budget_rejection_allows_smaller_footprint() {
+    // 64x64 solid green RGB Image XObject (16,384 bytes RGBA at source size).
+    let mut rgb = Vec::with_capacity(64 * 64 * 3);
+    for _ in 0..(64 * 64) {
+        rgb.extend_from_slice(&[0, 255, 0]);
+    }
+    let color_xobj = stream_obj(
+        "/Type /XObject /Subtype /Image /Width 64 /Height 64 \
+         /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &rgb,
+    );
+
+    // Draw 40x40 (needs 16 KiB -> exceeds 2 KiB budget), repeat 40x40 (skipped),
+    // then draw 10x10 (downscales to 10x10 = 400 B -> fits remaining 2 KiB budget).
+    let content = b"BT /F1 40 Tf 0 0 Td (A) Tj ET\n\
+                    BT /F1 40 Tf 45 0 Td (A) Tj ET\n\
+                    BT /F1 10 Tf 95 10 Td (A) Tj ET";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 50] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", content),                       // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] \
+          /Resources << /XObject << /Img 9 0 R >> >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                    // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        stream_obj("", b"1000 0 d0 1000 0 0 1000 0 0 cm /Img Do"), // 8
+        color_xobj,                                    // 9
+    ]);
+
+    let limits = zpdf::ParseLimits {
+        max_image_cache_bytes: 2_048,
+        ..zpdf::ParseLimits::default()
+    };
+    let doc = PdfDocument::open_with_limits(pdf, limits.clone()).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let (dl, stats) = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_limits(&limits)
+        .with_image_downscale(1.0)
+        .interpret_with_stats(&content_bytes);
+
+    assert!(
+        stats.diagnostics.resource_limit_reached,
+        "oversized 40x40 footprint must record resource_limit_reached"
+    );
+    let draws: Vec<_> = dl
+        .commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            zpdf::display_list::RenderCommand::DrawInlineImage(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        draws.len(),
+        1,
+        "smaller 10x10 footprint must still be admitted after 40x40 rejection"
+    );
+    assert!(
+        draws[0].image.width <= 12 && draws[0].image.height <= 12,
+        "admitted draw must be the downscaled 10x10 copy, got {}x{}",
+        draws[0].image.width,
+        draws[0].image.height
+    );
+
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&dl, 1.0)
+        .expect("render");
+    assert_eq!(
+        px(&rendered, 20, 20),
+        [255, 255, 255],
+        "first rejected 40x40 draw must stay blank"
+    );
+    assert_eq!(
+        px(&rendered, 65, 20),
+        [255, 255, 255],
+        "repeated rejected 40x40 draw must stay blank"
+    );
+    assert_eq!(
+        px(&rendered, 100, 15),
+        [0, 255, 0],
+        "later smaller 10x10 draw must render green"
+    );
+}

@@ -31,12 +31,18 @@ impl DisplayList {
         self.commands.push(cmd);
     }
 
-    /// Truncate `self.commands` to `len` and drop any recorded metadata ranges
-    /// that extend past `len`.
+    /// Truncate `self.commands` to `len`, dropping incomplete expanded glyph
+    /// runs and clipping pattern ranges to the surviving command prefix.
     pub fn truncate_commands(&mut self, len: usize) {
         self.commands.truncate(len);
         self.expanded_glyph_runs.retain(|e| e.cmd_end <= len);
-        self.pattern_ranges.retain(|&(_, end)| end <= len);
+        self.pattern_ranges.retain_mut(|(start, end)| {
+            if *start >= len {
+                return false;
+            }
+            *end = (*end).min(len);
+            *start < *end
+        });
     }
 
     /// Record a semantic glyph run whose visual marks have already been
@@ -459,6 +465,19 @@ mod tests {
         assert_eq!(dl.commands.len(), 4);
         assert_eq!(dl.pattern_ranges(), &[(1, 3)]);
         assert!(!dl.is_in_pattern_range(4));
+
+        // Partial truncation inside `[1, 3)` preserves the surviving `[1, 2)` prefix.
+        dl.truncate_commands(2);
+        assert_eq!(dl.commands.len(), 2);
+        assert_eq!(dl.pattern_ranges(), &[(1, 2)]);
+        assert!(dl.is_in_pattern_range(1));
+        assert!(!dl.is_in_pattern_range(2));
+
+        // Truncating to the start of the range drops it completely.
+        dl.truncate_commands(1);
+        assert_eq!(dl.commands.len(), 1);
+        assert!(dl.pattern_ranges().is_empty());
+        assert!(!dl.is_in_pattern_range(1));
     }
 }
 

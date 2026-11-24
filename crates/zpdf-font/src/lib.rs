@@ -1966,7 +1966,7 @@ impl LoadedFont {
                 // `encoding` is indexed by absolute character code (the
                 // /Differences codes), unlike /Widths which is /FirstChar-based.
                 let glyph_name = encoding.get(char_code as usize)?;
-                if glyph_name == "g0" || glyph_name.is_empty() {
+                if glyph_name.is_empty() {
                     return None;
                 }
                 let stream = char_procs.get(glyph_name)?;
@@ -1988,7 +1988,7 @@ impl LoadedFont {
                 ..
             } => {
                 let glyph_name = encoding.get(char_code as usize)?;
-                if glyph_name == "g0" || glyph_name.is_empty() {
+                if glyph_name.is_empty() {
                     return None;
                 }
                 let stream = char_procs.get(glyph_name)?;
@@ -5550,6 +5550,46 @@ mod tests {
         // the font's 1000-unit advance scale here. The content interpreter
         // applies the divisor when converting this value to text space.
         assert!((font.simple_glyph_advance(33, 1) - 1400.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn type3_explicit_g0_char_proc_is_accessible_in_both_accessors() {
+        let mut char_procs = HashMap::new();
+        let g0_stream: Arc<[u8]> = Arc::from(b"500 0 d0 0 0 400 400 re f".as_slice());
+        char_procs.insert("g0".into(), Arc::clone(&g0_stream));
+        let mut encoding = vec![String::new(); 256];
+        encoding[65] = "g0".into();
+
+        let font_matrix = [0.001, 0.0, 0.0, 0.001, 0.0, 0.0];
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix,
+                char_procs,
+                encoding,
+                widths: vec![500.0],
+                first_char: 65,
+            },
+            "Type3G0".into(),
+            Vec::new(),
+            CidWidths::new(500.0),
+        );
+
+        let (stream, matrix) = font
+            .type3_glyph_stream(65)
+            .expect("explicitly encoded /g0 CharProc must resolve in type3_glyph_stream");
+        assert_eq!(stream, g0_stream.as_ref());
+        assert_eq!(matrix, font_matrix);
+
+        let (name, entry_stream, entry_matrix) = font
+            .type3_glyph_entry(65)
+            .expect("explicitly encoded /g0 CharProc must resolve in type3_glyph_entry");
+        assert_eq!(name, "g0");
+        assert_eq!(entry_stream.as_ref(), g0_stream.as_ref());
+        assert_eq!(entry_matrix, font_matrix);
+
+        // Unassigned slots (empty string) still return None.
+        assert!(font.type3_glyph_stream(66).is_none());
+        assert!(font.type3_glyph_entry(66).is_none());
     }
 
     /// `/Widths` starts at `/FirstChar`: a code below it has no entry and

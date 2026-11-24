@@ -210,6 +210,14 @@ pub struct ContentInterpreter<'a> {
         (ObjectId, Option<[u8; 3]>, (u32, u32)),
         std::sync::Arc<zpdf_display_list::InlineImage>,
     >,
+    /// Original decoded source dimensions of non-stencil Image XObjects seen
+    /// on the no-`ImageCache` Type 3 inline path, so footprint lookup uses the
+    /// source size rather than a previously downscaled cached copy.
+    type3_inline_xobject_sizes: HashMap<ObjectId, (u32, u32)>,
+    /// Footprints rejected for image budget on the no-`ImageCache` Type 3
+    /// XObject path, scoped per `(obj_id, footprint)` so a smaller footprint
+    /// of the same object can still be admitted if it fits the remaining budget.
+    type3_rejected_xobject_footprints: HashSet<(ObjectId, (u32, u32))>,
     /// Decoded RGBA bytes retained by `DrawInlineImage` commands emitted
     /// without an external `ImageCache`, charged against `max_image_cache_bytes`.
     type3_inline_fallback_bytes: u64,
@@ -896,8 +904,8 @@ fn command_matches_caller_fill(
         RenderCommand::PushClip { .. }
         | RenderCommand::PushClipStroke { .. }
         | RenderCommand::PopClip
-        | RenderCommand::PushBlendGroup { .. }
         | RenderCommand::PopBlendGroup => true,
+        RenderCommand::PushBlendGroup { mask, .. } => mask.is_none(),
     }
 }
 
@@ -1266,6 +1274,8 @@ impl<'a> ContentInterpreter<'a> {
             type3_inline_image_cache: HashMap::new(),
             type3_inline_fallback_cache: HashMap::new(),
             type3_inline_xobject_cache: HashMap::new(),
+            type3_inline_xobject_sizes: HashMap::new(),
+            type3_rejected_xobject_footprints: HashSet::new(),
             type3_inline_fallback_bytes: 0,
             state_floor: 0,
             text_sink: None,
@@ -4919,23 +4929,27 @@ impl<'a> ContentInterpreter<'a> {
                     self.emit_inline_image_draw(inline, transform);
                     return;
                 }
-            } else if let Some((width, height)) =
-                self.type3_inline_xobject_cache
-                    .iter()
-                    .find_map(|((id, color, _), img)| {
-                        (*id == obj_id && color.is_none()).then_some((img.width, img.height))
-                    })
-            {
+                if self
+                    .type3_rejected_xobject_footprints
+                    .contains(&(obj_id, footprint))
+                {
+                    self.type3_image_dropped = true;
+                    return;
+                }
+            } else if let Some(&(width, height)) = self.type3_inline_xobject_sizes.get(&obj_id) {
                 let footprint = self.image_footprint(&transform, width, height);
                 let key = (obj_id, None, footprint);
                 if let Some(inline) = self.type3_inline_xobject_cache.get(&key).cloned() {
                     self.emit_inline_image_draw(inline, transform);
                     return;
                 }
-            }
-            if self.rejected_image_objects.contains(&obj_id) {
-                self.type3_image_dropped = true;
-                return;
+                if self
+                    .type3_rejected_xobject_footprints
+                    .contains(&(obj_id, footprint))
+                {
+                    self.type3_image_dropped = true;
+                    return;
+                }
             }
         } else {
             // Fast path: this image object is already stored at the size this
@@ -5111,17 +5125,21 @@ impl<'a> ContentInterpreter<'a> {
 
         if embed_type3_inline {
             let is_mask = image.is_image_mask;
+            let (src_w, src_h) = (image.width, image.height);
             if is_mask {
-                self.image_mask_sizes
-                    .insert(obj_id, (image.width, image.height));
+                self.image_mask_sizes.insert(obj_id, (src_w, src_h));
+            } else {
+                self.type3_inline_xobject_sizes
+                    .insert(obj_id, (src_w, src_h));
             }
-            let footprint = self.image_footprint(&transform, image.width, image.height);
+            let footprint = self.image_footprint(&transform, src_w, src_h);
             let color_key = is_mask.then(|| self.fill_rgb_u8());
             if let Some(inline) = self.emit_draw_inline_image(image) {
                 self.type3_inline_xobject_cache
                     .insert((obj_id, color_key, footprint), inline);
             } else {
-                self.rejected_image_objects.insert(obj_id);
+                self.type3_rejected_xobject_footprints
+                    .insert((obj_id, footprint));
             }
             return;
         }
@@ -7387,6 +7405,7 @@ impl<'a> ContentInterpreter<'a> {
                 completed = false;
                 break;
             }
+            let mut verified_text = String::new();
             let glyph_verified = record_semantic
                 && self
                     .font_cache
@@ -7396,16 +7415,19 @@ impl<'a> ContentInterpreter<'a> {
                         font.append_verified_type3_unicode(
                             glyph.code,
                             glyph.code_len,
-                            &mut String::new(),
+                            &mut verified_text,
                         )
                     });
+            let is_whitespace_glyph = glyph_verified
+                && !verified_text.is_empty()
+                && verified_text.chars().all(char::is_whitespace);
             let Some((glyph_name, stream_bytes, font_matrix)) = self
                 .font_cache
                 .as_ref()
                 .and_then(|fc| fc.get(font_id))
                 .and_then(|font| font.type3_glyph_entry(glyph.glyph_id))
             else {
-                if glyph_verified {
+                if is_whitespace_glyph && !caller_no_marks {
                     let pos = self.display_list.commands.len();
                     match active_verified.as_mut() {
                         Some((_, end, seg_glyphs)) if *end == pos => seg_glyphs.push(*glyph),
@@ -7651,6 +7673,7 @@ impl<'a> ContentInterpreter<'a> {
                     .all(|cmd| command_matches_caller_fill(cmd, paint_color, alpha));
             if completed
                 && glyph_verified
+                && (emitted_paint || is_whitespace_glyph)
                 && !fully_hidden_by_oc
                 && !suppressed_by_none
                 && !glyph_image_dropped

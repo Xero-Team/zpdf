@@ -1777,13 +1777,18 @@ mod resource_tests {
             ));
             dl
         };
-        let mut renderer = WgpuRenderer::new();
-        let Ok(straight_page) =
-            renderer.render_display_list(&make_dl(straight.to_vec(), false), 1.0)
-        else {
-            // Headless environment without a GPU adapter: helper assertion above still ran.
-            return;
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(WgpuRenderError::NoAdapter) => {
+                // Headless environment without a compatible GPU adapter: helper assertion above still ran.
+                return;
+            }
+            Err(err) => panic!("unexpected GPU adapter initialization error: {err}"),
         };
+        let mut renderer = WgpuRenderer::new().with_context(ctx);
+        let straight_page = renderer
+            .render_display_list(&make_dl(straight.to_vec(), false), 1.0)
+            .expect("render straight-alpha inline image");
         let premul_page = renderer
             .render_display_list(&make_dl(premul.to_vec(), true), 1.0)
             .expect("render premultiplied inline image");
