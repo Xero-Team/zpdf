@@ -1692,16 +1692,18 @@ fn dense_translucent_multi_segment_nested_tiling_preserves_backdrop_above_cap() 
 #[test]
 fn overlapping_multiply_above_64_passes_preserves_both_copies() {
     let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_dark = b"<< /Type /ExtGState /BM /Darken >>".to_vec();
     let mut cell_stream = String::from("/GM gs 0.5 0.5 0.5 rg 0 0 8 2 re f\n");
-    // 32 additional Multiply marks in a separate horizontal strip y=[2..4]
-    // so the cell has 33 Multiply segments total (2 copies × 33 = 66 > 64).
-    for _ in 0..32 {
-        cell_stream.push_str("/GM gs 0.99 0.99 0.99 rg 0 2 4 2 re f\n");
+    // 32 additional alternating Multiply/Darken marks in a separate horizontal
+    // strip y=[2..4] so the cell has 33 non-coalesceable segments (2 copies × 33 = 66 > 64).
+    for k in 0..32 {
+        let gs = if k % 2 == 0 { "/GD" } else { "/GM" };
+        cell_stream.push_str(&format!("{gs} gs 0.99 0.99 0.99 rg 0 2 8 2 re f\n"));
     }
     let cell = stream_obj(
         "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
          /BBox [0 0 8 4] /XStep 4 /YStep 4 \
-         /Resources << /ExtGState << /GM 6 0 R >> >>",
+         /Resources << /ExtGState << /GM 6 0 R /GD 7 0 R >> >>",
         cell_stream.as_bytes(),
     );
     // Left [0..40]×[0..40] = 100 tiles (below cap); right [60..320]×[0..260] = 4,225 tiles (above cap).
@@ -1715,6 +1717,7 @@ fn overlapping_multiply_above_64_passes_preserves_both_copies() {
         content,                                       // 4
         cell,                                          // 5
         gs_mul,                                        // 6
+        gs_dark,                                       // 7
     ]);
     let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
 
@@ -1966,5 +1969,207 @@ fn small_patterned_mark_on_7000x7000_raster_fits_blend_budget() {
     assert!(
         stroke_mid.iter().all(|&c| (122..=134).contains(&c)),
         "50%-opacity black Multiply stroke on 7000x7000 raster must paint ~128, got {stroke_mid:?}"
+    );
+}
+
+/// Regression (ISO 32000-1 §11.6.7): a backdrop-dependent tiling pattern painted
+/// under an outer non-Normal blend mode (e.g. `/BM /Screen`) must evaluate its
+/// cell against the live page backdrop BEFORE applying the outer blend mode.
+/// Over opaque blue, white `Multiply` evaluates to blue, and `Screen(blue, blue)`
+/// stays blue (isolating would evaluate to white and screen the page to white).
+#[test]
+fn outer_screen_blend_mode_on_backdrop_dependent_tiling_evaluates_cell_first() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_screen = b"<< /Type /ExtGState /BM /Screen >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 10 10 re f",
+    );
+    // Left half [0..50]: opaque blue; right half [50..100]: opaque 50% gray.
+    // Paint patterned fill with `/BM /Screen` over [10..90]×[10..90].
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 50 100 re f\n\
+          0.5 0.5 0.5 rg 50 0 50 100 re f\n\
+          /GS gs /Pattern cs /P0 scn 10 10 80 80 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> /ExtGState << /GS 7 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+        gs_screen,                                     // 7
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+
+    let blue_in = px_on(&page, 100.0, 1.0, 25.5, 50.5);
+    assert_rgbish(
+        blue_in,
+        [0, 0, 255],
+        "white Multiply cell under outer /BM /Screen over blue must stay blue (not screen to white)",
+    );
+    let gray_in = px_on(&page, 100.0, 1.0, 70.5, 50.5);
+    assert!(
+        gray_in.iter().all(|&c| (186..=197).contains(&c)),
+        "white Multiply cell under outer /BM /Screen over 50% gray must screen(0.5,0.5)=~191, got {gray_in:?}"
+    );
+    let gray_out = px_on(&page, 100.0, 1.0, 95.5, 50.5);
+    assert!(
+        gray_out.iter().all(|&c| (124..=132).contains(&c)),
+        "50% gray outside the patterned fill must stay untouched (~128), got {gray_out:?}"
+    );
+}
+
+/// Regression: when a dense outer cell (>4,096 tiles) paints a nested path with
+/// a half-pixel edge using an inner pattern containing two opaque black
+/// `Multiply` marks, the nested path's anti-aliased edge coverage must be
+/// applied ONCE (~128 on white, matching a solid-black reference — NOT ~64).
+#[test]
+fn dense_nested_half_pixel_path_applies_inner_shape_coverage_once() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_dark = b"<< /Type /ExtGState /BM /Darken >>".to_vec();
+    // Non-coalesceable 2-segment inner pattern (Multiply + Darken black) so
+    // lifting exercises `OpacityGroup { mask: Some(mask_seg), steps }` directly.
+    let p_inner = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 2 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 8 0 R /GD 9 0 R >> >>",
+        b"/GM gs 0 0 0 rg 0 0 2 2 re f\n/GD gs 0 0 0 rg 0 0 2 2 re f",
+    );
+    // Outer cell 4×4 paints a rect with half-pixel left edge x = 1.5 using P_inner.
+    let p_outer = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4 \
+         /Resources << /Pattern << /PI 5 0 R >> >>",
+        b"/Pattern cs /PI scn 1.5 0 2 4 re f",
+    );
+    // Solid reference outer cell 4×4 painting the exact same half-pixel rect in solid black.
+    let p_ref = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4",
+        b"0 0 0 rg 1.5 0 2 4 re f",
+    );
+    // 260×260 with 4×4 outer cells = 65×65 = 4,225 tiles (>4,096 dense path).
+    let content = stream_obj(
+        "",
+        b"/Pattern cs /PO scn 0 0 260 260 re f\n\
+          /Pattern cs /PR scn 280 0 260 260 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 540 260] /Contents 4 0 R \
+          /Resources << /Pattern << /PO 6 0 R /PR 7 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        p_inner,                                       // 5
+        p_outer,                                       // 6
+        p_ref,                                         // 7
+        gs_mul,                                        // 8
+        gs_dark,                                       // 9
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+
+    // Sample at the half-covered column x mod 4 == 1 (e.g. x=121 for PO, x=401 for PR).
+    let pat_edge = px_on(&page, 260.0, 1.0, 121.2, 130.5);
+    let ref_edge = px_on(&page, 260.0, 1.0, 401.2, 130.5);
+    assert!(
+        (120..=136).contains(&ref_edge[0]),
+        "sanity check: solid nested edge must be ~128, got {ref_edge:?}"
+    );
+    assert!(
+        (pat_edge[0] as i32 - ref_edge[0] as i32).abs() <= 3,
+        "dense nested half-pixel edge must match solid ref ({ref_edge:?}, NOT ~64), got {pat_edge:?}"
+    );
+}
+
+/// Regression: on a dense grid (>4,096 tiles), an overlapping cell spanning 6
+/// horizontal steps with 205 spanning white `Multiply` marks (or 175
+/// non-coalesceable alternating `Multiply`/`Darken` white marks exceeding the
+/// 1,024 per-copy pass budget) followed by a black detail confined to the first
+/// step must NOT silently drop the trailing black detail and must still
+/// preserve the page backdrop under the white marks.
+#[test]
+fn dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_dark = b"<< /Type /ExtGState /BM /Darken >>".to_vec();
+
+    // Cell A: 205 spanning white Multiply marks + trailing black detail in step 0.
+    let mut cell_mul_stream = String::new();
+    for _ in 0..205 {
+        cell_mul_stream.push_str("/GM gs 1 1 1 rg 0 0 24 4 re f\n");
+    }
+    cell_mul_stream.push_str("0 0 0 rg 0 0 2 4 re f\n");
+    let cell_mul = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 24 4] /XStep 4 /YStep 4 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        cell_mul_stream.as_bytes(),
+    );
+
+    // Cell B: 175 non-coalesceable alternating Multiply/Darken white marks across
+    // 6 steps (6 × 175 = 1,050 > 1,024 pass budget) + trailing black detail in
+    // step 0, on a 2×2 step (132×132 fill = 66×66 = 4,356 > 4,096 dense tiles).
+    let mut cell_alt_stream = String::new();
+    for k in 0..175 {
+        let gs = if k % 2 == 0 { "/GM" } else { "/GD" };
+        cell_alt_stream.push_str(&format!("{gs} gs 1 1 1 rg 0 0 12 2 re f\n"));
+    }
+    cell_alt_stream.push_str("/GM gs 0 0 0 rg 0 0 1 2 re f\n");
+    let cell_alt = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 12 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 7 0 R /GD 8 0 R >> >>",
+        cell_alt_stream.as_bytes(),
+    );
+
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 420 260 re f\n\
+          /Pattern cs /PM scn 0 0 260 260 re f\n\
+          /Pattern cs /PA scn 280 0 132 132 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 260] /Contents 4 0 R \
+          /Resources << /Pattern << /PM 5 0 R /PA 6 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell_mul,                                      // 5
+        cell_alt,                                      // 6
+        gs_mul,                                        // 7
+        gs_dark,                                       // 8
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+
+    // Cell A (205 Multiply): x mod 4 == 1 is black detail, x mod 4 == 3 stays blue.
+    assert_rgbish(
+        px_on(&page, 260.0, 1.0, 121.2, 130.5),
+        [0, 0, 0],
+        "Cell A trailing black detail past 205 white Multiply marks must remain visible",
+    );
+    assert_rgbish(
+        px_on(&page, 260.0, 1.0, 123.2, 130.5),
+        [0, 0, 255],
+        "Cell A white Multiply marks must preserve blue backdrop",
+    );
+
+    // Cell B (175 alternating Multiply/Darken > 1,024 passes): x mod 2 == 0 is black, x mod 2 == 1 stays blue.
+    assert_rgbish(
+        px_on(&page, 260.0, 1.0, 340.2, 66.5),
+        [0, 0, 0],
+        "Cell B trailing black detail past 1,024-pass overlap budget must remain visible",
+    );
+    assert_rgbish(
+        px_on(&page, 260.0, 1.0, 341.2, 66.5),
+        [0, 0, 255],
+        "Cell B white Multiply/Darken marks in bounded fallback must preserve blue backdrop",
     );
 }

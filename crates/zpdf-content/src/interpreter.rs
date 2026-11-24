@@ -4163,27 +4163,26 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
         if self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some() {
-            // A backdrop-dependent tiling pattern under a Normal-mode outer
-            // soft mask must evaluate against the live page backdrop BEFORE the
-            // object's soft mask is applied (ISO 32000-1 §11.6.7), so open a
-            // non-isolated group instead of isolating from the page backdrop.
-            let non_isolated_tiling = self.current.blend_mode == BlendMode::Normal
-                && self.current.soft_mask.is_some()
-                && match &cmd {
-                    RenderCommand::FillPath {
-                        paint: Paint::Tiling(t),
-                        ..
-                    }
-                    | RenderCommand::StrokePath {
-                        paint: Paint::Tiling(t),
-                        ..
-                    } => t.is_backdrop_dependent(),
-                    RenderCommand::DrawGlyphRun(run) => match &run.paint {
-                        Paint::Tiling(t) => t.is_backdrop_dependent(),
-                        _ => false,
-                    },
+            // A backdrop-dependent tiling pattern painted under an outer blend
+            // mode and/or soft mask must evaluate its cell against the live page
+            // backdrop BEFORE the outer blend mode and soft mask are applied
+            // (ISO 32000-1 §11.6.7), so open a non-isolated group instead of
+            // isolating from the page backdrop.
+            let non_isolated_tiling = match &cmd {
+                RenderCommand::FillPath {
+                    paint: Paint::Tiling(t),
+                    ..
+                }
+                | RenderCommand::StrokePath {
+                    paint: Paint::Tiling(t),
+                    ..
+                } => t.is_backdrop_dependent(),
+                RenderCommand::DrawGlyphRun(run) => match &run.paint {
+                    Paint::Tiling(t) => t.is_backdrop_dependent(),
                     _ => false,
-                };
+                },
+                _ => false,
+            };
             self.display_list.push(RenderCommand::PushBlendGroup {
                 blend_mode: self.current.blend_mode,
                 // A single solid/backdrop-independent object carrying a blend

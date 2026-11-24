@@ -266,9 +266,15 @@ pub enum TilingBlendStep {
     Segment(TilingBlendSegment),
     /// Evaluate `steps` at full outer opacity (`1.0`) against a copy of the
     /// live destination backdrop, then mix the finished result back into the
-    /// destination with constant `alpha` (ISO 32000-1 §11.4.5 / §11.6.7).
+    /// destination with constant `alpha` (and optional per-pixel `mask`
+    /// coverage from a lifted nested shape) ONCE (ISO 32000-1 §11.4.5 / §11.6.7).
     OpacityGroup {
         alpha: f32,
+        /// Optional coverage mask segment (opaque white shape under active clips)
+        /// for a lifted multi-step nested tiling paint, ensuring the nested
+        /// shape's anti-aliased edge coverage is applied once across all child
+        /// steps rather than once per segment.
+        mask: Option<TilingBlendSegment>,
         steps: Vec<TilingBlendStep>,
     },
 }
@@ -290,8 +296,38 @@ impl TilingBlendStep {
     pub fn any_intersects_period(steps: &[Self], tiling: &TilingPattern, di: i64, dj: i64) -> bool {
         steps.iter().any(|s| match s {
             Self::Segment(seg) => seg.intersects_period(tiling, di, dj),
-            Self::OpacityGroup { steps, .. } => Self::any_intersects_period(steps, tiling, di, dj),
+            Self::OpacityGroup { mask, steps, .. } => {
+                mask.as_ref()
+                    .is_none_or(|m| m.intersects_period(tiling, di, dj))
+                    && Self::any_intersects_period(steps, tiling, di, dj)
+            }
         })
+    }
+
+    /// Count how many leaf [`TilingBlendSegment`] passes in `steps` intersect
+    /// `tiling`'s fundamental period under neighbor shift `(di, dj)`.
+    pub fn count_intersecting_passes(
+        steps: &[Self],
+        tiling: &TilingPattern,
+        di: i64,
+        dj: i64,
+    ) -> usize {
+        steps
+            .iter()
+            .map(|s| match s {
+                Self::Segment(seg) => usize::from(seg.intersects_period(tiling, di, dj)),
+                Self::OpacityGroup { mask, steps, .. } => {
+                    if mask
+                        .as_ref()
+                        .is_some_and(|m| !m.intersects_period(tiling, di, dj))
+                    {
+                        0
+                    } else {
+                        Self::count_intersecting_passes(steps, tiling, di, dj)
+                    }
+                }
+            })
+            .sum()
     }
 
     /// If every leaf segment in `steps` shares the same [`BlendMode`] and there
@@ -499,9 +535,11 @@ impl TilingPattern {
         }
         let page_rect = self.commands.page_rect;
         let bbox = self.bbox;
+        type AssocRun = (BlendMode, Vec<Vec<RenderCommand>>, Option<Rect>);
         let mut steps: Vec<TilingBlendStep> = Vec::new();
         let mut clip_stack: Vec<RenderCommand> = initial_clips.to_vec();
         let mut cur_normal: Vec<RenderCommand> = Vec::new();
+        let mut cur_assoc: Option<AssocRun> = None;
         let mut passthrough_pops: Vec<usize> = Vec::new();
 
         let make_segment = |blend_mode: BlendMode,
@@ -524,11 +562,75 @@ impl TilingPattern {
             })
         };
 
+        let flush_assoc = |cur_assoc: &mut Option<AssocRun>,
+                           steps: &mut Vec<TilingBlendStep>,
+                           next_seg_id: &mut usize|
+         -> Option<()> {
+            let Some((mode, mut items, bounds)) = cur_assoc.take() else {
+                return Some(());
+            };
+            if items.is_empty() {
+                return Some(());
+            }
+            if *next_seg_id > MAX_SEGMENTS {
+                return None;
+            }
+            let segment_id = *next_seg_id;
+            *next_seg_id += 1;
+            let seg_cmds = if items.len() == 1 {
+                items.pop().unwrap()
+            } else {
+                // Porter-Duff premultiplied Multiply and Screen are strictly
+                // associative over ALL colors and alphas starting from
+                // transparent (0,0,0,0), so consecutive runs coalesce into one
+                // backdrop-independent tile segment wrapped in an isolated
+                // Normal group.
+                let mut v = Vec::new();
+                v.push(RenderCommand::PushBlendGroup {
+                    blend_mode: BlendMode::Normal,
+                    isolated: true,
+                    knockout: false,
+                    bounds: bbox,
+                    alpha: 1.0,
+                    mask: None,
+                });
+                let mut iter = items.into_iter();
+                if let Some(first) = iter.next() {
+                    v.extend(first);
+                }
+                for item in iter {
+                    v.push(RenderCommand::PushBlendGroup {
+                        blend_mode: mode,
+                        isolated: true,
+                        knockout: false,
+                        bounds: bbox,
+                        alpha: 1.0,
+                        mask: None,
+                    });
+                    v.extend(item);
+                    v.push(RenderCommand::PopBlendGroup);
+                }
+                v.push(RenderCommand::PopBlendGroup);
+                v
+            };
+            let mut dl = DisplayList::new(page_rect);
+            dl.commands = seg_cmds;
+            steps.push(TilingBlendStep::Segment(TilingBlendSegment {
+                blend_mode: mode,
+                commands: std::sync::Arc::new(dl),
+                segment_id,
+                bounds,
+            }));
+            Some(())
+        };
+
         let flush_normal = |cur_normal: &mut Vec<RenderCommand>,
+                            cur_assoc: &mut Option<AssocRun>,
                             clip_stack: &[RenderCommand],
                             steps: &mut Vec<TilingBlendStep>,
                             next_seg_id: &mut usize|
          -> Option<()> {
+            flush_assoc(cur_assoc, steps, next_seg_id)?;
             if cur_normal.is_empty() {
                 return Some(());
             }
@@ -558,6 +660,7 @@ impl TilingPattern {
             clip_stack: &[RenderCommand],
             page_rect: Rect,
             bbox: Rect,
+            bounds_override: Option<Option<Rect>>,
             next_seg_id: &mut usize,
             build_cmd: &F,
         ) -> Option<Vec<TilingBlendStep>>
@@ -582,7 +685,8 @@ impl TilingPattern {
                         for _ in 0..clip_stack.len() {
                             seg_cmds.push(RenderCommand::PopClip);
                         }
-                        let bounds = commands_ink_bounds(&seg_cmds, bbox);
+                        let bounds =
+                            bounds_override.unwrap_or_else(|| commands_ink_bounds(&seg_cmds, bbox));
                         let mut dl = DisplayList::new(page_rect);
                         dl.commands = seg_cmds;
                         out.push(TilingBlendStep::Segment(TilingBlendSegment {
@@ -592,7 +696,36 @@ impl TilingPattern {
                             bounds,
                         }));
                     }
-                    TilingBlendStep::OpacityGroup { alpha, steps } => {
+                    TilingBlendStep::OpacityGroup { alpha, mask, steps } => {
+                        let lifted_mask = match mask {
+                            Some(m) => {
+                                if *next_seg_id > MAX_SEGMENTS {
+                                    return None;
+                                }
+                                let segment_id = *next_seg_id;
+                                *next_seg_id += 1;
+                                let mut lifted = inner.clone();
+                                lifted.commands = m.commands;
+                                let cmd = build_cmd(std::sync::Arc::new(lifted), 1.0);
+                                let mut seg_cmds = Vec::with_capacity(clip_stack.len() * 2 + 1);
+                                seg_cmds.extend(clip_stack.iter().cloned());
+                                seg_cmds.push(cmd);
+                                for _ in 0..clip_stack.len() {
+                                    seg_cmds.push(RenderCommand::PopClip);
+                                }
+                                let bounds = bounds_override
+                                    .unwrap_or_else(|| commands_ink_bounds(&seg_cmds, bbox));
+                                let mut dl = DisplayList::new(page_rect);
+                                dl.commands = seg_cmds;
+                                Some(TilingBlendSegment {
+                                    blend_mode: BlendMode::Normal,
+                                    commands: std::sync::Arc::new(dl),
+                                    segment_id,
+                                    bounds,
+                                })
+                            }
+                            None => None,
+                        };
                         let lifted_children = lift_inner_steps(
                             inner,
                             steps,
@@ -600,11 +733,13 @@ impl TilingPattern {
                             clip_stack,
                             page_rect,
                             bbox,
+                            bounds_override,
                             next_seg_id,
                             build_cmd,
                         )?;
                         out.push(TilingBlendStep::OpacityGroup {
                             alpha,
+                            mask: lifted_mask,
                             steps: lifted_children,
                         });
                     }
@@ -612,6 +747,18 @@ impl TilingPattern {
             }
             Some(out)
         }
+
+        let rect_cover_path = |r: Rect| -> Path {
+            let r = r.normalize();
+            let pad = 1.0;
+            let mut p = Path::new();
+            p.move_to(zpdf_core::Point::new(r.x0 - pad, r.y0 - pad));
+            p.line_to(zpdf_core::Point::new(r.x1 + pad, r.y0 - pad));
+            p.line_to(zpdf_core::Point::new(r.x1 + pad, r.y1 + pad));
+            p.line_to(zpdf_core::Point::new(r.x0 - pad, r.y1 + pad));
+            p.close();
+            p
+        };
 
         let mut idx = 0usize;
         while idx < cmds.len() {
@@ -661,78 +808,91 @@ impl TilingPattern {
                                 memo,
                                 &mut inner_seg_id,
                             )?;
-                            let needs_opacity_group = *alpha < 1.0
-                                && (inner_steps.len() > 1
-                                    || matches!(
-                                        inner_steps.first(),
-                                        Some(TilingBlendStep::OpacityGroup { .. })
-                                    ));
-                            let leaf_alpha = if needs_opacity_group { 1.0 } else { *alpha };
-                            let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
-                                RenderCommand::FillPath {
-                                    path: path.clone(),
-                                    rule: *rule,
-                                    paint: Paint::Tiling(pat),
-                                    alpha: a,
-                                    overprint: *overprint,
-                                }
-                            };
-                            if needs_opacity_group {
+                            let multi_step = inner_steps.len() > 1
+                                || matches!(
+                                    inner_steps.first(),
+                                    Some(TilingBlendStep::OpacityGroup { .. })
+                                );
+                            if multi_step {
                                 flush_normal(
                                     &mut cur_normal,
+                                    &mut cur_assoc,
                                     &clip_stack,
                                     &mut steps,
                                     next_seg_id,
                                 )?;
+                                // Capture the nested fill path + active clip coverage ONCE in
+                                // `mask_seg`, and lift every child step onto a full-coverage
+                                // rect so anti-aliased nested path edges are never blended
+                                // multiple times across child segments.
+                                let mask_cmd = RenderCommand::FillPath {
+                                    path: path.clone(),
+                                    rule: *rule,
+                                    paint: Paint::Solid(Color::white()),
+                                    alpha: 1.0,
+                                    overprint: None,
+                                };
+                                let mask_seg = make_segment(
+                                    BlendMode::Normal,
+                                    wrap_cmd_in_clips(mask_cmd, &clip_stack),
+                                    next_seg_id,
+                                )?;
+                                let cover_path = rect_cover_path(mask_seg.bounds.unwrap_or(bbox));
+                                let build_cover = |pat: std::sync::Arc<TilingPattern>, a: f32| {
+                                    RenderCommand::FillPath {
+                                        path: cover_path.clone(),
+                                        rule: FillRule::NonZero,
+                                        paint: Paint::Tiling(pat),
+                                        alpha: a,
+                                        overprint: *overprint,
+                                    }
+                                };
                                 let lifted = lift_inner_steps(
                                     inner,
                                     inner_steps,
-                                    leaf_alpha,
-                                    &clip_stack,
+                                    1.0,
+                                    &[],
                                     page_rect,
                                     bbox,
+                                    Some(mask_seg.bounds),
                                     next_seg_id,
-                                    &build,
+                                    &build_cover,
                                 )?;
                                 steps.push(TilingBlendStep::OpacityGroup {
                                     alpha: *alpha,
+                                    mask: Some(mask_seg),
                                     steps: lifted,
                                 });
                             } else {
+                                let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
+                                    RenderCommand::FillPath {
+                                        path: path.clone(),
+                                        rule: *rule,
+                                        paint: Paint::Tiling(pat),
+                                        alpha: a,
+                                        overprint: *overprint,
+                                    }
+                                };
                                 let lifted = lift_inner_steps(
                                     inner,
                                     inner_steps,
-                                    leaf_alpha,
+                                    *alpha,
                                     &clip_stack,
                                     page_rect,
                                     bbox,
+                                    None,
                                     next_seg_id,
                                     &build,
                                 )?;
                                 for step in lifted {
-                                    match step {
-                                        TilingBlendStep::Segment(seg)
-                                            if seg.blend_mode == BlendMode::Normal =>
-                                        {
-                                            // Keep consecutive Normal work coalesced.
-                                            flush_normal(
-                                                &mut cur_normal,
-                                                &clip_stack,
-                                                &mut steps,
-                                                next_seg_id,
-                                            )?;
-                                            steps.push(TilingBlendStep::Segment(seg));
-                                        }
-                                        other => {
-                                            flush_normal(
-                                                &mut cur_normal,
-                                                &clip_stack,
-                                                &mut steps,
-                                                next_seg_id,
-                                            )?;
-                                            steps.push(other);
-                                        }
-                                    }
+                                    flush_normal(
+                                        &mut cur_normal,
+                                        &mut cur_assoc,
+                                        &clip_stack,
+                                        &mut steps,
+                                        next_seg_id,
+                                    )?;
+                                    steps.push(step);
                                 }
                             }
                             idx += 1;
@@ -740,6 +900,7 @@ impl TilingPattern {
                         }
                     }
                     if cur_normal.is_empty() {
+                        flush_assoc(&mut cur_assoc, &mut steps, next_seg_id)?;
                         cur_normal.extend(clip_stack.iter().cloned());
                     }
                     cur_normal.push(cmds[idx].clone());
@@ -771,39 +932,78 @@ impl TilingPattern {
                                 memo,
                                 &mut inner_seg_id,
                             )?;
-                            let needs_opacity_group = *alpha < 1.0
-                                && (inner_steps.len() > 1
-                                    || matches!(
-                                        inner_steps.first(),
-                                        Some(TilingBlendStep::OpacityGroup { .. })
-                                    ));
-                            let leaf_alpha = if needs_opacity_group { 1.0 } else { *alpha };
-                            let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
-                                RenderCommand::StrokePath {
+                            let multi_step = inner_steps.len() > 1
+                                || matches!(
+                                    inner_steps.first(),
+                                    Some(TilingBlendStep::OpacityGroup { .. })
+                                );
+                            flush_normal(
+                                &mut cur_normal,
+                                &mut cur_assoc,
+                                &clip_stack,
+                                &mut steps,
+                                next_seg_id,
+                            )?;
+                            if multi_step {
+                                let mask_cmd = RenderCommand::StrokePath {
                                     path: path.clone(),
                                     style: style.clone(),
-                                    paint: Paint::Tiling(pat),
-                                    alpha: a,
-                                    overprint: *overprint,
-                                }
-                            };
-                            flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
-                            let lifted = lift_inner_steps(
-                                inner,
-                                inner_steps,
-                                leaf_alpha,
-                                &clip_stack,
-                                page_rect,
-                                bbox,
-                                next_seg_id,
-                                &build,
-                            )?;
-                            if needs_opacity_group {
+                                    paint: Paint::Solid(Color::white()),
+                                    alpha: 1.0,
+                                    overprint: None,
+                                };
+                                let mask_seg = make_segment(
+                                    BlendMode::Normal,
+                                    wrap_cmd_in_clips(mask_cmd, &clip_stack),
+                                    next_seg_id,
+                                )?;
+                                let cover_path = rect_cover_path(mask_seg.bounds.unwrap_or(bbox));
+                                let build_cover = |pat: std::sync::Arc<TilingPattern>, a: f32| {
+                                    RenderCommand::FillPath {
+                                        path: cover_path.clone(),
+                                        rule: FillRule::NonZero,
+                                        paint: Paint::Tiling(pat),
+                                        alpha: a,
+                                        overprint: *overprint,
+                                    }
+                                };
+                                let lifted = lift_inner_steps(
+                                    inner,
+                                    inner_steps,
+                                    1.0,
+                                    &[],
+                                    page_rect,
+                                    bbox,
+                                    Some(mask_seg.bounds),
+                                    next_seg_id,
+                                    &build_cover,
+                                )?;
                                 steps.push(TilingBlendStep::OpacityGroup {
                                     alpha: *alpha,
+                                    mask: Some(mask_seg),
                                     steps: lifted,
                                 });
                             } else {
+                                let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
+                                    RenderCommand::StrokePath {
+                                        path: path.clone(),
+                                        style: style.clone(),
+                                        paint: Paint::Tiling(pat),
+                                        alpha: a,
+                                        overprint: *overprint,
+                                    }
+                                };
+                                let lifted = lift_inner_steps(
+                                    inner,
+                                    inner_steps,
+                                    *alpha,
+                                    &clip_stack,
+                                    page_rect,
+                                    bbox,
+                                    None,
+                                    next_seg_id,
+                                    &build,
+                                )?;
                                 steps.extend(lifted);
                             }
                             idx += 1;
@@ -811,6 +1011,7 @@ impl TilingPattern {
                         }
                     }
                     if cur_normal.is_empty() {
+                        flush_assoc(&mut cur_assoc, &mut steps, next_seg_id)?;
                         cur_normal.extend(clip_stack.iter().cloned());
                     }
                     cur_normal.push(cmds[idx].clone());
@@ -836,36 +1037,75 @@ impl TilingPattern {
                                 memo,
                                 &mut inner_seg_id,
                             )?;
-                            let needs_opacity_group = run.alpha < 1.0
-                                && (inner_steps.len() > 1
-                                    || matches!(
-                                        inner_steps.first(),
-                                        Some(TilingBlendStep::OpacityGroup { .. })
-                                    ));
-                            let leaf_alpha = if needs_opacity_group { 1.0 } else { run.alpha };
-                            let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
-                                let mut lifted_run = run.clone();
-                                lifted_run.paint = Paint::Tiling(pat);
-                                lifted_run.alpha = a;
-                                RenderCommand::DrawGlyphRun(lifted_run)
-                            };
-                            flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
-                            let lifted = lift_inner_steps(
-                                inner,
-                                inner_steps,
-                                leaf_alpha,
+                            let multi_step = inner_steps.len() > 1
+                                || matches!(
+                                    inner_steps.first(),
+                                    Some(TilingBlendStep::OpacityGroup { .. })
+                                );
+                            flush_normal(
+                                &mut cur_normal,
+                                &mut cur_assoc,
                                 &clip_stack,
-                                page_rect,
-                                bbox,
+                                &mut steps,
                                 next_seg_id,
-                                &build,
                             )?;
-                            if needs_opacity_group {
+                            if multi_step {
+                                let mut mask_run = run.clone();
+                                mask_run.paint = Paint::Solid(Color::white());
+                                mask_run.alpha = 1.0;
+                                mask_run.overprint = None;
+                                let mask_seg = make_segment(
+                                    BlendMode::Normal,
+                                    wrap_cmd_in_clips(
+                                        RenderCommand::DrawGlyphRun(mask_run),
+                                        &clip_stack,
+                                    ),
+                                    next_seg_id,
+                                )?;
+                                let cover_path = rect_cover_path(mask_seg.bounds.unwrap_or(bbox));
+                                let build_cover = |pat: std::sync::Arc<TilingPattern>, a: f32| {
+                                    RenderCommand::FillPath {
+                                        path: cover_path.clone(),
+                                        rule: FillRule::NonZero,
+                                        paint: Paint::Tiling(pat),
+                                        alpha: a,
+                                        overprint: run.overprint,
+                                    }
+                                };
+                                let lifted = lift_inner_steps(
+                                    inner,
+                                    inner_steps,
+                                    1.0,
+                                    &[],
+                                    page_rect,
+                                    bbox,
+                                    Some(mask_seg.bounds),
+                                    next_seg_id,
+                                    &build_cover,
+                                )?;
                                 steps.push(TilingBlendStep::OpacityGroup {
                                     alpha: run.alpha,
+                                    mask: Some(mask_seg),
                                     steps: lifted,
                                 });
                             } else {
+                                let build = |pat: std::sync::Arc<TilingPattern>, a: f32| {
+                                    let mut lifted_run = run.clone();
+                                    lifted_run.paint = Paint::Tiling(pat);
+                                    lifted_run.alpha = a;
+                                    RenderCommand::DrawGlyphRun(lifted_run)
+                                };
+                                let lifted = lift_inner_steps(
+                                    inner,
+                                    inner_steps,
+                                    run.alpha,
+                                    &clip_stack,
+                                    page_rect,
+                                    bbox,
+                                    None,
+                                    next_seg_id,
+                                    &build,
+                                )?;
                                 steps.extend(lifted);
                             }
                             idx += 1;
@@ -873,6 +1113,7 @@ impl TilingPattern {
                         }
                     }
                     if cur_normal.is_empty() {
+                        flush_assoc(&mut cur_assoc, &mut steps, next_seg_id)?;
                         cur_normal.extend(clip_stack.iter().cloned());
                     }
                     cur_normal.push(cmds[idx].clone());
@@ -880,6 +1121,7 @@ impl TilingPattern {
                 }
                 RenderCommand::DrawImage(_) => {
                     if cur_normal.is_empty() {
+                        flush_assoc(&mut cur_assoc, &mut steps, next_seg_id)?;
                         cur_normal.extend(clip_stack.iter().cloned());
                     }
                     cur_normal.push(cmds[idx].clone());
@@ -899,6 +1141,7 @@ impl TilingPattern {
                     if *blend_mode == BlendMode::Normal {
                         if *isolated || !inner_backdrop {
                             if cur_normal.is_empty() {
+                                flush_assoc(&mut cur_assoc, &mut steps, next_seg_id)?;
                                 cur_normal.extend(clip_stack.iter().cloned());
                             }
                             cur_normal.extend(cmds[idx..=end].iter().cloned());
@@ -910,7 +1153,13 @@ impl TilingPattern {
                         } else if !*knockout && mask.is_none() {
                             // Non-isolated constant-opacity group: keep live backdrop
                             // across its decomposed steps and apply `alpha` once.
-                            flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
+                            flush_normal(
+                                &mut cur_normal,
+                                &mut cur_assoc,
+                                &clip_stack,
+                                &mut steps,
+                                next_seg_id,
+                            )?;
                             let inner_steps = self.blend_steps_for_slice(
                                 inner,
                                 &clip_stack,
@@ -920,6 +1169,7 @@ impl TilingPattern {
                             )?;
                             steps.push(TilingBlendStep::OpacityGroup {
                                 alpha: *alpha,
+                                mask: None,
                                 steps: inner_steps,
                             });
                             idx = end + 1;
@@ -930,7 +1180,26 @@ impl TilingPattern {
                         if !*isolated && inner_backdrop {
                             return None;
                         }
-                        flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
+                        let is_assoc =
+                            matches!(*blend_mode, BlendMode::Multiply | BlendMode::Screen);
+                        if !is_assoc
+                            || cur_assoc
+                                .as_ref()
+                                .is_some_and(|(m, _, _)| *m != *blend_mode)
+                        {
+                            flush_assoc(&mut cur_assoc, &mut steps, next_seg_id)?;
+                        }
+                        if !cur_normal.is_empty() {
+                            for _ in 0..clip_stack.len() {
+                                cur_normal.push(RenderCommand::PopClip);
+                            }
+                            let seg = make_segment(
+                                BlendMode::Normal,
+                                std::mem::take(&mut cur_normal),
+                                next_seg_id,
+                            )?;
+                            steps.push(TilingBlendStep::Segment(seg));
+                        }
                         let needs_wrapper = *alpha < 1.0 || mask.is_some() || *knockout;
                         let seg_cmds = if needs_wrapper {
                             let mut v = Vec::with_capacity(clip_stack.len() * 2 + inner.len() + 2);
@@ -960,8 +1229,29 @@ impl TilingPattern {
                             }
                             v
                         };
-                        let seg = make_segment(*blend_mode, seg_cmds, next_seg_id)?;
-                        steps.push(TilingBlendStep::Segment(seg));
+                        if is_assoc {
+                            let item_bounds = commands_ink_bounds(&seg_cmds, bbox);
+                            match cur_assoc.as_mut() {
+                                Some((_, items, acc_bounds)) => {
+                                    items.push(seg_cmds);
+                                    *acc_bounds = match (*acc_bounds, item_bounds) {
+                                        (Some(a), Some(b)) => Some(Rect::new(
+                                            a.x0.min(b.x0),
+                                            a.y0.min(b.y0),
+                                            a.x1.max(b.x1),
+                                            a.y1.max(b.y1),
+                                        )),
+                                        (a, b) => a.or(b),
+                                    };
+                                }
+                                None => {
+                                    cur_assoc = Some((*blend_mode, vec![seg_cmds], item_bounds));
+                                }
+                            }
+                        } else {
+                            let seg = make_segment(*blend_mode, seg_cmds, next_seg_id)?;
+                            steps.push(TilingBlendStep::Segment(seg));
+                        }
                         idx = end + 1;
                     }
                 }
@@ -970,7 +1260,13 @@ impl TilingPattern {
                 }
             }
         }
-        flush_normal(&mut cur_normal, &clip_stack, &mut steps, next_seg_id)?;
+        flush_normal(
+            &mut cur_normal,
+            &mut cur_assoc,
+            &clip_stack,
+            &mut steps,
+            next_seg_id,
+        )?;
         Some(steps)
     }
 }
@@ -1795,10 +2091,13 @@ mod tiling_backdrop_tests {
 
     #[test]
     fn blend_steps_wraps_translucent_multi_segment_inner_tiling_in_opacity_group() {
+        // Two non-coalesceable segments (Multiply + Darken) inside `inner` so
+        // lifting must wrap them in a single OpacityGroup carrying the nested
+        // shape mask once.
         let mut inner_cmds = Vec::new();
-        for _ in 0..2 {
+        for mode in [BlendMode::Multiply, BlendMode::Darken] {
             inner_cmds.push(RenderCommand::PushBlendGroup {
-                blend_mode: BlendMode::Multiply,
+                blend_mode: mode,
                 isolated: true,
                 knockout: false,
                 bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
@@ -1824,24 +2123,69 @@ mod tiling_backdrop_tests {
         }]);
         let steps = outer
             .blend_steps()
-            .expect("translucent multi-segment inner Multiply must decompose into OpacityGroup");
+            .expect("translucent multi-segment inner tiling must decompose into OpacityGroup");
         assert_eq!(steps.len(), 1);
         match &steps[0] {
-            TilingBlendStep::OpacityGroup { alpha, steps } => {
+            TilingBlendStep::OpacityGroup { alpha, mask, steps } => {
                 assert!((*alpha - 0.5).abs() < 1e-6);
+                assert!(mask.is_some(), "nested shape mask must be captured once");
                 assert_eq!(steps.len(), 2);
-                for s in steps {
-                    assert!(matches!(
-                        s,
-                        TilingBlendStep::Segment(TilingBlendSegment {
-                            blend_mode: BlendMode::Multiply,
-                            ..
-                        })
-                    ));
-                }
+                assert!(matches!(
+                    &steps[0],
+                    TilingBlendStep::Segment(TilingBlendSegment {
+                        blend_mode: BlendMode::Multiply,
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    &steps[1],
+                    TilingBlendStep::Segment(TilingBlendSegment {
+                        blend_mode: BlendMode::Darken,
+                        ..
+                    })
+                ));
             }
             other => panic!("expected OpacityGroup, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn blend_steps_coalesces_consecutive_multiply_and_screen_marks() {
+        let mut cmds = Vec::new();
+        for _ in 0..205 {
+            cmds.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cmds.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cmds.push(RenderCommand::PopBlendGroup);
+        }
+        let pat = tiling_with(cmds);
+        let segs = pat
+            .blend_segments()
+            .expect("205 consecutive Multiply marks must coalesce");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].blend_mode, BlendMode::Multiply);
+        // The coalesced segment commands must remain backdrop-independent.
+        assert!(!TilingPattern {
+            commands: Arc::clone(&segs[0].commands),
+            bbox: pat.bbox,
+            x_step: pat.x_step,
+            y_step: pat.y_step,
+            matrix: pat.matrix,
+            tiling_type: pat.tiling_type,
+        }
+        .is_backdrop_dependent());
     }
 
     #[test]
@@ -1864,9 +2208,10 @@ mod tiling_backdrop_tests {
             overprint: None,
         });
         dl.push(RenderCommand::PopBlendGroup);
-        // Mark 2 occupies only [0..3] × [2..4] (intersects di=0, NOT di=-1).
+        // Mark 2 (Darken, non-coalesceable with Multiply) occupies only [0..3] × [2..4]
+        // (intersects di=0, NOT di=-1).
         dl.push(RenderCommand::PushBlendGroup {
-            blend_mode: BlendMode::Multiply,
+            blend_mode: BlendMode::Darken,
             isolated: true,
             knockout: false,
             bounds: Rect::new(0.0, 0.0, 8.0, 4.0),

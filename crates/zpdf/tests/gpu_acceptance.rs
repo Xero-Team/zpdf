@@ -1489,14 +1489,16 @@ fn gpu_dense_translucent_multi_segment_nested_tiling_preserves_backdrop() {
 #[test]
 fn gpu_overlapping_multiply_above_64_passes_preserves_both_copies() {
     let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_dark = b"<< /Type /ExtGState /BM /Darken >>".to_vec();
     let mut cell_stream = String::from("/GM gs 0.5 0.5 0.5 rg 0 0 8 2 re f\n");
-    for _ in 0..32 {
-        cell_stream.push_str("/GM gs 0.99 0.99 0.99 rg 0 2 4 2 re f\n");
+    for k in 0..32 {
+        let gs = if k % 2 == 0 { "/GD" } else { "/GM" };
+        cell_stream.push_str(&format!("{gs} gs 0.99 0.99 0.99 rg 0 2 8 2 re f\n"));
     }
     let cell = stream_obj(
         "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
          /BBox [0 0 8 4] /XStep 4 /YStep 4 \
-         /Resources << /ExtGState << /GM 6 0 R >> >>",
+         /Resources << /ExtGState << /GM 6 0 R /GD 7 0 R >> >>",
         cell_stream.as_bytes(),
     );
     let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 40 40 re f\n60 0 260 260 re f");
@@ -1509,6 +1511,7 @@ fn gpu_overlapping_multiply_above_64_passes_preserves_both_copies() {
         content,                                       // 4
         cell,                                          // 5
         gs_mul,                                        // 6
+        gs_dark,                                       // 7
     ]);
 
     let doc = PdfDocument::open(pdf).expect("open pdf");
@@ -1683,5 +1686,286 @@ fn gpu_multi_segment_tiling_applies_outer_shape_coverage_once() {
     assert!(
         aa_glyph_pixels >= 10,
         "expected anti-aliased glyph-clip pixels on GPU, found {aa_glyph_pixels}"
+    );
+}
+
+/// Regression (ISO 32000-1 §11.6.7): GPU must evaluate a backdrop-dependent
+/// tiling cell against the live page backdrop BEFORE applying an outer
+/// `/BM /Screen` blend mode (matching CPU).
+#[test]
+fn gpu_outer_screen_blend_mode_on_backdrop_dependent_tiling_evaluates_cell_first() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_screen = b"<< /Type /ExtGState /BM /Screen >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 10 10 re f",
+    );
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 50 100 re f\n\
+          0.5 0.5 0.5 rg 50 0 50 100 re f\n\
+          /GS gs /Pattern cs /P0 scn 10 10 80 80 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> /ExtGState << /GS 7 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+        gs_screen,                                     // 7
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU outer-Screen tiling test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 99 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let blue_in = px(&gpu.data, 25, 50);
+    assert!(
+        blue_in[0] < 10 && blue_in[1] < 10 && blue_in[2] > 245,
+        "GPU white Multiply cell under outer /BM /Screen over blue must stay blue, got {blue_in:?}"
+    );
+    let gray_in = px(&gpu.data, 70, 50);
+    assert!(
+        gray_in.iter().all(|&c| (186..=197).contains(&c)),
+        "GPU white Multiply cell under outer /BM /Screen over 50% gray must be ~191, got {gray_in:?}"
+    );
+    let gray_out = px(&gpu.data, 95, 50);
+    assert!(
+        gray_out.iter().all(|&c| (124..=132).contains(&c)),
+        "GPU 50% gray outside fill must stay ~128, got {gray_out:?}"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  outer_screen_backdrop_tiling: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "outer Screen backdrop tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}
+
+/// Regression: dense GPU (>4,096 tiles) nested half-pixel path painted with a
+/// 2-segment black `Multiply` inner pattern must apply the nested path's
+/// anti-aliased coverage ONCE (~128 on white, matching solid reference).
+#[test]
+fn gpu_dense_nested_half_pixel_path_applies_inner_shape_coverage_once() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_dark = b"<< /Type /ExtGState /BM /Darken >>".to_vec();
+    let p_inner = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 2 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 8 0 R /GD 9 0 R >> >>",
+        b"/GM gs 0 0 0 rg 0 0 2 2 re f\n/GD gs 0 0 0 rg 0 0 2 2 re f",
+    );
+    let p_outer = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4 \
+         /Resources << /Pattern << /PI 5 0 R >> >>",
+        b"/Pattern cs /PI scn 1.5 0 2 4 re f",
+    );
+    let p_ref = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4",
+        b"0 0 0 rg 1.5 0 2 4 re f",
+    );
+    let content = stream_obj(
+        "",
+        b"/Pattern cs /PO scn 0 0 260 260 re f\n\
+          /Pattern cs /PR scn 280 0 260 260 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 540 260] /Contents 4 0 R \
+          /Resources << /Pattern << /PO 6 0 R /PR 7 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        p_inner,                                       // 5
+        p_outer,                                       // 6
+        p_ref,                                         // 7
+        gs_mul,                                        // 8
+        gs_dark,                                       // 9
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU dense nested half-pixel test (no adapter?): {e}");
+            return;
+        }
+    };
+    let px = |x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 259 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [gpu.data[off], gpu.data[off + 1], gpu.data[off + 2]]
+    };
+    let pat_edge = px(121, 130);
+    let ref_edge = px(401, 130);
+    assert!(
+        (110..=145).contains(&ref_edge[0]),
+        "GPU sanity check: solid nested edge must be ~128, got {ref_edge:?}"
+    );
+    assert!(
+        (pat_edge[0] as i32 - ref_edge[0] as i32).abs() <= 4,
+        "GPU dense nested half-pixel edge must match solid ref ({ref_edge:?}, NOT ~64), got {pat_edge:?}"
+    );
+}
+
+/// Regression: dense GPU (>4,096 tiles) overlapping cell exceeding the 1,024
+/// per-copy pass budget (both 6 steps × 205 spanning white Multiply marks and
+/// 6 steps × 175 non-coalesceable alternating Multiply/Darken white marks +
+/// trailing black detail in step 0) must keep the trailing black detail visible
+/// and preserve the blue page backdrop.
+#[test]
+fn gpu_dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_dark = b"<< /Type /ExtGState /BM /Darken >>".to_vec();
+    let mut cell_mul_stream = String::new();
+    for _ in 0..205 {
+        cell_mul_stream.push_str("/GM gs 1 1 1 rg 0 0 24 4 re f\n");
+    }
+    cell_mul_stream.push_str("0 0 0 rg 0 0 2 4 re f\n");
+    let cell_mul = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 24 4] /XStep 4 /YStep 4 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        cell_mul_stream.as_bytes(),
+    );
+    let mut cell_alt_stream = String::new();
+    for k in 0..175 {
+        let gs = if k % 2 == 0 { "/GM" } else { "/GD" };
+        cell_alt_stream.push_str(&format!("{gs} gs 1 1 1 rg 0 0 12 2 re f\n"));
+    }
+    cell_alt_stream.push_str("/GM gs 0 0 0 rg 0 0 1 2 re f\n");
+    let cell_alt = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 12 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 7 0 R /GD 8 0 R >> >>",
+        cell_alt_stream.as_bytes(),
+    );
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 420 260 re f\n\
+          /Pattern cs /PM scn 0 0 260 260 re f\n\
+          /Pattern cs /PA scn 280 0 132 132 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 260] /Contents 4 0 R \
+          /Resources << /Pattern << /PM 5 0 R /PA 6 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell_mul,                                      // 5
+        cell_alt,                                      // 6
+        gs_mul,                                        // 7
+        gs_dark,                                       // 8
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU dense pass-budget fallback test (no adapter?): {e}");
+            return;
+        }
+    };
+    let px = |x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 259 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [gpu.data[off], gpu.data[off + 1], gpu.data[off + 2]]
+    };
+    let detail_a = px(121, 130);
+    assert!(
+        detail_a[0] < 10 && detail_a[1] < 10 && detail_a[2] < 10,
+        "GPU Cell A trailing black detail must remain black, got {detail_a:?}"
+    );
+    let bg_a = px(123, 130);
+    assert!(
+        bg_a[0] < 10 && bg_a[1] < 10 && bg_a[2] > 245,
+        "GPU Cell A white Multiply marks must preserve blue backdrop, got {bg_a:?}"
+    );
+    let detail_b = px(340, 66);
+    assert!(
+        detail_b[0] < 10 && detail_b[1] < 10 && detail_b[2] < 10,
+        "GPU Cell B trailing black detail past 1,024-pass budget must remain black, got {detail_b:?}"
+    );
+    let bg_b = px(341, 66);
+    assert!(
+        bg_b[0] < 10 && bg_b[1] < 10 && bg_b[2] > 245,
+        "GPU Cell B white Multiply/Darken marks in fallback must preserve blue backdrop, got {bg_b:?}"
     );
 }

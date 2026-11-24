@@ -555,11 +555,15 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 } else {
                     None
                 };
-                if !*isolated && !*knockout && *blend_mode == zpdf_display_list::BlendMode::Normal {
-                    if *alpha >= 1.0 && mask_ops.is_none() {
+                if !*isolated && !*knockout {
+                    if *blend_mode == zpdf_display_list::BlendMode::Normal
+                        && *alpha >= 1.0
+                        && mask_ops.is_none()
+                    {
                         page.recorder.push_passthrough_blend();
                     } else {
-                        page.recorder.push_non_isolated(*alpha, mask_ops);
+                        page.recorder
+                            .push_non_isolated_with_mode(*blend_mode, *alpha, mask_ops);
                     }
                 } else {
                     page.recorder.push_blend(*blend_mode, *alpha, mask_ops);
@@ -1323,11 +1327,14 @@ fn record_dl_commands_at(
                 } else {
                     None
                 };
-                if !*isolated && !*knockout && *blend_mode == zpdf_display_list::BlendMode::Normal {
-                    if *alpha >= 1.0 && sub.is_none() {
+                if !*isolated && !*knockout {
+                    if *blend_mode == zpdf_display_list::BlendMode::Normal
+                        && *alpha >= 1.0
+                        && sub.is_none()
+                    {
                         rec.push_passthrough_blend();
                     } else {
-                        rec.push_non_isolated(*alpha, sub);
+                        rec.push_non_isolated_with_mode(*blend_mode, *alpha, sub);
                     }
                 } else {
                     rec.push_blend(*blend_mode, *alpha, sub);
@@ -1855,15 +1862,20 @@ fn record_tiling_pattern_rasterized(
                         }
                         zpdf_display_list::TilingBlendStep::OpacityGroup {
                             alpha: inner_alpha,
+                            mask: inner_mask,
                             steps: inner_steps,
                         } => {
                             if let Some((di, dj)) = overlap_shift {
-                                if !zpdf_display_list::TilingBlendStep::any_intersects_period(
-                                    inner_steps,
-                                    tiling,
-                                    di,
-                                    dj,
-                                ) {
+                                if inner_mask
+                                    .as_ref()
+                                    .is_some_and(|m| !m.intersects_period(tiling, di, dj))
+                                    || !zpdf_display_list::TilingBlendStep::any_intersects_period(
+                                        inner_steps,
+                                        tiling,
+                                        di,
+                                        dj,
+                                    )
+                                {
                                     continue;
                                 }
                             }
@@ -1871,9 +1883,34 @@ fn record_tiling_pattern_rasterized(
                             if a <= 0.0 {
                                 continue;
                             }
-                            let wrap_inner = a < 1.0 && rec.can_push_blend();
+                            let mask_ops = match inner_mask {
+                                Some(m_seg) => {
+                                    let Some(tile_id) = get_or_record_tile(
+                                        rec,
+                                        &m_seg.commands,
+                                        m_seg.segment_id,
+                                        overlap_shift,
+                                    ) else {
+                                        continue;
+                                    };
+                                    let ops = rec.record_subops(|r| {
+                                        r.add_tile(quad_opaque, tile_id);
+                                    });
+                                    Some(record::MaskOps {
+                                        ops,
+                                        kind: zpdf_display_list::SoftMaskKind::Alpha,
+                                        backdrop_luma: 0.0,
+                                        dx: 0,
+                                        dy: 0,
+                                        transfer: None,
+                                    })
+                                }
+                                None => None,
+                            };
+                            let wrap_inner =
+                                (a < 1.0 || mask_ops.is_some()) && rec.can_push_blend();
                             if wrap_inner {
-                                rec.push_non_isolated_opacity(a);
+                                rec.push_non_isolated(a, mask_ops);
                             }
                             emit_steps(
                                 rec,
@@ -1895,7 +1932,34 @@ fn record_tiling_pattern_rasterized(
             }
 
             let mut remaining_passes = MAX_DENSE_BLEND_PASSES;
-            if overlap_count > 1 {
+            let separate_copies = if overlap_count > 1 {
+                let mut total_passes = 0usize;
+                'count: for dj in overlap.dj.clone() {
+                    for di in overlap.di.clone() {
+                        total_passes = total_passes.saturating_add(
+                            zpdf_display_list::TilingBlendStep::count_intersecting_passes(
+                                &steps, tiling, di, dj,
+                            ),
+                        );
+                        if total_passes > MAX_DENSE_BLEND_PASSES {
+                            break 'count;
+                        }
+                    }
+                }
+                if total_passes > MAX_DENSE_BLEND_PASSES {
+                    tracing::warn!(
+                        total_passes,
+                        limit = MAX_DENSE_BLEND_PASSES,
+                        "dense GPU tiling blend plan exceeds pass budget; flattening overlap copies per step"
+                    );
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            if separate_copies {
                 'copies: for dj in overlap.dj.clone() {
                     for di in overlap.di.clone() {
                         if !rec.can_record() || remaining_passes == 0 {
@@ -2307,6 +2371,162 @@ fn composite_into(
                 non_isolated,
                 unclipped_group,
             } => {
+                // Non-isolated group with a non-Normal outer blend mode (ISO
+                // 32000-1 §11.4.5 / §11.6.7): evaluate the inner ops against
+                // the live parent backdrop (color) and against transparent
+                // (accumulated group alpha α_g), remove the initial backdrop's
+                // contribution via `mask_apply` (`non_isolated = 2u`), apply
+                // any outer soft mask, and composite onto `parent` with `mode`.
+                if *non_isolated
+                    && *mode != zpdf_display_list::BlendMode::Normal
+                    && overprint.is_none()
+                {
+                    let mut depth = 1usize;
+                    let mut end_i = i + 1;
+                    while end_i < ops.len() && depth > 0 {
+                        match ops[end_i] {
+                            PageOp::PushBlend { .. } => depth += 1,
+                            PageOp::PopBlend => depth -= 1,
+                            _ => {}
+                        }
+                        if depth > 0 {
+                            end_i += 1;
+                        }
+                    }
+                    let inner_ops = &ops[i + 1..end_i.min(ops.len())];
+                    let parent = *active.last().unwrap_or(&base);
+                    let group_clips: &[record::ClipStamp] =
+                        if *unclipped_group { &[] } else { clips };
+
+                    let g_color_base = pool.acquire(device)?;
+                    init_layer_from_base(
+                        ctx,
+                        encoder,
+                        pool.get(g_color_base),
+                        pool.get(parent),
+                        group_clips,
+                        res,
+                        keep_bgs,
+                        keep_bufs,
+                    );
+                    let g_color = composite_into(
+                        ctx,
+                        encoder,
+                        pool,
+                        g_color_base,
+                        inner_ops,
+                        res,
+                        keep_bgs,
+                        keep_bufs,
+                    )?;
+                    if g_color != g_color_base {
+                        pool.recycle(g_color_base);
+                    }
+
+                    let g_alpha_base = pool.acquire(device)?;
+                    init_layer(
+                        encoder,
+                        pool.get(g_alpha_base),
+                        wgpu::Color::TRANSPARENT,
+                        group_clips,
+                        res,
+                    );
+                    let g_alpha = composite_into(
+                        ctx,
+                        encoder,
+                        pool,
+                        g_alpha_base,
+                        inner_ops,
+                        res,
+                        keep_bgs,
+                        keep_bufs,
+                    )?;
+                    if g_alpha != g_alpha_base {
+                        pool.recycle(g_alpha_base);
+                    }
+
+                    let g_removed = remove_non_isolated_backdrop(
+                        ctx, encoder, pool, g_color, g_alpha, parent, res, keep_bgs, keep_bufs,
+                    )?;
+                    let group = if let Some(m) = mask.as_ref() {
+                        apply_soft_mask(
+                            ctx, encoder, pool, g_removed, m, None, res, keep_bgs, keep_bufs,
+                        )?
+                    } else {
+                        g_removed
+                    };
+
+                    let scratch = pool.acquire(device)?;
+                    let mode_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("zpdf-blend-mode"),
+                        contents: bytemuck::cast_slice(&[
+                            blend::blend_index(*mode),
+                            unit(*alpha).to_bits(),
+                            0u32,
+                            0u32,
+                            0.0f32.to_bits(),
+                            0.0f32.to_bits(),
+                            0.0f32.to_bits(),
+                            0.0f32.to_bits(),
+                        ]),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let comp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("zpdf-composite-bg"),
+                        layout: &ctx.pipelines.composite_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    pool.get(parent).sampleable_view(),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    pool.get(group).sampleable_view(),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: mode_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    {
+                        let mut pass = begin_layer_pass(
+                            encoder,
+                            pool.get(scratch),
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            wgpu::LoadOp::Clear(0),
+                        );
+                        pass.set_bind_group(0, Some(res.bind_group), &[]);
+                        if let (Some(fs), Some((svb, sib))) = (res.fs_range, res.solid) {
+                            pass.set_pipeline(&ctx.pipelines.composite);
+                            pass.set_bind_group(1, Some(&comp_bg), &[]);
+                            pass.set_vertex_buffer(0, svb.slice(..));
+                            pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.set_stencil_reference(0);
+                            pass.draw_indexed(
+                                fs.first_index..fs.first_index + fs.index_count,
+                                fs.base_vertex,
+                                0..1,
+                            );
+                        }
+                        stamp_clips(&mut pass, clips, res);
+                    }
+                    keep_bgs.push(comp_bg);
+                    keep_bufs.push(mode_buf);
+                    pool.recycle(group);
+                    active.pop();
+                    if parent != base {
+                        pool.recycle(parent);
+                    }
+                    active.push(scratch);
+                    i = end_i.saturating_add(1);
+                    continue;
+                }
+
                 let g = pool.acquire(device)?;
                 let group_clips: &[record::ClipStamp] = if *unclipped_group { &[] } else { clips };
                 if *non_isolated {
@@ -2526,6 +2746,91 @@ fn pack_transfer_lut(transfer: Option<&std::sync::Arc<[u8; 256]>>) -> [u32; 64] 
         *slot = word;
     }
     lut
+}
+
+/// ISO 32000-1 §11.4.5 non-isolated group backdrop removal: given `g_color`
+/// evaluated over `parent` and `g_alpha` evaluated over transparent, write the
+/// backdrop-removed premultiplied group result `(c_g * α_g, α_g)` into a fresh
+/// layer using `mask_apply` (`non_isolated = 2u`), and recycle `g_color` and
+/// `g_alpha`.
+#[allow(clippy::too_many_arguments)]
+fn remove_non_isolated_backdrop(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    pool: &mut blend::LayerPool,
+    g_color: usize,
+    g_alpha: usize,
+    parent: usize,
+    res: &ReplayRes,
+    keep_bgs: &mut Vec<wgpu::BindGroup>,
+    keep_bufs: &mut Vec<wgpu::Buffer>,
+) -> Result<usize, WgpuRenderError> {
+    use wgpu::util::DeviceExt;
+    let device = &ctx.device;
+    let out = pool.acquire(device)?;
+    let mask_u = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("zpdf-backdrop-remove-uniform"),
+        contents: bytemuck::bytes_of(&MaskUniform {
+            kind: 2,
+            dx: 0,
+            dy: 0,
+            non_isolated: 2,
+            backdrop_luma: 0.0,
+            group_alpha: 1.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
+            lut: pack_transfer_lut(None),
+        }),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zpdf-backdrop-remove-bg"),
+        layout: &ctx.pipelines.mask_apply_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(pool.get(g_color).sampleable_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(pool.get(g_alpha).sampleable_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: mask_u.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(pool.get(parent).sampleable_view()),
+            },
+        ],
+    });
+    {
+        let mut pass = begin_layer_pass(
+            encoder,
+            pool.get(out),
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            wgpu::LoadOp::Clear(0),
+        );
+        pass.set_bind_group(0, Some(res.bind_group), &[]);
+        if let (Some(fs), Some((svb, sib))) = (res.fs_range, res.solid) {
+            pass.set_pipeline(&ctx.pipelines.mask_apply);
+            pass.set_bind_group(1, Some(&bg), &[]);
+            pass.set_vertex_buffer(0, svb.slice(..));
+            pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_stencil_reference(0);
+            pass.draw_indexed(
+                fs.first_index..fs.first_index + fs.index_count,
+                fs.base_vertex,
+                0..1,
+            );
+        }
+    }
+    keep_bgs.push(bg);
+    keep_bufs.push(mask_u);
+    pool.recycle(g_color);
+    pool.recycle(g_alpha);
+    Ok(out)
 }
 
 /// Apply a group's soft mask: composite the mask group into its own layer, then a
@@ -3228,9 +3533,12 @@ mod resource_tests {
     #[test]
     fn translucent_dense_overlapping_multiply_wraps_once_in_non_isolated_opacity() {
         let mut cell = zpdf_display_list::DisplayList::new(Rect::new(0.0, 0.0, 2.0, 2.0));
-        for _ in 0..2 {
+        for mode in [
+            zpdf_display_list::BlendMode::Multiply,
+            zpdf_display_list::BlendMode::Darken,
+        ] {
             cell.push(RenderCommand::PushBlendGroup {
-                blend_mode: zpdf_display_list::BlendMode::Multiply,
+                blend_mode: mode,
                 isolated: true,
                 knockout: false,
                 bounds: Rect::new(0.0, 0.0, 2.0, 2.0),
@@ -3280,20 +3588,22 @@ mod resource_tests {
                 ..
             }) if (*alpha - 0.5).abs() < 1e-6
         ));
-        let mul_alphas: Vec<f32> = rec
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                PageOp::PushBlend {
-                    mode: zpdf_display_list::BlendMode::Multiply,
-                    alpha,
-                    non_isolated: false,
-                    ..
-                } => Some(*alpha),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(mul_alphas, vec![1.0, 1.0]);
+        let seg_alphas: Vec<f32> =
+            rec.ops
+                .iter()
+                .filter_map(|op| match op {
+                    PageOp::PushBlend {
+                        mode:
+                            zpdf_display_list::BlendMode::Multiply
+                            | zpdf_display_list::BlendMode::Darken,
+                        alpha,
+                        non_isolated: false,
+                        ..
+                    } => Some(*alpha),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(seg_alphas, vec![1.0, 1.0]);
     }
 }
 

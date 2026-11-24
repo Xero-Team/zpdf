@@ -102,6 +102,7 @@ pub fn display_list_to_svg(
     }
 
     writer.emit_commands(&display_list.commands, 0);
+    writer.flush_pending_backdrop();
 
     let mut svg = String::with_capacity(writer.defs.len() + writer.out.len() + 192);
     svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -152,6 +153,10 @@ struct SvgWriter<'a> {
     blend_depth: usize,
     isolated_depth: usize,
     backdrop_snapshots: usize,
+    /// Open batch of pairwise-disjoint translucent multi-pass tiling items
+    /// sharing one base backdrop `<g id="b{bg_id}">` snapshot, flushed as a
+    /// single premultiplied `R * w + B * (1 - w)` SVG filter composition.
+    pending_backdrop: Option<PendingBackdrop>,
     x0: f64,
     y1: f64,
     /// Uniform coordinate scale from current PDF space (page or pattern cell)
@@ -247,6 +252,73 @@ const MAX_SVG_TILING_BLEND_PASSES: usize = 1024;
 /// Cap on chained page-backdrop `<g id="b...">` snapshots used for non-associative
 /// multi-pass tiling patterns painted with `opacity < 1.0`.
 const MAX_BACKDROP_SNAPSHOTS: usize = 4;
+/// Cap on pairwise-disjoint translucent tiling items batched onto a single
+/// shared page-backdrop snapshot.
+const MAX_PENDING_BACKDROP_ITEMS: usize = 256;
+
+struct BackdropBlendItem {
+    res_id: u32,
+    shape_id: u32,
+    bounds: zpdf_core::Rect,
+}
+
+struct PendingBackdrop {
+    bg_id: u32,
+    items: Vec<BackdropBlendItem>,
+}
+
+fn rects_overlap(a: zpdf_core::Rect, b: zpdf_core::Rect) -> bool {
+    let a = a.normalize();
+    let b = b.normalize();
+    a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1
+}
+
+fn path_bounds_pdf(path: &Path) -> Option<zpdf_core::Rect> {
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for p in path.points() {
+        if !p.x.is_finite() || !p.y.is_finite() {
+            return None;
+        }
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+        .then(|| zpdf_core::Rect::new(x0, y0, x1, y1))
+}
+
+fn stroke_bounds_pdf(path: &Path, style: &StrokeStyle) -> Option<zpdf_core::Rect> {
+    let b = path_bounds_pdf(path)?;
+    let has_joins = path.points().len() > 2;
+    let reach = if has_joins {
+        match style.join {
+            LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0),
+            _ => std::f32::consts::SQRT_2,
+        }
+    } else if style.cap == LineCap::Square {
+        std::f32::consts::SQRT_2
+    } else {
+        1.0
+    };
+    let w = if style.width.is_finite() && style.width > 0.0 {
+        style.width
+    } else {
+        1.0
+    };
+    let pad = (w as f64 * 0.5 * reach as f64).max(1.0);
+    Some(zpdf_core::Rect::new(
+        b.x0 - pad,
+        b.y0 - pad,
+        b.x1 + pad,
+        b.y1 + pad,
+    ))
+}
 
 struct TilingPatternGeometry {
     bx0: f64,
@@ -286,6 +358,7 @@ impl<'a> SvgWriter<'a> {
             blend_depth: 0,
             isolated_depth: 0,
             backdrop_snapshots: 0,
+            pending_backdrop: None,
             x0: rect.x0,
             y1: rect.y1,
             scale: 1.0,
@@ -374,8 +447,18 @@ impl<'a> SvgWriter<'a> {
                     }
                     self.emit_stroke(path, style, paint, *alpha, depth);
                 }
-                RenderCommand::DrawGlyphRun(run) => self.emit_glyph_run(run),
-                RenderCommand::DrawImage(draw) => self.emit_image(draw),
+                RenderCommand::DrawGlyphRun(run) => {
+                    if depth == 0 && self.blend_depth == 0 {
+                        self.flush_pending_backdrop();
+                    }
+                    self.emit_glyph_run(run);
+                }
+                RenderCommand::DrawImage(draw) => {
+                    if depth == 0 && self.blend_depth == 0 {
+                        self.flush_pending_backdrop();
+                    }
+                    self.emit_image(draw);
+                }
                 RenderCommand::PushClip { path, rule } => {
                     let frame = Frame::Clip {
                         prev_clip: self.clip,
@@ -411,6 +494,9 @@ impl<'a> SvgWriter<'a> {
                     mask,
                     ..
                 } => {
+                    if depth == 0 && self.blend_depth == 0 {
+                        self.flush_pending_backdrop();
+                    }
                     if *knockout {
                         self.warn_knockout();
                     }
@@ -725,6 +811,7 @@ impl<'a> SvgWriter<'a> {
                 }
                 zpdf_display_list::TilingBlendStep::OpacityGroup {
                     alpha,
+                    mask,
                     steps: inner,
                 } => {
                     let a = if alpha.is_finite() {
@@ -735,8 +822,22 @@ impl<'a> SvgWriter<'a> {
                     if a <= 0.0 {
                         continue;
                     }
+                    let mask_id = mask.as_ref().map(|m_seg| {
+                        let mid = self.fresh_id();
+                        let saved_out = std::mem::take(&mut self.out);
+                        self.emit_commands(&m_seg.commands.commands, depth + 1);
+                        let mask_body = std::mem::replace(&mut self.out, saved_out);
+                        let _ = write!(
+                            self.defs,
+                            "<mask id=\"m{mid}\" maskUnits=\"userSpaceOnUse\">\n{mask_body}</mask>\n"
+                        );
+                        mid
+                    });
                     self.out.push_str("<g opacity=\"");
                     push_num(&mut self.out, a as f64);
+                    if let Some(mid) = mask_id {
+                        let _ = write!(self.out, "\" mask=\"url(#m{mid})");
+                    }
                     let _ = writeln!(
                         self.out,
                         "\" style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
@@ -908,8 +1009,35 @@ impl<'a> SvgWriter<'a> {
                 }
                 if all_flat {
                     let mut passes = Vec::new();
+                    let separate_copies = if overlap_count > 1 {
+                        let mut total_passes = 0usize;
+                        'count: for dj in overlap.dj.clone() {
+                            for di in overlap.di.clone() {
+                                total_passes = total_passes.saturating_add(
+                                    zpdf_display_list::TilingBlendStep::count_intersecting_passes(
+                                        &steps, tiling, di, dj,
+                                    ),
+                                );
+                                if total_passes > MAX_SVG_TILING_BLEND_PASSES {
+                                    break 'count;
+                                }
+                            }
+                        }
+                        if total_passes > MAX_SVG_TILING_BLEND_PASSES {
+                            tracing::warn!(
+                                total_passes,
+                                limit = MAX_SVG_TILING_BLEND_PASSES,
+                                "svg tiling blend plan exceeds pass budget; flattening overlap copies per step"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    };
                     let mut remaining = MAX_SVG_TILING_BLEND_PASSES;
-                    if overlap_count > 1 {
+                    if separate_copies {
                         'copies: for dj in overlap.dj.clone() {
                             for di in overlap.di.clone() {
                                 for seg in &flat_segments {
@@ -961,10 +1089,165 @@ impl<'a> SvgWriter<'a> {
             .unwrap_or_default()
     }
 
-    /// Snapshot the current top-level canvas into `<defs><g id="b{id}">` and
-    /// re-reference it on the page so a multi-pass translucent tiling object
-    /// can evaluate all passes at full opacity against the live backdrop and
-    /// apply the object's opacity once. Returns `None` when `self.out` is empty.
+    /// Flush any open batch of pairwise-disjoint translucent multi-pass tiling
+    /// items into `self.out` using an exact premultiplied sRGB SVG filter
+    /// (`out = R * w + B * (1 - w)`). This preserves translucent backdrop alpha
+    /// in unpainted gaps (never double-compositing `#b{bg_id}`) and allows
+    /// arbitrarily many disjoint patterned objects to share one backdrop
+    /// snapshot without exponential `<use>` chaining.
+    fn flush_pending_backdrop(&mut self) {
+        let Some(pending) = self.pending_backdrop.take() else {
+            return;
+        };
+        if pending.items.is_empty() {
+            let _ = writeln!(self.out, "<use href=\"#b{}\"/>", pending.bg_id);
+            return;
+        }
+        let w = self.page_width;
+        let h = self.page_height;
+        let fid = self.fresh_id();
+        if pending.items.len() == 1 {
+            let item = &pending.items[0];
+            let _ = write!(
+                self.defs,
+                "<filter id=\"f{fid}\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
+            );
+            push_num(&mut self.defs, w);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, h);
+            self.defs
+                .push_str("\" color-interpolation-filters=\"sRGB\">\n");
+            let _ = write!(
+                self.defs,
+                "<feImage href=\"#r{}\" x=\"0\" y=\"0\" width=\"",
+                item.res_id
+            );
+            push_num(&mut self.defs, w);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, h);
+            self.defs.push_str("\" result=\"res\"/>\n");
+            let _ = write!(
+                self.defs,
+                "<feImage href=\"#s{}\" x=\"0\" y=\"0\" width=\"",
+                item.shape_id
+            );
+            push_num(&mut self.defs, w);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, h);
+            self.defs.push_str("\" result=\"wt\"/>\n");
+            self.defs
+                .push_str("<feComposite in=\"res\" in2=\"wt\" operator=\"in\" result=\"rw\"/>\n");
+            self.defs.push_str(
+                "<feComposite in=\"SourceGraphic\" in2=\"wt\" operator=\"out\" result=\"biw\"/>\n",
+            );
+            self.defs.push_str(
+                "<feComposite in=\"rw\" in2=\"biw\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\"/>\n",
+            );
+            self.defs.push_str("</filter>\n");
+        } else {
+            let mut masked_uses = String::new();
+            let mut shape_uses = String::new();
+            for item in &pending.items {
+                let fi = self.fresh_id();
+                let _ = write!(
+                    self.defs,
+                    "<filter id=\"fi{fi}\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
+                );
+                push_num(&mut self.defs, w);
+                self.defs.push_str("\" height=\"");
+                push_num(&mut self.defs, h);
+                self.defs
+                    .push_str("\" color-interpolation-filters=\"sRGB\">\n");
+                let _ = write!(
+                    self.defs,
+                    "<feImage href=\"#s{}\" x=\"0\" y=\"0\" width=\"",
+                    item.shape_id
+                );
+                push_num(&mut self.defs, w);
+                self.defs.push_str("\" height=\"");
+                push_num(&mut self.defs, h);
+                self.defs.push_str("\" result=\"wt\"/>\n");
+                self.defs
+                    .push_str("<feComposite in=\"SourceGraphic\" in2=\"wt\" operator=\"in\"/>\n");
+                self.defs.push_str("</filter>\n");
+                let _ = writeln!(
+                    masked_uses,
+                    "<use href=\"#r{}\" filter=\"url(#fi{fi})\"/>",
+                    item.res_id
+                );
+                let _ = writeln!(shape_uses, "<use href=\"#s{}\"/>", item.shape_id);
+            }
+            let rw_id = self.fresh_id();
+            let _ = write!(self.defs, "<g id=\"rw{rw_id}\">\n{masked_uses}</g>\n");
+            let sa_id = self.fresh_id();
+            let _ = write!(self.defs, "<g id=\"sa{sa_id}\">\n{shape_uses}</g>\n");
+
+            let _ = write!(
+                self.defs,
+                "<filter id=\"f{fid}\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
+            );
+            push_num(&mut self.defs, w);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, h);
+            self.defs
+                .push_str("\" color-interpolation-filters=\"sRGB\">\n");
+            let _ = write!(
+                self.defs,
+                "<feImage href=\"#rw{rw_id}\" x=\"0\" y=\"0\" width=\""
+            );
+            push_num(&mut self.defs, w);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, h);
+            self.defs.push_str("\" result=\"rw\"/>\n");
+            let _ = write!(
+                self.defs,
+                "<feImage href=\"#sa{sa_id}\" x=\"0\" y=\"0\" width=\""
+            );
+            push_num(&mut self.defs, w);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, h);
+            self.defs.push_str("\" result=\"wt\"/>\n");
+            self.defs.push_str(
+                "<feComposite in=\"SourceGraphic\" in2=\"wt\" operator=\"out\" result=\"biw\"/>\n",
+            );
+            self.defs.push_str(
+                "<feComposite in=\"rw\" in2=\"biw\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\"/>\n",
+            );
+            self.defs.push_str("</filter>\n");
+        }
+        let _ = writeln!(
+            self.out,
+            "<use href=\"#b{}\" filter=\"url(#f{fid})\"/>",
+            pending.bg_id
+        );
+    }
+
+    /// Emit `<g id="r{res_id}">` in `self.defs` evaluating `passes` at full
+    /// opacity against `<use href="#b{bg_id}"/>`.
+    fn write_backdrop_result_def(&mut self, bg_id: u32, passes: &[(u32, BlendMode)]) -> u32 {
+        let res_id = self.fresh_id();
+        let _ = write!(
+            self.defs,
+            "<g id=\"r{res_id}\">\n<use href=\"#b{bg_id}\"/>\n"
+        );
+        for &(id, blend_mode) in passes {
+            self.defs.push_str("<rect x=\"0\" y=\"0\" width=\"");
+            push_num(&mut self.defs, self.page_width);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, self.page_height);
+            let _ = write!(self.defs, "\" fill=\"url(#p{id})\"");
+            if let Some(name) = blend_css(blend_mode) {
+                let _ = write!(self.defs, " style=\"mix-blend-mode:{name};\"");
+            }
+            self.defs.push_str("/>\n");
+        }
+        self.defs.push_str("</g>\n");
+        res_id
+    }
+
+    /// Snapshot the current top-level canvas into `<defs><g id="b{id}">` without
+    /// re-emitting `<use>` into `self.out` (the caller's filter composition
+    /// emits the sole `<use href="#b{id}" filter="..."/>` when flushed).
     fn snapshot_page_backdrop(&mut self) -> Option<u32> {
         self.backdrop_snapshots += 1;
         if self.out.is_empty() {
@@ -973,7 +1256,6 @@ impl<'a> SvgWriter<'a> {
         let prior = std::mem::take(&mut self.out);
         let bg_id = self.fresh_id();
         let _ = write!(self.defs, "<g id=\"b{bg_id}\">\n{prior}</g>\n");
-        let _ = writeln!(self.out, "<use href=\"#b{bg_id}\"/>");
         Some(bg_id)
     }
 
@@ -987,6 +1269,9 @@ impl<'a> SvgWriter<'a> {
                 let Some(d) = self.path_data(path) else {
                     return;
                 };
+                if depth == 0 && self.blend_depth == 0 {
+                    self.flush_pending_backdrop();
+                }
                 self.out.push_str("<path d=\"");
                 self.out.push_str(&d);
                 self.out.push_str("\" fill=\"");
@@ -1016,13 +1301,79 @@ impl<'a> SvgWriter<'a> {
                 if passes.is_empty() {
                     return;
                 }
-                if passes.len() > 1
-                    && opacity < 1.0
-                    && depth == 0
-                    && self.blend_depth == 0
-                    && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS
-                {
-                    let bg_id = self.snapshot_page_backdrop();
+                if passes.len() > 1 && opacity < 1.0 {
+                    if depth == 0 && self.blend_depth == 0 {
+                        let obj_bounds = path_bounds_pdf(path);
+                        let can_join = obj_bounds.is_some_and(|b| {
+                            self.pending_backdrop.as_ref().is_some_and(|p| {
+                                p.items.len() < MAX_PENDING_BACKDROP_ITEMS
+                                    && !p.items.iter().any(|it| rects_overlap(it.bounds, b))
+                            })
+                        });
+                        if !can_join {
+                            self.flush_pending_backdrop();
+                        }
+                        if self.pending_backdrop.is_some()
+                            || (!self.out.is_empty()
+                                && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS)
+                        {
+                            let bg_id = if let Some(ref p) = self.pending_backdrop {
+                                Some(p.bg_id)
+                            } else {
+                                self.snapshot_page_backdrop()
+                            };
+                            if let Some(bg_id) = bg_id {
+                                let res_id = self.write_backdrop_result_def(bg_id, &passes);
+                                let shape_id = self.fresh_id();
+                                let placement = self.placement_attrs();
+                                let _ = write!(
+                                    self.defs,
+                                    "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"#ffffff\""
+                                );
+                                if *rule == FillRule::EvenOdd {
+                                    self.defs.push_str(" fill-rule=\"evenodd\"");
+                                }
+                                push_opacity(&mut self.defs, "fill-opacity", opacity);
+                                self.defs.push_str(&placement);
+                                self.defs.push_str("/></g>\n");
+                                if let Some(b) = obj_bounds {
+                                    let item = BackdropBlendItem {
+                                        res_id,
+                                        shape_id,
+                                        bounds: b,
+                                    };
+                                    if let Some(ref mut p) = self.pending_backdrop {
+                                        p.items.push(item);
+                                    } else {
+                                        self.pending_backdrop = Some(PendingBackdrop {
+                                            bg_id,
+                                            items: vec![item],
+                                        });
+                                    }
+                                } else {
+                                    self.pending_backdrop = Some(PendingBackdrop {
+                                        bg_id,
+                                        items: vec![BackdropBlendItem {
+                                            res_id,
+                                            shape_id,
+                                            bounds: zpdf_core::Rect::new(0.0, 0.0, 0.0, 0.0),
+                                        }],
+                                    });
+                                    self.flush_pending_backdrop();
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    // Bounded isolated single-opacity fallback (when there is no
+                    // backdrop yet, nested inside a group, or past the chained
+                    // overlapping-snapshot limit): evaluate all passes at 1.0
+                    // inside one isolated group and apply `opacity` ONCE to the
+                    // completed object instead of repeating `fill-opacity` per pass.
+                    if depth == 0 && self.blend_depth == 0 {
+                        self.flush_pending_backdrop();
+                    }
                     let clip_id = self.fresh_id();
                     let _ = write!(self.defs, "<clipPath id=\"c{clip_id}\"");
                     if let Some(outer) = self.clip {
@@ -1033,17 +1384,16 @@ impl<'a> SvgWriter<'a> {
                         self.defs.push_str(" clip-rule=\"evenodd\"");
                     }
                     self.defs.push_str("/></clipPath>\n");
-
                     self.out.push_str("<g opacity=\"");
                     push_num(&mut self.out, opacity as f64);
-                    let _ = write!(self.out, "\" clip-path=\"url(#c{clip_id})\"");
+                    let _ = write!(
+                        self.out,
+                        "\" style=\"isolation:isolate;\" clip-path=\"url(#c{clip_id})\""
+                    );
                     if let Some(m) = self.stroke_mask {
                         let _ = write!(self.out, " mask=\"url(#m{m})\"");
                     }
                     self.out.push_str(">\n");
-                    if let Some(bg) = bg_id {
-                        let _ = writeln!(self.out, "<use href=\"#b{bg}\"/>");
-                    }
                     for (id, blend_mode) in passes {
                         self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
                         push_num(&mut self.out, self.page_width);
@@ -1057,6 +1407,9 @@ impl<'a> SvgWriter<'a> {
                     }
                     self.out.push_str("</g>\n");
                     return;
+                }
+                if depth == 0 && self.blend_depth == 0 {
+                    self.flush_pending_backdrop();
                 }
                 let placement = self.placement_attrs();
                 for (id, blend_mode) in passes {
@@ -1095,6 +1448,9 @@ impl<'a> SvgWriter<'a> {
                 let Some(d) = self.path_data(path) else {
                     return;
                 };
+                if depth == 0 && self.blend_depth == 0 {
+                    self.flush_pending_backdrop();
+                }
                 self.out.push_str("<path d=\"");
                 self.out.push_str(&d);
                 self.out.push_str("\" fill=\"none\" stroke=\"");
@@ -1122,13 +1478,73 @@ impl<'a> SvgWriter<'a> {
                 if passes.is_empty() {
                     return;
                 }
-                if passes.len() > 1
-                    && opacity < 1.0
-                    && depth == 0
-                    && self.blend_depth == 0
-                    && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS
-                {
-                    let bg_id = self.snapshot_page_backdrop();
+                if passes.len() > 1 && opacity < 1.0 {
+                    if depth == 0 && self.blend_depth == 0 {
+                        let obj_bounds = stroke_bounds_pdf(path, style);
+                        let can_join = obj_bounds.is_some_and(|b| {
+                            self.pending_backdrop.as_ref().is_some_and(|p| {
+                                p.items.len() < MAX_PENDING_BACKDROP_ITEMS
+                                    && !p.items.iter().any(|it| rects_overlap(it.bounds, b))
+                            })
+                        });
+                        if !can_join {
+                            self.flush_pending_backdrop();
+                        }
+                        if self.pending_backdrop.is_some()
+                            || (!self.out.is_empty()
+                                && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS)
+                        {
+                            let bg_id = if let Some(ref p) = self.pending_backdrop {
+                                Some(p.bg_id)
+                            } else {
+                                self.snapshot_page_backdrop()
+                            };
+                            if let Some(bg_id) = bg_id {
+                                let res_id = self.write_backdrop_result_def(bg_id, &passes);
+                                let shape_id = self.fresh_id();
+                                let placement = self.placement_attrs();
+                                let _ = write!(
+                                    self.defs,
+                                    "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
+                                );
+                                push_opacity(&mut self.defs, "stroke-opacity", opacity);
+                                push_stroke_attrs(&mut self.defs, style, self.scale);
+                                self.defs.push_str(&placement);
+                                self.defs.push_str("/></g>\n");
+                                if let Some(b) = obj_bounds {
+                                    let item = BackdropBlendItem {
+                                        res_id,
+                                        shape_id,
+                                        bounds: b,
+                                    };
+                                    if let Some(ref mut p) = self.pending_backdrop {
+                                        p.items.push(item);
+                                    } else {
+                                        self.pending_backdrop = Some(PendingBackdrop {
+                                            bg_id,
+                                            items: vec![item],
+                                        });
+                                    }
+                                } else {
+                                    self.pending_backdrop = Some(PendingBackdrop {
+                                        bg_id,
+                                        items: vec![BackdropBlendItem {
+                                            res_id,
+                                            shape_id,
+                                            bounds: zpdf_core::Rect::new(0.0, 0.0, 0.0, 0.0),
+                                        }],
+                                    });
+                                    self.flush_pending_backdrop();
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    // Bounded isolated single-opacity fallback for strokes.
+                    if depth == 0 && self.blend_depth == 0 {
+                        self.flush_pending_backdrop();
+                    }
                     let mask_id = self.fresh_id();
                     let _ = write!(
                         self.defs,
@@ -1153,10 +1569,10 @@ impl<'a> SvgWriter<'a> {
 
                     self.out.push_str("<g opacity=\"");
                     push_num(&mut self.out, opacity as f64);
-                    let _ = writeln!(self.out, "\" mask=\"url(#m{mask_id})\">");
-                    if let Some(bg) = bg_id {
-                        let _ = writeln!(self.out, "<use href=\"#b{bg}\"/>");
-                    }
+                    let _ = writeln!(
+                        self.out,
+                        "\" style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
+                    );
                     for (id, blend_mode) in passes {
                         self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
                         push_num(&mut self.out, self.page_width);
@@ -1170,6 +1586,9 @@ impl<'a> SvgWriter<'a> {
                     }
                     self.out.push_str("</g>\n");
                     return;
+                }
+                if depth == 0 && self.blend_depth == 0 {
+                    self.flush_pending_backdrop();
                 }
                 let placement = self.placement_attrs();
                 for (id, blend_mode) in passes {
@@ -3261,6 +3680,267 @@ mod tests {
         assert!(
             rgb.iter().all(|&c| (58..=70).contains(&c)),
             "SVG overlapping 2x33 (>64) copies must preserve both 50%-gray Multiply marks (~64, not ~128), got {rgb:?}"
+        );
+    }
+
+    #[test]
+    fn tiling_pattern_mixed_blend_five_copies_preserve_object_opacity_in_svg() {
+        // Non-associative mixed cell: Normal red followed by Multiply black.
+        // At 100% -> black; at 50% over white -> ~[128, 128, 128] (NOT [128, 64, 64]).
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 120.0));
+        // Five disjoint 50%-opacity fills in the top row y=[80..110].
+        for i in 0..5 {
+            let x0 = 10.0 + i as f64 * 35.0;
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(x0, 80.0, x0 + 25.0, 110.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+                alpha: 0.5,
+                overprint: None,
+            });
+        }
+        // Five disjoint 50%-opacity strokes in the middle row y=[40..70].
+        for i in 0..5 {
+            let x = 22.0 + i as f64 * 35.0;
+            let mut line = Path::new();
+            line.move_to(Point::new(x, 40.0));
+            line.line_to(Point::new(x, 70.0));
+            dl.push(RenderCommand::StrokePath {
+                path: line,
+                style: StrokeStyle {
+                    width: 16.0,
+                    ..StrokeStyle::default()
+                },
+                paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+                alpha: 0.5,
+                overprint: None,
+            });
+        }
+        // Five *overlapping* 50%-opacity fills in the bottom row y=[5..30]
+        // (forces > MAX_BACKDROP_SNAPSHOTS = 4 chained snapshots onto the bounded fallback).
+        for i in 0..5 {
+            let x0 = 10.0 + i as f64 * 8.0;
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(x0, 5.0, x0 + 40.0, 30.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+                alpha: 0.5,
+                overprint: None,
+            });
+        }
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(200, 120).expect("pixmap");
+        let sx = 200.0 / tree.size().width();
+        let sy = 120.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let px = |x: u32, y_pdf: u32| -> [u8; 3] {
+            let p = pixmap.pixel(x, 119 - y_pdf).expect("in bounds");
+            [p.red(), p.green(), p.blue()]
+        };
+
+        let fill_1 = px(22, 95);
+        let fill_5 = px(162, 95);
+        assert!(
+            fill_1.iter().all(|&c| (124..=132).contains(&c)),
+            "1st disjoint mixed fill must be ~[128,128,128], got {fill_1:?}"
+        );
+        assert!(
+            fill_5.iter().all(|&c| (124..=132).contains(&c)),
+            "5th disjoint mixed fill must agree (~[128,128,128], not [128,64,64]), got {fill_5:?}"
+        );
+
+        let stroke_1 = px(22, 55);
+        let stroke_5 = px(162, 55);
+        assert!(
+            stroke_1.iter().all(|&c| (124..=132).contains(&c)),
+            "1st disjoint mixed stroke must be ~[128,128,128], got {stroke_1:?}"
+        );
+        assert!(
+            stroke_5.iter().all(|&c| (124..=132).contains(&c)),
+            "5th disjoint mixed stroke must agree (~[128,128,128], not [128,64,64]), got {stroke_5:?}"
+        );
+
+        // Non-overlapping tail of the 5th overlapping fill (x=76, y_pdf=18) on white:
+        // exercises the bounded post-cap fallback and must STILL be gray ~[128,128,128].
+        let overlap_5_tail = px(76, 18);
+        assert!(
+            overlap_5_tail.iter().all(|&c| (124..=132).contains(&c)),
+            "5th overlapping mixed fill tail (past snapshot cap) must apply opacity once (~[128,128,128], not [128,64,64]), got {overlap_5_tail:?}"
+        );
+    }
+
+    #[test]
+    fn tiling_pattern_mixed_blend_preserves_translucent_backdrop_alpha_in_gap() {
+        // Cell 20×20 with Normal red + Multiply black ONLY on x=[0..10], leaving
+        // x=[10..20] as an unpainted gap. Over a 50%-opaque blue backdrop with
+        // SvgOptions.background = None, a 50%-opacity patterned fill or stroke
+        // must keep backdrop alpha = 0.5 (~128, NOT 0.625 / ~159) inside the gap.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 120.0, 60.0));
+        // 50%-opaque blue rectangle across the whole page on a transparent canvas.
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 120.0, 60.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        // 50%-opacity mixed-mode patterned fill covering x=[0..40].
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 60.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        // 50%-opacity mixed-mode patterned stroke covering x=[60..100] (center x=80, width=40).
+        let mut line = Path::new();
+        line.move_to(Point::new(80.0, 0.0));
+        line.line_to(Point::new(80.0, 60.0));
+        dl.push(RenderCommand::StrokePath {
+            path: line,
+            style: StrokeStyle {
+                width: 40.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Tiling(tiling),
+            alpha: 0.5,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions {
+                background: None,
+                ..SvgOptions::default()
+            },
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(120, 60).expect("pixmap");
+        let sx = 120.0 / tree.size().width();
+        let sy = 60.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let px_rgba = |x: u32, y: u32| -> [u8; 4] {
+            let p = pixmap.pixel(x, y).expect("in bounds");
+            [p.red(), p.green(), p.blue(), p.alpha()]
+        };
+
+        let outside = px_rgba(50, 30);
+        let fill_gap = px_rgba(15, 30);
+        let stroke_gap = px_rgba(75, 30);
+        assert!(
+            (124..=132).contains(&outside[3]),
+            "sanity check: 50%-opaque blue backdrop outside must have alpha ~128, got {outside:?}"
+        );
+        assert!(
+            (fill_gap[3] as i32 - outside[3] as i32).abs() <= 2
+                && (fill_gap[2] as i32 - outside[2] as i32).abs() <= 2
+                && fill_gap[0] <= 2
+                && fill_gap[1] <= 2,
+            "fill unpainted gap must preserve translucent backdrop ({outside:?}, NOT alpha ~159), got {fill_gap:?}"
+        );
+        assert!(
+            (stroke_gap[3] as i32 - outside[3] as i32).abs() <= 2
+                && (stroke_gap[2] as i32 - outside[2] as i32).abs() <= 2
+                && stroke_gap[0] <= 2
+                && stroke_gap[1] <= 2,
+            "stroke unpainted gap must preserve translucent backdrop ({outside:?}, NOT alpha ~159), got {stroke_gap:?}"
+        );
+        // Painted half of cell (x=5 in fill, x=65 in stroke): 50% black over 50%-opaque blue
+        // gives alpha = 0.5 + 0.5*(1 - 0.5) = 0.75 (~191), premul blue = 0.5*(1 - 0.5) = 0.25 (~64).
+        let fill_painted = px_rgba(5, 30);
+        let stroke_painted = px_rgba(65, 30);
+        assert!(
+            (187..=195).contains(&fill_painted[3]) && fill_painted[0] <= 2,
+            "fill painted half must composite once (~alpha 191, no red leak), got {fill_painted:?}"
+        );
+        assert!(
+            (187..=195).contains(&stroke_painted[3]) && stroke_painted[0] <= 2,
+            "stroke painted half must composite once (~alpha 191, no red leak), got {stroke_painted:?}"
         );
     }
 }

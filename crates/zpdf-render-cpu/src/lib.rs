@@ -64,6 +64,12 @@ pub struct CpuRenderer<'a> {
     /// raster.
     mask_pool: Vec<tiny_skia::Mask>,
     blend_stack: Vec<BlendEntry>,
+    /// Active non-isolated non-`Normal` transparency group currently recording
+    /// its inner commands so `PopBlendGroup` can evaluate both live-backdrop
+    /// color `(C_n, α_n)` and transparent group alpha `α_g` for exact
+    /// ISO 32000-1 §11.4.5 backdrop removal before compositing with its outer
+    /// blend mode.
+    recording_non_isolated: Option<RecordedNonIsolatedGroup>,
     /// Bytes retained by the live page/group pixmap plus parked blend parents.
     blend_surface_bytes: u64,
     /// Transparent page-sized surfaces left by finished blend groups and
@@ -547,6 +553,14 @@ struct BlendEntry {
     non_isolated: bool,
 }
 
+struct RecordedNonIsolatedGroup {
+    blend_mode: BlendMode,
+    alpha: f32,
+    mask: Option<Arc<[u8]>>,
+    nesting: usize,
+    cmds: Vec<RenderCommand>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CpuRenderError {
     #[error("not initialized")]
@@ -587,6 +601,7 @@ impl<'a> CpuRenderer<'a> {
             clip_mask_bytes: 0,
             mask_pool: Vec::new(),
             blend_stack: Vec::new(),
+            recording_non_isolated: None,
             blend_surface_bytes: 0,
             surface_pool: Vec::new(),
             pooled_surface_bytes: 0,
@@ -1233,6 +1248,7 @@ impl<'a> CpuRenderer<'a> {
                 clip_mask_bytes: 0,
                 mask_pool: Vec::new(),
                 blend_stack: Vec::new(),
+                recording_non_isolated: None,
                 blend_surface_bytes: self
                     .blend_surface_bytes
                     .saturating_add(self.pooled_surface_bytes)
@@ -1818,14 +1834,73 @@ impl<'a> CpuRenderer<'a> {
                 }
                 TilingBlendStep::OpacityGroup {
                     alpha: inner_alpha,
+                    mask: inner_mask,
                     steps: inner_steps,
                 } => {
                     if let Some((di, dj)) = overlap_shift {
-                        if !TilingBlendStep::any_intersects_period(inner_steps, tiling, di, dj) {
+                        if inner_mask
+                            .as_ref()
+                            .is_some_and(|m| !m.intersects_period(tiling, di, dj))
+                            || !TilingBlendStep::any_intersects_period(inner_steps, tiling, di, dj)
+                        {
                             continue;
                         }
                     }
-                    if self.with_backdrop_opacity(*inner_alpha, Some(region), |r| {
+                    if let Some(m_seg) = inner_mask {
+                        let ok = self.with_backdrop_shape_coverage(
+                            *inner_alpha,
+                            Some(region),
+                            |r, _band_offset| {
+                                if let Some((pixmap, transform, quality, tile_opacity)) = r
+                                    .prepare_tiling_paint_for(
+                                        tiling,
+                                        &m_seg.commands,
+                                        m_seg.segment_id,
+                                        overlap_shift,
+                                        1.0,
+                                    )
+                                {
+                                    let paint = tiny_skia::Paint {
+                                        shader: tiny_skia::Pattern::new(
+                                            (*pixmap).as_ref(),
+                                            tiny_skia::SpreadMode::Repeat,
+                                            quality,
+                                            tile_opacity,
+                                            transform,
+                                        ),
+                                        blend_mode: tiny_skia::BlendMode::SourceOver,
+                                        anti_alias: false,
+                                        ..Default::default()
+                                    };
+                                    if let Some(ref mut target) = r.pixmap {
+                                        if let Some(r_rect) =
+                                            PaintedBounds::whole(target.width(), target.height())
+                                                .to_rect()
+                                        {
+                                            target.fill_rect(
+                                                r_rect,
+                                                &paint,
+                                                tiny_skia::Transform::identity(),
+                                                None,
+                                            );
+                                        }
+                                    }
+                                }
+                            },
+                            |r, local_region| {
+                                r.paint_tiling_steps_in_region(
+                                    tiling,
+                                    inner_steps,
+                                    overlap_shift,
+                                    local_region,
+                                    remaining_passes,
+                                )
+                            },
+                        );
+                        if ok {
+                            painted = true;
+                        }
+                    } else if self.with_backdrop_opacity(*inner_alpha, Some(region), |r| {
                         let ok = r.paint_tiling_steps_in_region(
                             tiling,
                             inner_steps,
@@ -1870,8 +1945,33 @@ impl<'a> CpuRenderer<'a> {
             .max(0) as usize;
         let overlap_count = overlap_nx.saturating_mul(overlap_ny);
         let mut remaining_passes = MAX_DENSE_TILING_BLEND_PASSES;
+        let separate_copies = if overlap_count > 1 {
+            let mut total_passes = 0usize;
+            'count: for dj in overlap.dj.clone() {
+                for di in overlap.di.clone() {
+                    total_passes = total_passes.saturating_add(
+                        TilingBlendStep::count_intersecting_passes(steps, tiling, di, dj),
+                    );
+                    if total_passes > MAX_DENSE_TILING_BLEND_PASSES {
+                        break 'count;
+                    }
+                }
+            }
+            if total_passes > MAX_DENSE_TILING_BLEND_PASSES {
+                tracing::warn!(
+                    total_passes,
+                    limit = MAX_DENSE_TILING_BLEND_PASSES,
+                    "dense CPU tiling blend plan exceeds pass budget; flattening overlap copies per step"
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
         let mut painted = false;
-        if overlap_count > 1 {
+        if separate_copies {
             'copies: for dj in overlap.dj.clone() {
                 for di in overlap.di.clone() {
                     if self.over_budget || remaining_passes == 0 {
@@ -3067,6 +3167,24 @@ impl<'a> CpuRenderer<'a> {
             return;
         }
 
+        // A non-isolated group with a non-Normal outer blend mode (e.g. a
+        // backdrop-dependent tiling pattern painted under `/BM /Screen`,
+        // ISO 32000-1 §11.4.5 / §11.6.7) must evaluate its elements against
+        // the live backdrop before applying the outer blend mode, while
+        // tracking accumulated group alpha α_g over transparent so untouched
+        // pixels and cell gaps are left undisturbed. Record its inner commands
+        // until the matching `PopBlendGroup`.
+        if !isolated && !knockout && blend_mode != BlendMode::Normal {
+            self.recording_non_isolated = Some(RecordedNonIsolatedGroup {
+                blend_mode,
+                alpha,
+                mask: mask_plane,
+                nesting: 0,
+                cmds: Vec::new(),
+            });
+            return;
+        }
+
         let pixmap = match self.pixmap.take() {
             Some(p) => p,
             None => return,
@@ -3132,6 +3250,185 @@ impl<'a> CpuRenderer<'a> {
         if self.pixmap.is_some() {
             self.blend_surface_bytes += surface_bytes;
         }
+    }
+
+    /// Replay a recorded non-isolated non-`Normal` group against both the live
+    /// backdrop (producing `(C_n, α_n)`) and a transparent surface (producing
+    /// accumulated group alpha `α_g`), perform exact ISO 32000-1 §11.4.5
+    /// backdrop removal, fold any soft mask, and composite onto `backdrop` with
+    /// `rec.blend_mode` and `rec.alpha`.
+    fn finish_recorded_non_isolated_group(&mut self, rec: RecordedNonIsolatedGroup) {
+        if self.over_budget || rec.cmds.is_empty() {
+            return;
+        }
+        let Some(mut backdrop) = self.pixmap.take() else {
+            return;
+        };
+        let (w, h) = (backdrop.width(), backdrop.height());
+        let surface_bytes = w as u64 * h as u64 * 4;
+        let pooled_count = self
+            .surface_pool
+            .iter()
+            .filter(|p| (p.width(), p.height()) == (w, h))
+            .count();
+        let needed_new_bytes = 2usize.saturating_sub(pooled_count) as u64 * surface_bytes;
+        if needed_new_bytes > 0 && !self.surface_room(needed_new_bytes) {
+            tracing::warn!(
+                "non-isolated blend group scratch exceeds memory budget; falling back to isolated group"
+            );
+            self.pixmap = Some(backdrop);
+            self.push_blend_group(rec.blend_mode, true, false, rec.alpha, None);
+            if let Some(last) = self.blend_stack.last_mut() {
+                last.mask = rec.mask;
+            }
+            for cmd in &rec.cmds {
+                let _ = self.execute(cmd);
+            }
+            self.pop_blend_group();
+            return;
+        }
+        let Some(mut group_color) = self.take_surface(w, h) else {
+            self.pixmap = Some(backdrop);
+            return;
+        };
+        let Some(group_alpha) = self.take_surface(w, h) else {
+            self.recycle_surface(group_color, None);
+            self.pixmap = Some(backdrop);
+            return;
+        };
+
+        let backdrop_dirty = self.dirty.take();
+        self.blend_surface_bytes = self
+            .blend_surface_bytes
+            .saturating_add(surface_bytes.saturating_mul(2));
+
+        let run_pass = |this: &mut Self, target: tiny_skia::Pixmap| {
+            let base_clips = this.clip_stack.len();
+            let base_blends = this.blend_stack.len();
+            let base_skipped = this.skipped_blend_depth;
+            this.pixmap = Some(target);
+            this.dirty = None;
+            for cmd in &rec.cmds {
+                if this.over_budget {
+                    break;
+                }
+                let _ = this.execute(cmd);
+            }
+            while this.skipped_blend_depth > base_skipped {
+                this.skipped_blend_depth -= 1;
+            }
+            while this.blend_stack.len() > base_blends {
+                this.pop_blend_group();
+            }
+            while this.clip_stack.len() > base_clips {
+                this.pop_clip();
+            }
+            (this.pixmap.take(), this.dirty.take())
+        };
+
+        // Pass 1: evaluate commands over a copy of the live backdrop -> (C_n, α_n).
+        group_color.data_mut().copy_from_slice(backdrop.data());
+        let (group_color, _color_dirty) = run_pass(self, group_color);
+
+        // Pass 2: evaluate the same commands over transparent -> exact α_g.
+        let (group_alpha, alpha_dirty) = run_pass(self, group_alpha);
+
+        self.blend_surface_bytes = self
+            .blend_surface_bytes
+            .saturating_sub(surface_bytes.saturating_mul(2));
+
+        let (mut group_color, group_alpha) = match (group_color, group_alpha) {
+            (Some(gc), Some(ga)) => (gc, ga),
+            (gc_opt, ga_opt) => {
+                if let Some(gc) = gc_opt {
+                    let whole = PaintedBounds::whole(gc.width(), gc.height());
+                    self.recycle_surface(gc, Some(whole));
+                }
+                if let Some(ga) = ga_opt {
+                    self.recycle_surface(ga, alpha_dirty);
+                }
+                self.dirty = backdrop_dirty;
+                self.pixmap = Some(backdrop);
+                return;
+            }
+        };
+
+        let region = alpha_dirty.filter(|r| !r.is_empty());
+        if let Some(region) = region {
+            let stride = w as usize;
+            let base_data = backdrop.data();
+            let alpha_data = group_alpha.data();
+            let col_data = group_color.data_mut();
+            let (x0, x1) = (region.x0 as usize, region.x1 as usize);
+            for y in region.y0 as usize..region.y1 as usize {
+                let row = y * stride;
+                let m_row = rec
+                    .mask
+                    .as_ref()
+                    .and_then(|plane| plane.get(row + x0..row + x1));
+                for (dx, x) in (x0..x1).enumerate() {
+                    let p = (row + x) * 4;
+                    let ga_u8 = alpha_data[p + 3];
+                    if ga_u8 == 0 {
+                        col_data[p..p + 4].fill(0);
+                        continue;
+                    }
+                    let a_g = ga_u8 as f32 / 255.0;
+                    let a_n = col_data[p + 3] as f32 / 255.0;
+                    let a_0 = base_data[p + 3] as f32 / 255.0;
+                    let factor = a_0 / a_g - a_0;
+                    let m_u8 = m_row.map_or(255, |r| r[dx]);
+                    if m_u8 == 0 {
+                        col_data[p..p + 4].fill(0);
+                        continue;
+                    }
+                    for ch in 0..3 {
+                        let c_n = if a_n > 0.0 {
+                            (col_data[p + ch] as f32 / 255.0) / a_n
+                        } else {
+                            0.0
+                        };
+                        let c_0 = if a_0 > 0.0 {
+                            (base_data[p + ch] as f32 / 255.0) / a_0
+                        } else {
+                            0.0
+                        };
+                        let c_g = (c_n + (c_n - c_0) * factor).clamp(0.0, 1.0);
+                        let premul = (c_g * a_g * 255.0).round().clamp(0.0, 255.0) as u8;
+                        col_data[p + ch] = if m_u8 == 255 {
+                            premul
+                        } else {
+                            mul255(premul, m_u8)
+                        };
+                    }
+                    col_data[p + 3] = if m_u8 == 255 {
+                        ga_u8
+                    } else {
+                        mul255(ga_u8, m_u8)
+                    };
+                }
+            }
+
+            let paint = tiny_skia::PixmapPaint {
+                blend_mode: Self::blend_mode_to_skia(rec.blend_mode),
+                opacity: unit(rec.alpha),
+                ..Default::default()
+            };
+            if let Some(rect) = region.to_rect() {
+                composite_group_region(&mut backdrop, &group_color, &paint, rect);
+            }
+            self.dirty = Some(match backdrop_dirty {
+                Some(b) => b.union(region),
+                None => region,
+            });
+        } else {
+            self.dirty = backdrop_dirty;
+        }
+
+        let whole = PaintedBounds::whole(group_color.width(), group_color.height());
+        self.recycle_surface(group_color, Some(whole));
+        self.recycle_surface(group_alpha, alpha_dirty);
+        self.pixmap = Some(backdrop);
     }
 
     fn pop_blend_group(&mut self) {
@@ -3620,6 +3917,7 @@ impl<'a> CpuRenderer<'a> {
             clip_mask_bytes: 0,
             mask_pool: Vec::new(),
             blend_stack: Vec::new(),
+            recording_non_isolated: None,
             // Everything the page holds stays allocated while the mask group
             // renders, so its groups share the page's budget rather than
             // starting a fresh one per nesting level.
@@ -4955,6 +5253,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.current_clip = None;
         self.clip_bounds = None;
         self.blend_stack.clear();
+        self.recording_non_isolated = None;
         self.blend_surface_bytes = 0;
         self.surface_pool.clear();
         self.pooled_surface_bytes = 0;
@@ -5026,6 +5325,26 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
                 self.over_budget = true;
                 tracing::warn!("render exceeded time budget; truncating page");
             }
+        }
+
+        if let Some(ref mut rec) = self.recording_non_isolated {
+            match cmd {
+                RenderCommand::PushBlendGroup { .. } => {
+                    rec.nesting += 1;
+                    rec.cmds.push(cmd.clone());
+                }
+                RenderCommand::PopBlendGroup if rec.nesting > 0 => {
+                    rec.nesting -= 1;
+                    rec.cmds.push(cmd.clone());
+                }
+                RenderCommand::PopBlendGroup => {
+                    if let Some(finished) = self.recording_non_isolated.take() {
+                        self.finish_recorded_non_isolated_group(finished);
+                    }
+                }
+                _ => rec.cmds.push(cmd.clone()),
+            }
+            return Ok(());
         }
 
         if self.over_budget {
@@ -5108,6 +5427,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
     fn end_page(&mut self) -> Result<Self::Target, Self::Error> {
         // Gracefully close a malformed/truncated display list. This also restores
         // the real page target if the deadline fired inside an open blend group.
+        self.recording_non_isolated = None;
         while !self.blend_stack.is_empty() {
             self.pop_blend_group();
         }

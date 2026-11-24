@@ -793,12 +793,17 @@ impl PageRecorder {
         self.blend_frames.push(BlendFrameKind::Passthrough);
     }
 
-    /// Begin a non-isolated `Normal` group with constant `alpha` and optional
+    /// Begin a non-isolated group with `mode`, constant `alpha`, and optional
     /// soft `mask` (ISO 32000-1 §11.4.5 / §11.6.7): the group layer starts from
-    /// a copy of the live parent backdrop so blend modes / overprint inside
-    /// evaluate against the real destination, and `PopBlend` applies `alpha`
-    /// (and `mask` coverage when present) ONCE via `mix(base, group, alpha * cov)`.
-    pub fn push_non_isolated(&mut self, alpha: f32, mask: Option<MaskOps>) {
+    /// a copy of the live parent backdrop so inner blend modes evaluate against
+    /// the real destination before the outer `mode`, `alpha`, and `mask` are
+    /// applied on `PopBlend`.
+    pub fn push_non_isolated_with_mode(
+        &mut self,
+        mode: BlendMode,
+        alpha: f32,
+        mask: Option<MaskOps>,
+    ) {
         if !self.can_push_blend() {
             if self.skipped_blend_depth == 0 {
                 tracing::warn!(
@@ -812,7 +817,7 @@ impl PageRecorder {
         }
         let clips = self.active_clips();
         self.ops.push(PageOp::PushBlend {
-            mode: BlendMode::Normal,
+            mode,
             alpha,
             clips,
             mask,
@@ -822,6 +827,15 @@ impl PageRecorder {
         });
         self.blend_depth += 1;
         self.blend_frames.push(BlendFrameKind::Real);
+    }
+
+    /// Begin a non-isolated `Normal` group with constant `alpha` and optional
+    /// soft `mask` (ISO 32000-1 §11.4.5 / §11.6.7): the group layer starts from
+    /// a copy of the live parent backdrop so blend modes / overprint inside
+    /// evaluate against the real destination, and `PopBlend` applies `alpha`
+    /// (and `mask` coverage when present) ONCE via `mix(base, group, alpha * cov)`.
+    pub fn push_non_isolated(&mut self, alpha: f32, mask: Option<MaskOps>) {
+        self.push_non_isolated_with_mode(BlendMode::Normal, alpha, mask);
     }
 
     /// Begin a non-isolated constant-opacity group (no soft mask).
