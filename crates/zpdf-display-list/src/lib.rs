@@ -14,6 +14,7 @@ pub struct DisplayList {
     /// so recorded ranges cannot silently refer to different commands.
     pub commands: Vec<RenderCommand>,
     expanded_glyph_runs: Vec<ExpandedGlyphRun>,
+    pattern_ranges: Vec<(usize, usize)>,
 }
 
 impl DisplayList {
@@ -22,11 +23,20 @@ impl DisplayList {
             page_rect,
             commands: Vec::new(),
             expanded_glyph_runs: Vec::new(),
+            pattern_ranges: Vec::new(),
         }
     }
 
     pub fn push(&mut self, cmd: RenderCommand) {
         self.commands.push(cmd);
+    }
+
+    /// Truncate `self.commands` to `len` and drop any recorded metadata ranges
+    /// that extend past `len`.
+    pub fn truncate_commands(&mut self, len: usize) {
+        self.commands.truncate(len);
+        self.expanded_glyph_runs.retain(|e| e.cmd_end <= len);
+        self.pattern_ranges.retain(|&(_, end)| end <= len);
     }
 
     /// Record a semantic glyph run whose visual marks have already been
@@ -73,6 +83,50 @@ impl DisplayList {
     /// `cmd_start` with non-overlapping `[cmd_start, cmd_end)` ranges.
     pub fn expanded_glyph_runs(&self) -> &[ExpandedGlyphRun] {
         &self.expanded_glyph_runs
+    }
+
+    /// Record a command range `[cmd_start, cmd_end)` emitted while painting a
+    /// tiling pattern cell. Glyphs inside a pattern cell are decorative paint
+    /// artwork rather than logical page text.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cmd_start > cmd_end`, `cmd_end > self.commands.len()`, or
+    /// `cmd_start` overlaps a previously recorded range.
+    pub fn push_pattern_range(&mut self, cmd_start: usize, cmd_end: usize) {
+        assert!(
+            cmd_start <= cmd_end && cmd_end <= self.commands.len(),
+            "pattern command range {cmd_start}..{cmd_end} out of bounds for {} commands",
+            self.commands.len()
+        );
+        if let Some(&(_, prev_end)) = self.pattern_ranges.last() {
+            assert!(
+                cmd_start >= prev_end,
+                "pattern command range {cmd_start}..{cmd_end} overlaps previous range ending at {prev_end}",
+            );
+        }
+        if cmd_start < cmd_end {
+            self.pattern_ranges.push((cmd_start, cmd_end));
+        }
+    }
+
+    /// Discard all recorded pattern command ranges.
+    pub fn clear_pattern_ranges(&mut self) {
+        self.pattern_ranges.clear();
+    }
+
+    /// Non-overlapping `[cmd_start, cmd_end)` ranges of commands emitted while
+    /// painting tiling pattern cells.
+    pub fn pattern_ranges(&self) -> &[(usize, usize)] {
+        &self.pattern_ranges
+    }
+
+    /// Whether `commands[cmd_idx]` originated inside a tiling pattern cell.
+    pub fn is_in_pattern_range(&self, cmd_idx: usize) -> bool {
+        let pos = self
+            .pattern_ranges
+            .partition_point(|&(start, _)| start <= cmd_idx);
+        pos > 0 && cmd_idx < self.pattern_ranges[pos - 1].1
     }
 }
 
@@ -383,6 +437,28 @@ mod tests {
         }
         dl.push_expanded_glyph_run(0, 3, sample_glyph_run(1));
         dl.push_expanded_glyph_run(2, 4, sample_glyph_run(2));
+    }
+
+    #[test]
+    fn pattern_ranges_track_membership_and_truncate_cleanly() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for _ in 0..6 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_pattern_range(1, 3);
+        dl.push_pattern_range(4, 6);
+        assert!(!dl.is_in_pattern_range(0));
+        assert!(dl.is_in_pattern_range(1));
+        assert!(dl.is_in_pattern_range(2));
+        assert!(!dl.is_in_pattern_range(3));
+        assert!(dl.is_in_pattern_range(4));
+        assert!(dl.is_in_pattern_range(5));
+        assert!(!dl.is_in_pattern_range(6));
+
+        dl.truncate_commands(4);
+        assert_eq!(dl.commands.len(), 4);
+        assert_eq!(dl.pattern_ranges(), &[(1, 3)]);
+        assert!(!dl.is_in_pattern_range(4));
     }
 }
 

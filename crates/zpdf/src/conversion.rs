@@ -171,7 +171,9 @@ pub fn convert_pdf(
                 .with_images(&mut images)
                 .with_image_cache_limit(remaining_image_bytes);
         } else {
-            interpreter = interpreter.with_skip_images(true);
+            interpreter = interpreter
+                .with_skip_images(true)
+                .with_skip_type3_painting(true);
         }
         if let Some(oc) = &oc_config {
             interpreter = interpreter.with_optional_content(oc);

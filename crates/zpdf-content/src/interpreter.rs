@@ -66,6 +66,10 @@ pub struct ContentInterpreter<'a> {
     /// and shading rasters (used by extraction-only callers that discard the
     /// display list).
     skip_images: bool,
+    /// Skip visual CharProc replay for Type 3 glyphs (used by extraction-only
+    /// callers that discard the display list so repeated vector glyphs do not
+    /// exhaust the page's shared operator budget).
+    skip_type3_painting: bool,
     max_image_cache_bytes: u64,
     max_font_cache_bytes: u64,
     /// Active document/standalone parsing policy used by inline image filters
@@ -140,6 +144,9 @@ pub struct ContentInterpreter<'a> {
     /// innermost last. Lookups search these before the page resources.
     form_resources: Vec<std::sync::Arc<ResourceDict>>,
     form_depth: u32,
+    /// Nesting depth inside `paint_tiling_pattern` on the current display list;
+    /// outermost depth records `[cmd_start, cmd_end)` ranges on `DisplayList`.
+    pattern_depth: u32,
     /// Object ids of the form XObjects currently being interpreted. A form
     /// that draws itself (directly, or through a pattern cell) recurses
     /// forever, so re-entry is refused instead of fanning out to the budget.
@@ -1163,6 +1170,7 @@ impl<'a> ContentInterpreter<'a> {
             resources: None,
             image_cache: None,
             skip_images: false,
+            skip_type3_painting: false,
             max_image_cache_bytes: limits.max_image_cache_bytes,
             max_font_cache_bytes: limits.max_font_cache_bytes,
             parse_limits: limits,
@@ -1187,6 +1195,7 @@ impl<'a> ContentInterpreter<'a> {
             font_override: false,
             form_resources: Vec::new(),
             form_depth: 0,
+            pattern_depth: 0,
             active_forms: Vec::new(),
             active_type3_glyphs: Vec::new(),
             type3_font_resources: HashMap::new(),
@@ -1661,6 +1670,17 @@ impl<'a> ContentInterpreter<'a> {
     /// emit image-budget diagnostics.
     pub fn with_skip_images(mut self, skip: bool) -> Self {
         self.skip_images = skip;
+        self
+    }
+
+    /// Skip visual replay of Type 3 glyph CharProc streams while preserving
+    /// text advances and decoded text extraction.
+    ///
+    /// Intended for extraction-only callers (such as `ConversionMode::TextOnly`)
+    /// that discard the display list so repeated vector glyphs cannot consume
+    /// the page's shared operator budget.
+    pub fn with_skip_type3_painting(mut self, skip: bool) -> Self {
+        self.skip_type3_painting = skip;
         self
     }
 
@@ -4653,6 +4673,7 @@ impl<'a> ContentInterpreter<'a> {
         // takes effect later, possibly in visible content).
         let page_rect = self.display_list.page_rect;
         let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
+        let saved_pattern_depth = std::mem::replace(&mut self.pattern_depth, 0);
         let saved_state = self.current.clone();
         let saved_oc_hidden = self.oc_hidden_from.take();
         // Mask glyphs and rules define opacity, not logical page content.
@@ -4679,6 +4700,7 @@ impl<'a> ContentInterpreter<'a> {
         self.text_sink = saved_text_sink;
         self.span_streams = saved_span_streams;
         self.rule_sink = saved_rule_sink;
+        self.pattern_depth = saved_pattern_depth;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
         // /BC components live in the group's /CS; the mean is a serviceable
@@ -5300,7 +5322,7 @@ impl<'a> ContentInterpreter<'a> {
             }
             true
         } else {
-            self.display_list.commands.truncate(cmd_mark);
+            self.display_list.truncate_commands(cmd_mark);
             false
         }
     }
@@ -6676,6 +6698,9 @@ impl<'a> ContentInterpreter<'a> {
         let saved_tile_op_index = self.tile_op_index;
         let saved_mc_stream = self.current_mc_stream.take();
 
+        let pattern_cmd_start = self.display_list.commands.len();
+        let is_outer_pattern = self.pattern_depth == 0;
+        self.pattern_depth += 1;
         self.form_depth += 1;
         'tiles: for j in j0..=j1 {
             for i in i0..=i1 {
@@ -6804,6 +6829,14 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.form_depth -= 1;
+        self.pattern_depth -= 1;
+        if is_outer_pattern {
+            let pattern_cmd_end = self.display_list.commands.len();
+            if pattern_cmd_end > pattern_cmd_start {
+                self.display_list
+                    .push_pattern_range(pattern_cmd_start, pattern_cmd_end);
+            }
+        }
         self.current_mc_stream = saved_mc_stream;
         self.soft_mask_reuse = saved_mask_reuse;
         self.tile_op_index = saved_tile_op_index;
@@ -6837,6 +6870,9 @@ impl<'a> ContentInterpreter<'a> {
             .and_then(|fc| fc.get(font_id))
             .is_some_and(|font| font.is_type3());
         if is_type3 {
+            if self.skip_type3_painting {
+                return;
+            }
             let paint_color = self.current.fill_color;
             let alpha = self.current.fill_alpha;
             let overprint =
@@ -7102,7 +7138,7 @@ impl<'a> ContentInterpreter<'a> {
         overprint: Option<Overprint>,
     ) {
         const MAX_TYPE3_DEPTH: u32 = 16;
-        if glyphs.is_empty() || self.over_budget() {
+        if self.skip_type3_painting || glyphs.is_empty() || self.over_budget() {
             return;
         }
         if self.oc_suppressed() {
