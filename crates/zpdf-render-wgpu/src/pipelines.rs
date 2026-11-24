@@ -42,6 +42,14 @@ pub struct Pipelines {
     pub mask_apply_bgl: wgpu::BindGroupLayout,
     /// Soft-mask apply pipeline (fullscreen, group × mask coverage).
     pub mask_apply: wgpu::RenderPipeline,
+    /// Bind group 1 (affine tile): base + trans + tile0 + tile1 + repeat sampler.
+    pub affine_tile_bgl: wgpu::BindGroupLayout,
+    /// Exact 3-seed affine dense tiling pattern composite pipeline.
+    pub affine_tile: wgpu::RenderPipeline,
+    /// Shared constant uniform for `COPY_BASE_MODE` (`init_layer_from_base`).
+    pub copy_base_uniform: wgpu::Buffer,
+    /// Shared constant uniforms for standard opaque (`alpha == 1.0`) blend modes `0..16`.
+    pub blend_opaque_uniforms: [wgpu::Buffer; 16],
 }
 
 impl Pipelines {
@@ -451,6 +459,133 @@ impl Pipelines {
             cache: None,
         });
 
+        let affine_tile_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("zpdf-affine-tile-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let affine_shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/affine_tile.wgsl"));
+        let affine_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("zpdf-affine-tile-layout"),
+            bind_group_layouts: &[Some(&page_bgl), Some(&affine_tile_bgl)],
+            immediate_size: 0,
+        });
+        let affine_vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TexturedVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &tex_attrs,
+        };
+        let affine_tile = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("zpdf-affine-tile"),
+            layout: Some(&affine_layout),
+            vertex: wgpu::VertexState {
+                module: &affine_shader,
+                entry_point: Some("vs_affine_tile"),
+                buffers: &[Some(affine_vbl)],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(content_stencil_state()),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &affine_shader,
+                entry_point: Some("fs_affine_tile"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        use wgpu::util::DeviceExt;
+        let copy_base_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("zpdf-copy-base-mode"),
+            contents: bytemuck::cast_slice(&[
+                101u32,
+                1.0f32.to_bits(),
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let blend_opaque_uniforms = std::array::from_fn(|mode_id| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("zpdf-blend-opaque-mode"),
+                contents: bytemuck::cast_slice(&[
+                    mode_id as u32,
+                    1.0f32.to_bits(),
+                    0u32,
+                    0u32,
+                    0u32,
+                    0u32,
+                    0u32,
+                    0u32,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+        });
+
         Self {
             page_bgl,
             tex_bgl,
@@ -467,6 +602,10 @@ impl Pipelines {
             composite,
             mask_apply_bgl,
             mask_apply,
+            affine_tile_bgl,
+            affine_tile,
+            copy_base_uniform,
+            blend_opaque_uniforms,
         }
     }
 }

@@ -235,6 +235,14 @@ const MAX_TILING_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_DIRECT_TILING_TILES: i64 = 4096;
 const MAX_DENSE_TILING_BLEND_PASSES: usize = 1024;
 
+struct PreparedAffineTiles {
+    trans: Arc<tiny_skia::Pixmap>,
+    k: Arc<tiny_skia::Pixmap>,
+    f1: Arc<tiny_skia::Pixmap>,
+    transform: tiny_skia::Transform,
+    quality: tiny_skia::FilterQuality,
+}
+
 fn unit(v: f32) -> f32 {
     if v.is_finite() {
         v.clamp(0.0, 1.0)
@@ -1397,25 +1405,26 @@ impl<'a> CpuRenderer<'a> {
         Some((tile_pixmap, transform, quality, opacity))
     }
 
-    /// Collapse an overlapping dense backdrop-dependent tiling pattern whose
-    /// per-copy pass count exceeds [`MAX_DENSE_TILING_BLEND_PASSES`] into two
-    /// repeating tiles `(T_mul, T_scr)` evaluated in **exact per-copy draw
-    /// order** (all steps of copy 0, then all steps of copy 1, ...) onto tiny
-    /// black (`f(0)`), white (`f(1)`), and transparent (`α_tile`) tiles.
-    /// Applying `T_mul` (`Multiply`) then `T_scr` (`Screen`) reproduces
-    /// `f(0) + (f(1) - f(0)) * B` in 2 page passes while preserving exact copy
-    /// order (e.g. interleaved `Multiply` + `Screen` pairs).
+    /// Collapse an affine overlapping dense backdrop-dependent tiling pattern
+    /// whose per-copy pass count exceeds [`MAX_DENSE_TILING_BLEND_PASSES`] into
+    /// three repeating sample tiles `(tile_trans, tile0, tile1)` evaluated in
+    /// **exact per-copy draw order** onto transparent (`(T, a_t)`), opaque black
+    /// (`K`), and opaque white (`K + M`). Applying:
+    ///
+    /// - `out_a = a_t + (1 - a_t) * B_a`
+    /// - `out_rgb = (1 - B_a) * T + B_a * K + M * B_rgb`
+    ///
+    /// reproduces any sequence of `Normal` / `Multiply` / `Screen` /
+    /// `OpacityGroup` steps in a single pass across arbitrary target alpha
+    /// (transparent, translucent, and opaque) without reordering copies.
+    /// Returns `None` without caching if pass or wall-clock budgets are
+    /// exhausted so partial tiles are never cached as complete.
     fn prepare_tiling_affine_tiles(
         &mut self,
         tiling: &TilingPattern,
         steps: &[TilingBlendStep],
-    ) -> Option<(
-        Arc<tiny_skia::Pixmap>,
-        Arc<tiny_skia::Pixmap>,
-        tiny_skia::Transform,
-        tiny_skia::FilterQuality,
-    )> {
-        const MAX_AFFINE_TILE_PASSES: usize = 4096;
+    ) -> Option<PreparedAffineTiles> {
+        const MAX_AFFINE_TILE_PASSES: usize = 65_536;
         if self.tiling_depth >= MAX_TILING_DEPTH || steps.is_empty() {
             return None;
         }
@@ -1513,7 +1522,16 @@ impl<'a> CpuRenderer<'a> {
             .soft_mask_depth
             .saturating_add(self.blend_stack.len())
             .saturating_add(self.non_isolated_depth);
-        let mul_key = TilingCacheKey::new(
+        let trans_key = TilingCacheKey::new(
+            tiling,
+            usize::MAX - 2,
+            None,
+            BlendMode::Normal,
+            tile_w,
+            tile_h,
+            blend_depth,
+        );
+        let k_key = TilingCacheKey::new(
             tiling,
             usize::MAX - 1,
             None,
@@ -1522,7 +1540,7 @@ impl<'a> CpuRenderer<'a> {
             tile_h,
             blend_depth,
         );
-        let scr_key = TilingCacheKey::new(
+        let f1_key = TilingCacheKey::new(
             tiling,
             usize::MAX,
             None,
@@ -1531,11 +1549,18 @@ impl<'a> CpuRenderer<'a> {
             tile_h,
             blend_depth,
         );
-        if let (Some((_, mul_pm)), Some((_, scr_pm))) = (
-            self.tiling_cache.get(&mul_key),
-            self.tiling_cache.get(&scr_key),
+        if let (Some((_, trans_pm)), Some((_, k_pm)), Some((_, f1_pm))) = (
+            self.tiling_cache.get(&trans_key),
+            self.tiling_cache.get(&k_key),
+            self.tiling_cache.get(&f1_key),
         ) {
-            return Some((Arc::clone(mul_pm), Arc::clone(scr_pm), transform, quality));
+            return Some(PreparedAffineTiles {
+                trans: Arc::clone(trans_pm),
+                k: Arc::clone(k_pm),
+                f1: Arc::clone(f1_pm),
+                transform,
+                quality,
+            });
         }
 
         let tile_bytes = tile_w as u64 * tile_h as u64 * 4;
@@ -1553,7 +1578,7 @@ impl<'a> CpuRenderer<'a> {
         }
 
         let overlap = tiling.overlap_copy_ranges();
-        let make_sub = |target: tiny_skia::Pixmap, alpha_only: bool| CpuRenderer {
+        let make_sub = |target: tiny_skia::Pixmap| CpuRenderer {
             pixmap: Some(target),
             dirty: None,
             scale: cell_scale_x,
@@ -1578,7 +1603,7 @@ impl<'a> CpuRenderer<'a> {
             blend_stack: Vec::new(),
             recording_non_isolated: None,
             non_isolated_depth: 0,
-            alpha_only_pass: alpha_only,
+            alpha_only_pass: false,
             shape_only_pass: false,
             blend_surface_bytes: self
                 .blend_surface_bytes
@@ -1607,17 +1632,19 @@ impl<'a> CpuRenderer<'a> {
             page_start: None,
         };
 
+        #[allow(clippy::too_many_arguments)]
         fn exec_steps_on_tile(
             sub: &mut CpuRenderer,
             tiling: &TilingPattern,
             steps: &[TilingBlendStep],
             di: i64,
             dj: i64,
-            alpha_only: bool,
+            seed_is_opaque: bool,
             remaining: &mut usize,
+            exhausted: &mut bool,
         ) {
             for step in steps {
-                if sub.over_budget || *remaining == 0 {
+                if sub.over_budget || *exhausted {
                     return;
                 }
                 match step {
@@ -1625,8 +1652,15 @@ impl<'a> CpuRenderer<'a> {
                         if !seg.intersects_period(tiling, di, dj) {
                             continue;
                         }
-                        *remaining = remaining.saturating_sub(1);
-                        let wrap = !alpha_only && seg.blend_mode != BlendMode::Normal;
+                        if seed_is_opaque && seg.is_identity_on_opaque() {
+                            continue;
+                        }
+                        if *remaining == 0 {
+                            *exhausted = true;
+                            return;
+                        }
+                        *remaining -= 1;
+                        let wrap = seg.blend_mode != BlendMode::Normal;
                         if wrap {
                             sub.push_blend_group(seg.blend_mode, true, false, 1.0, None);
                         }
@@ -1683,14 +1717,30 @@ impl<'a> CpuRenderer<'a> {
                                 },
                                 |r, _| {
                                     exec_steps_on_tile(
-                                        r, tiling, inner, di, dj, alpha_only, remaining,
+                                        r,
+                                        tiling,
+                                        inner,
+                                        di,
+                                        dj,
+                                        seed_is_opaque,
+                                        remaining,
+                                        exhausted,
                                     );
                                     true
                                 },
                             );
                         } else {
                             let _ = sub.with_backdrop_opacity(a, whole, |r| {
-                                exec_steps_on_tile(r, tiling, inner, di, dj, alpha_only, remaining);
+                                exec_steps_on_tile(
+                                    r,
+                                    tiling,
+                                    inner,
+                                    di,
+                                    dj,
+                                    seed_is_opaque,
+                                    remaining,
+                                    exhausted,
+                                );
                                 true
                             });
                         }
@@ -1699,98 +1749,87 @@ impl<'a> CpuRenderer<'a> {
             }
         }
 
-        let run_sample = |seed: Option<tiny_skia::Color>,
-                          alpha_only: bool|
-         -> Option<(tiny_skia::Pixmap, bool)> {
-            let mut target = tiny_skia::Pixmap::new(tile_w, tile_h)?;
-            if let Some(c) = seed {
-                target.fill(c);
-            }
-            let mut sub = make_sub(target, alpha_only);
-            let mut rem = MAX_AFFINE_TILE_PASSES;
-            'copies: for dj in overlap.dj.clone() {
-                for di in overlap.di.clone() {
-                    if sub.over_budget || rem == 0 {
-                        break 'copies;
-                    }
-                    if !sub.soft_mask_planes.is_empty() {
-                        sub.soft_mask_planes.clear();
-                        sub.soft_mask_cache_bytes = 0;
-                    }
-                    sub.rect_x0 = (bx0 - di as f64 * x_step) as f32;
-                    sub.rect_y0 = (by0 - dj as f64 * y_step) as f32;
-                    sub.rect_y1 = (by0 + abs_y - dj as f64 * y_step) as f32;
-                    exec_steps_on_tile(&mut sub, tiling, steps, di, dj, alpha_only, &mut rem);
-                }
-            }
-            let ob = sub.over_budget;
-            Some((sub.pixmap.take()?, ob))
-        };
-
-        let (tile0, ob0) = run_sample(Some(tiny_skia::Color::BLACK), false)?;
-        let (tile1, ob1) = run_sample(Some(tiny_skia::Color::WHITE), false)?;
-        let (tile_a, oba) = run_sample(None, true)?;
-        if ob0 || ob1 || oba {
-            self.over_budget = true;
-        }
-
-        let mut mul_pm = tiny_skia::Pixmap::new(tile_w, tile_h)?;
-        let mut scr_pm = tiny_skia::Pixmap::new(tile_w, tile_h)?;
-        let d0 = tile0.data();
-        let d1 = tile1.data();
-        let da = tile_a.data();
-        let dm = mul_pm.data_mut();
-        let ds = scr_pm.data_mut();
-        for p in (0..d0.len()).step_by(4) {
-            let a_u8 = da[p + 3];
-            if a_u8 == 0 {
-                continue;
-            }
-            let a_f = a_u8 as f32 / 255.0;
-            let mut max_k = 0u8;
-            for ch in 0..3 {
-                let k_u8 = d0[p + ch];
-                max_k = max_k.max(k_u8);
-                let k = k_u8 as f32 / 255.0;
-                let f1 = d1[p + ch] as f32 / 255.0;
-                let m = (f1 - k).clamp(0.0, 1.0 - k);
-                let t_mul = if 1.0 - k > 1e-6 {
-                    (m / (1.0 - k)).clamp(0.0, 1.0)
+        let run_sample =
+            |seed: Option<tiny_skia::Color>| -> Option<(tiny_skia::Pixmap, bool, bool)> {
+                let mut target = tiny_skia::Pixmap::new(tile_w, tile_h)?;
+                let seed_is_opaque = if let Some(c) = seed {
+                    target.fill(c);
+                    true
                 } else {
-                    0.0
+                    false
                 };
-                let r_mul = (t_mul - (1.0 - a_f)).clamp(0.0, a_f);
-                dm[p + ch] = (r_mul * 255.0).round().clamp(0.0, a_u8 as f32) as u8;
-                ds[p + ch] = k_u8;
-            }
-            dm[p + 3] = a_u8;
-            ds[p + 3] = max_k;
+                let mut sub = make_sub(target);
+                let mut rem = MAX_AFFINE_TILE_PASSES;
+                let mut exhausted = false;
+                'copies: for dj in overlap.dj.clone() {
+                    for di in overlap.di.clone() {
+                        if sub.over_budget || exhausted {
+                            break 'copies;
+                        }
+                        if !sub.soft_mask_planes.is_empty() {
+                            sub.soft_mask_planes.clear();
+                            sub.soft_mask_cache_bytes = 0;
+                        }
+                        sub.rect_x0 = (bx0 - di as f64 * x_step) as f32;
+                        sub.rect_y0 = (by0 - dj as f64 * y_step) as f32;
+                        sub.rect_y1 = (by0 + abs_y - dj as f64 * y_step) as f32;
+                        exec_steps_on_tile(
+                            &mut sub,
+                            tiling,
+                            steps,
+                            di,
+                            dj,
+                            seed_is_opaque,
+                            &mut rem,
+                            &mut exhausted,
+                        );
+                    }
+                }
+                let ob = sub.over_budget;
+                Some((sub.pixmap.take()?, ob, exhausted))
+            };
+
+        let (tile_trans, obt, ext) = run_sample(None)?;
+        let (tile0, ob0, ex0) = run_sample(Some(tiny_skia::Color::BLACK))?;
+        let (tile1, ob1, ex1) = run_sample(Some(tiny_skia::Color::WHITE))?;
+        if obt || ob0 || ob1 {
+            self.over_budget = true;
+            return None;
+        }
+        if ext || ex0 || ex1 {
+            tracing::warn!(
+                limit = MAX_AFFINE_TILE_PASSES,
+                "dense CPU affine tiling sample exceeded pass budget; declining partial tile"
+            );
+            return None;
         }
 
-        let mul_arc = Arc::new(mul_pm);
-        let scr_arc = Arc::new(scr_pm);
-        if !self.over_budget && tile_bytes.saturating_mul(2) <= MAX_TILING_CACHE_BYTES {
-            if self
-                .tiling_cache_bytes
-                .saturating_add(tile_bytes.saturating_mul(2))
-                > MAX_TILING_CACHE_BYTES
-            {
+        let trans_arc = Arc::new(tile_trans);
+        let k_arc = Arc::new(tile0);
+        let f1_arc = Arc::new(tile1);
+        let cache_bytes = tile_bytes.saturating_mul(3);
+        if cache_bytes <= MAX_TILING_CACHE_BYTES {
+            if self.tiling_cache_bytes.saturating_add(cache_bytes) > MAX_TILING_CACHE_BYTES {
                 self.tiling_cache.clear();
                 self.tiling_cache_bytes = 0;
             }
             self.tiling_cache.insert(
-                mul_key,
-                (Arc::clone(&tiling.commands), Arc::clone(&mul_arc)),
+                trans_key,
+                (Arc::clone(&tiling.commands), Arc::clone(&trans_arc)),
             );
-            self.tiling_cache.insert(
-                scr_key,
-                (Arc::clone(&tiling.commands), Arc::clone(&scr_arc)),
-            );
-            self.tiling_cache_bytes = self
-                .tiling_cache_bytes
-                .saturating_add(tile_bytes.saturating_mul(2));
+            self.tiling_cache
+                .insert(k_key, (Arc::clone(&tiling.commands), Arc::clone(&k_arc)));
+            self.tiling_cache
+                .insert(f1_key, (Arc::clone(&tiling.commands), Arc::clone(&f1_arc)));
+            self.tiling_cache_bytes = self.tiling_cache_bytes.saturating_add(cache_bytes);
         }
-        Some((mul_arc, scr_arc, transform, quality))
+        Some(PreparedAffineTiles {
+            trans: trans_arc,
+            k: k_arc,
+            f1: f1_arc,
+            transform,
+            quality,
+        })
     }
 
     fn tiling_is_non_overlapping(tiling: &TilingPattern) -> bool {
@@ -2259,6 +2298,7 @@ impl<'a> CpuRenderer<'a> {
         steps: &[TilingBlendStep],
         overlap_shift: Option<(i64, i64)>,
         region: PaintedBounds,
+        region_opaque: bool,
         remaining_passes: &mut usize,
     ) -> bool {
         let Some(rect) = region.to_rect() else {
@@ -2275,6 +2315,9 @@ impl<'a> CpuRenderer<'a> {
                         if !seg.intersects_period(tiling, di, dj) {
                             continue;
                         }
+                    }
+                    if region_opaque && seg.is_identity_on_opaque() {
+                        continue;
                     }
                     *remaining_passes = remaining_passes.saturating_sub(1);
                     let Some((pixmap, transform, quality, opacity)) = self
@@ -2374,6 +2417,7 @@ impl<'a> CpuRenderer<'a> {
                                     inner_steps,
                                     overlap_shift,
                                     local_region,
+                                    region_opaque,
                                     remaining_passes,
                                 )
                             },
@@ -2387,6 +2431,7 @@ impl<'a> CpuRenderer<'a> {
                             inner_steps,
                             overlap_shift,
                             region,
+                            region_opaque,
                             remaining_passes,
                         );
                         if ok {
@@ -2439,56 +2484,151 @@ impl<'a> CpuRenderer<'a> {
                 }
             }
             if total_passes > MAX_DENSE_TILING_BLEND_PASSES {
-                tracing::warn!(
-                    total_passes,
-                    limit = MAX_DENSE_TILING_BLEND_PASSES,
-                    "dense CPU tiling blend plan exceeds pass budget; collapsing overlapping copies into affine copy-order tiles"
-                );
-                if let (Some(rect), Some((mul_pm, scr_pm, transform, quality))) = (
-                    region.to_rect(),
-                    self.prepare_tiling_affine_tiles(tiling, steps),
-                ) {
-                    let mul_paint = tiny_skia::Paint {
-                        shader: tiny_skia::Pattern::new(
-                            (*mul_pm).as_ref(),
-                            tiny_skia::SpreadMode::Repeat,
-                            quality,
-                            1.0,
-                            transform,
-                        ),
-                        blend_mode: tiny_skia::BlendMode::Multiply,
-                        anti_alias: false,
-                        ..Default::default()
-                    };
-                    let scr_paint = tiny_skia::Paint {
-                        shader: tiny_skia::Pattern::new(
-                            (*scr_pm).as_ref(),
-                            tiny_skia::SpreadMode::Repeat,
-                            quality,
-                            1.0,
-                            transform,
-                        ),
-                        blend_mode: tiny_skia::BlendMode::Screen,
-                        anti_alias: false,
-                        ..Default::default()
-                    };
-                    if let Some(ref mut target) = self.pixmap {
-                        target.fill_rect(rect, &mul_paint, tiny_skia::Transform::identity(), None);
-                        target.fill_rect(rect, &scr_paint, tiny_skia::Transform::identity(), None);
-                        self.dirty = Some(match self.dirty {
-                            Some(d) => d.union(region),
-                            None => region,
-                        });
-                        return true;
+                if TilingBlendStep::is_affine_in_backdrop(steps) {
+                    tracing::warn!(
+                        total_passes,
+                        limit = MAX_DENSE_TILING_BLEND_PASSES,
+                        "dense CPU tiling blend plan exceeds pass budget; collapsing affine overlapping copies into 3-seed tiles"
+                    );
+                    if let Some(PreparedAffineTiles {
+                        trans: trans_pm,
+                        k: k_pm,
+                        f1: f1_pm,
+                        transform,
+                        quality,
+                    }) = self.prepare_tiling_affine_tiles(tiling, steps)
+                    {
+                        if let (Some(inv), Some(ref mut target)) =
+                            (transform.invert(), self.pixmap.as_mut())
+                        {
+                            let tw = trans_pm.width() as usize;
+                            let th = trans_pm.height() as usize;
+                            let td = trans_pm.data();
+                            let kd = k_pm.data();
+                            let f1d = f1_pm.data();
+                            let dst_w = target.width() as usize;
+                            let dst = target.data_mut();
+                            let sample_bilinear = |data: &[u8], tx: f32, ty: f32| -> [f32; 4] {
+                                let u = tx - 0.5;
+                                let v = ty - 0.5;
+                                let x0f = u.floor();
+                                let y0f = v.floor();
+                                let fx = u - x0f;
+                                let fy = v - y0f;
+                                let x0 = (x0f as i64).rem_euclid(tw as i64) as usize;
+                                let y0 = (y0f as i64).rem_euclid(th as i64) as usize;
+                                let x1 = (x0 + 1) % tw;
+                                let y1 = (y0 + 1) % th;
+                                let o00 = (y0 * tw + x0) * 4;
+                                let o10 = (y0 * tw + x1) * 4;
+                                let o01 = (y1 * tw + x0) * 4;
+                                let o11 = (y1 * tw + x1) * 4;
+                                let w00 = (1.0 - fx) * (1.0 - fy);
+                                let w10 = fx * (1.0 - fy);
+                                let w01 = (1.0 - fx) * fy;
+                                let w11 = fx * fy;
+                                let mut out = [0.0f32; 4];
+                                for ch in 0..4 {
+                                    out[ch] = (data[o00 + ch] as f32 * w00
+                                        + data[o10 + ch] as f32 * w10
+                                        + data[o01 + ch] as f32 * w01
+                                        + data[o11 + ch] as f32 * w11)
+                                        / 255.0;
+                                }
+                                out
+                            };
+                            let nearest = quality == tiny_skia::FilterQuality::Nearest;
+                            for y in region.y0..region.y1 {
+                                let py = y as f32 + 0.5;
+                                let row = y as usize * dst_w;
+                                for x in region.x0..region.x1 {
+                                    let px = x as f32 + 0.5;
+                                    let tx = inv.sx * px + inv.kx * py + inv.tx;
+                                    let ty = inv.ky * px + inv.sy * py + inv.ty;
+                                    let (t, k, f1) = if nearest {
+                                        let ix = (tx.floor() as i64).rem_euclid(tw as i64) as usize;
+                                        let iy = (ty.floor() as i64).rem_euclid(th as i64) as usize;
+                                        let o = (iy * tw + ix) * 4;
+                                        (
+                                            [
+                                                td[o] as f32 / 255.0,
+                                                td[o + 1] as f32 / 255.0,
+                                                td[o + 2] as f32 / 255.0,
+                                                td[o + 3] as f32 / 255.0,
+                                            ],
+                                            [
+                                                kd[o] as f32 / 255.0,
+                                                kd[o + 1] as f32 / 255.0,
+                                                kd[o + 2] as f32 / 255.0,
+                                                kd[o + 3] as f32 / 255.0,
+                                            ],
+                                            [
+                                                f1d[o] as f32 / 255.0,
+                                                f1d[o + 1] as f32 / 255.0,
+                                                f1d[o + 2] as f32 / 255.0,
+                                                f1d[o + 3] as f32 / 255.0,
+                                            ],
+                                        )
+                                    } else {
+                                        (
+                                            sample_bilinear(td, tx, ty),
+                                            sample_bilinear(kd, tx, ty),
+                                            sample_bilinear(f1d, tx, ty),
+                                        )
+                                    };
+                                    let p = (row + x as usize) * 4;
+                                    let ba = dst[p + 3] as f32 / 255.0;
+                                    let ta = t[3].clamp(0.0, 1.0);
+                                    let out_a = (ta + (1.0 - ta) * ba).clamp(0.0, 1.0);
+                                    let inv_ba = 1.0 - ba;
+                                    for ch in 0..3 {
+                                        let m = (f1[ch] - k[ch]).clamp(0.0, 1.0 - k[ch]);
+                                        let br = dst[p + ch] as f32 / 255.0;
+                                        let out_c = (inv_ba * t[ch] + ba * k[ch] + m * br)
+                                            .clamp(0.0, out_a);
+                                        dst[p + ch] =
+                                            (out_c * 255.0).round().clamp(0.0, 255.0) as u8;
+                                    }
+                                    dst[p + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+                                }
+                            }
+                            self.dirty = Some(match self.dirty {
+                                Some(d) => d.union(region),
+                                None => region,
+                            });
+                            return true;
+                        }
+                    }
+                    if self.over_budget {
+                        return false;
                     }
                 }
-                false
+                // Non-affine blend modes (e.g. Darken/Lighten) cannot be
+                // interpolated from black/white samples: preserve exact per-copy
+                // draw order against the actual backdrop up to the bounded
+                // `MAX_TILING_OVERLAP_COPIES × MAX_SEGMENTS` ceiling.
+                remaining_passes = 65_536;
+                true
             } else {
                 true
             }
         } else {
             false
         };
+        let region_opaque = !self.alpha_only_pass
+            && self.pixmap.as_ref().is_some_and(|p| {
+                let stride = p.width() as usize;
+                let data = p.data();
+                for y in region.y0 as usize..region.y1 as usize {
+                    let row = y * stride;
+                    for x in region.x0 as usize..region.x1 as usize {
+                        if data[(row + x) * 4 + 3] != 255 {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
         let mut painted = false;
         if separate_copies {
             'copies: for dj in overlap.dj.clone() {
@@ -2501,6 +2641,7 @@ impl<'a> CpuRenderer<'a> {
                         steps,
                         Some((di, dj)),
                         region,
+                        region_opaque,
                         &mut remaining_passes,
                     ) {
                         painted = true;
@@ -2513,6 +2654,7 @@ impl<'a> CpuRenderer<'a> {
                 steps,
                 None,
                 region,
+                region_opaque,
                 &mut remaining_passes,
             );
         }
@@ -4171,17 +4313,17 @@ impl<'a> CpuRenderer<'a> {
                                                     );
                                                 }
                                                 for_region_rows(region, w, |range| {
-                                                    knockout_merge(
+                                                    knockout_merge_premultiplied(
                                                         &mut backdrop.data_mut()[range.clone()],
                                                         &x_pix.data()[range.clone()],
-                                                        &gs.data()[range],
-                                                        None,
+                                                        &gs.data()[range.clone()],
+                                                        Some(&b0_pix.data()[range]),
                                                     );
                                                 });
                                             }
                                         } else {
                                             for_region_rows(region, w, |range| {
-                                                knockout_merge(
+                                                knockout_merge_premultiplied(
                                                     &mut backdrop.data_mut()[range.clone()],
                                                     &group_color.data()[range.clone()],
                                                     &gs.data()[range],
@@ -4562,6 +4704,7 @@ impl<'a> CpuRenderer<'a> {
                                 None
                             };
                             let elem_data = x_band.as_ref().map_or(gc.data(), |xb| xb.data());
+                            let b0_data = x_band.as_ref().and(b0_ref).map(|p| p.data());
                             let shape_data = gs.data();
                             let dst_data = backdrop.data_mut();
                             for ly in ly0..ly1 {
@@ -4570,11 +4713,11 @@ impl<'a> CpuRenderer<'a> {
                                 let d_end = ((by0 as usize + ly) * page_w + bx0 as usize + lx1) * 4;
                                 let s_start = (ly * bw_usize + lx0) * 4;
                                 let s_end = (ly * bw_usize + lx1) * 4;
-                                knockout_merge(
+                                knockout_merge_premultiplied(
                                     &mut dst_data[d_start..d_end],
                                     &elem_data[s_start..s_end],
                                     &shape_data[s_start..s_end],
-                                    None,
+                                    b0_data.map(|b| &b[d_start..d_end]),
                                 );
                             }
                         }
@@ -6380,6 +6523,41 @@ fn knockout_merge(group: &mut [u8], elem: &[u8], shape: &[u8], b0: Option<&[u8]>
         for c in 0..4 {
             let v = (group[o + c] as u32 * inv_f + x[c] * f as u32 + 127) / 255;
             group[o + c] = v.min(255) as u8;
+        }
+    }
+}
+
+/// Knockout merge for a child whose premultiplied `x_covered` ALREADY carries
+/// the element's antialiased geometric coverage `f_k` inside its premultiplied
+/// color and alpha (ISO 32000-1 §11.4.6):
+///
+/// `out = x_covered + (group - b0) * (1 - f_k)`
+///
+/// where `x_covered` is `composite(b0, child_premul)` (or `child_premul` when
+/// `b0` is `None` / transparent). Uses `shape` (`f_k`) ONLY to attenuate
+/// preceding siblings (and remove the uncovered `(1 - f_k) * b0` portion
+/// baked into `x_covered`) without double-multiplying the child's antialiased
+/// edge coverage.
+fn knockout_merge_premultiplied(
+    group: &mut [u8],
+    x_covered: &[u8],
+    shape: &[u8],
+    b0: Option<&[u8]>,
+) {
+    let n = group.len() / 4;
+    for i in 0..n {
+        let o = i * 4;
+        let f = shape[o + 3];
+        if f == 0 {
+            continue;
+        }
+        let inv_f = (255 - f) as f32 / 255.0;
+        for c in 0..4 {
+            let g = group[o + c] as f32;
+            let x = x_covered[o + c] as f32;
+            let b = b0.map_or(0.0, |b0| b0[o + c] as f32);
+            let v = (x + (g - b) * inv_f).round().clamp(0.0, 255.0) as u8;
+            group[o + c] = v;
         }
     }
 }
@@ -9496,5 +9674,96 @@ mod tests {
             px.iter().all(|&c| (186..=197).contains(&c)),
             "Screen(0.5, 0.5) with rect extending to x=1,100,000 on 20000x16 raster must paint ~191 (not be dropped as empty), got {px:?}"
         );
+    }
+
+    #[test]
+    fn knockout_parent_applies_antialiased_edge_coverage_once_for_recorded_child() {
+        // On a transparent page, an isolated knockout parent containing a single
+        // non-isolated Screen child with an opaque red rectangle whose left edge
+        // lands at x = 10.5 (half-pixel coverage) must yield ~128 edge alpha (NOT
+        // ~64 from multiplying premultiplied coverage by shape a second time), in
+        // BOTH the full-page and banded paths. Also verify a preceding opaque blue
+        // sibling is attenuated by (1 - f) = 0.5 at the same edge (~[128, 0, 128, 255]).
+        let page_rect = Rect::new(0.0, 0.0, 32.0, 20.0);
+        let mut rect_half_edge = Path::new();
+        rect_half_edge.rect(Rect::new(10.5, 2.0, 22.0, 18.0));
+        let mut full_bg = Path::new();
+        full_bg.rect(page_rect);
+
+        let run = |with_sibling: bool, max_band_bytes: u64| -> Vec<u8> {
+            let mut r = CpuRenderer::new();
+            r.begin_page(&PageRenderInfo {
+                page_rect,
+                scale: 1.0,
+                background: Color::rgba(0.0, 0.0, 0.0, 0.0),
+            })
+            .unwrap();
+            r.push_blend_group(BlendMode::Normal, true, true, 1.0, None);
+            if with_sibling {
+                r.execute(&RenderCommand::FillPath {
+                    path: full_bg.clone(),
+                    rule: FillRule::NonZero,
+                    paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                    alpha: 1.0,
+                    overprint: None,
+                })
+                .unwrap();
+            }
+            let rec = RecordedNonIsolatedGroup {
+                blend_mode: BlendMode::Screen,
+                alpha: 1.0,
+                mask: None,
+                nesting: 0,
+                cmds: vec![RenderCommand::FillPath {
+                    path: rect_half_edge.clone(),
+                    rule: FillRule::NonZero,
+                    paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                    alpha: 1.0,
+                    overprint: None,
+                }],
+            };
+            r.finish_recorded_non_isolated_group_budgeted(rec, max_band_bytes);
+            r.pop_blend_group();
+            r.end_page().unwrap().data
+        };
+
+        let edge_off = ((10 * 32 + 10) * 4) as usize;
+        let interior_off = ((10 * 32 + 15) * 4) as usize;
+
+        for (label, budget) in [
+            ("full-page", MAX_COVERAGE_BAND_BYTES),
+            ("banded-512", 512),
+            ("banded-128", 128),
+        ] {
+            let solo = run(false, budget);
+            let edge = &solo[edge_off..edge_off + 4];
+            assert!(
+                (122..=134).contains(&edge[0])
+                    && edge[1] == 0
+                    && edge[2] == 0
+                    && (122..=134).contains(&edge[3]),
+                "{label}: half-pixel edge on transparent knockout parent must have alpha ~128 (NOT ~64), got {edge:?}"
+            );
+            assert_eq!(
+                &solo[interior_off..interior_off + 4],
+                &[255, 0, 0, 255],
+                "{label}: interior must be opaque red"
+            );
+
+            let over_blue = run(true, budget);
+            let edge_b = &over_blue[edge_off..edge_off + 4];
+            assert!(
+                (122..=134).contains(&edge_b[0])
+                    && edge_b[1] == 0
+                    && (122..=134).contains(&edge_b[2])
+                    && edge_b[3] >= 253,
+                "{label}: half-pixel edge over prior blue sibling must be ~[128,0,128,255], got {edge_b:?}"
+            );
+            assert_eq!(
+                &over_blue[interior_off..interior_off + 4],
+                &[255, 0, 0, 255],
+                "{label}: interior must fully knock out prior blue sibling"
+            );
+        }
     }
 }

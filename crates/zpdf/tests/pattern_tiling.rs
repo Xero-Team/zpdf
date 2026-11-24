@@ -2265,3 +2265,191 @@ fn small_outline_glyph_in_non_isolated_screen_group_on_7000x7000_raster() {
         "outline glyph inside non-isolated Screen group on 7000x7000 raster must render ~191 pixels, found {brightened}"
     );
 }
+
+/// Regression: opaque 50%-gray `Darken` maps backdrop B to `min(B, 0.5)`.
+/// On a 0.25-gray page (~64), affine interpolation from black (0) and white
+/// (0.5) would erroneously return 0.125 (~32). Even above 4,096 tiles AND
+/// above 1,024 overlapping passes, CPU must decline the affine shortcut and
+/// preserve `Darken` against the actual 0.25-gray backdrop (~64).
+#[test]
+fn dense_darken_tiling_above_1024_passes_preserves_non_affine_backdrop() {
+    let gs_dark = b"<< /Type /ExtGState /BM /Darken >>".to_vec();
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let mut cell_stream = String::new();
+    // 6 overlapping copies (BBox [0..12]×[0..4], XStep=2) × 175 segments = 1,050 > 1,024.
+    for k in 0..175 {
+        if k == 0 {
+            cell_stream.push_str("/GD gs 0.5 0.5 0.5 rg 0 0 12 2 re f\n");
+        } else if k % 2 == 0 {
+            cell_stream.push_str("/GD gs 1 1 1 rg 0 2 12 2 re f\n");
+        } else {
+            cell_stream.push_str("/GM gs 1 1 1 rg 0 2 12 2 re f\n");
+        }
+    }
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 12 4] /XStep 2 /YStep 4 \
+         /Resources << /ExtGState << /GD 6 0 R /GM 7 0 R >> >>",
+        cell_stream.as_bytes(),
+    );
+    // 140×260 fill with 2×4 step = 70×65 = 4,550 > 4,096 tiles.
+    let content = stream_obj(
+        "",
+        b"0.25 0.25 0.25 rg 0 0 140 260 re f\n\
+          /Pattern cs /P0 scn 0 0 140 260 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        content,
+        cell,
+        gs_dark,
+        gs_mul,
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+    // Sample at y_pdf = 129.0 (129 % 4 == 1, inside the y=[0..2] Darken 0.5 strip):
+    let sample = px_on(&page, 260.0, 1.0, 70.5, 129.0);
+    assert!(
+        sample.iter().all(|&c| (60..=68).contains(&c)),
+        "CPU dense Darken(0.5) over 0.25-gray page must stay ~64 (NOT ~32 from affine shortcut), got {sample:?}"
+    );
+}
+
+/// Regression: on a transparent CPU target, the dense affine tiling path must
+/// preserve the exact accumulated alpha of a 50%-opaque white Normal mark
+/// (~128, NOT ~191 from two-pass Multiply+Screen alpha accumulation).
+#[test]
+fn dense_affine_tiling_preserves_alpha_on_transparent_cpu_target() {
+    use zpdf::display_list::{
+        Color, DisplayList, FillRule, Paint, Path, RenderCommand, TilingPattern,
+    };
+    use zpdf::RenderBackend;
+    use zpdf_core::{Matrix, Rect};
+    use zpdf_render::PageRenderInfo;
+
+    let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 12.0, 4.0));
+    let mut r_bot = Path::new();
+    r_bot.rect(Rect::new(0.0, 0.0, 2.0, 2.0));
+    cell.push(RenderCommand::FillPath {
+        path: r_bot,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::white()),
+        alpha: 0.5,
+        overprint: None,
+    });
+    let mut r_top = Path::new();
+    r_top.rect(Rect::new(0.0, 2.0, 12.0, 4.0));
+    for k in 0..175 {
+        let mode = if k % 2 == 0 {
+            zpdf::display_list::BlendMode::Multiply
+        } else {
+            zpdf::display_list::BlendMode::Screen
+        };
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: mode,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 12.0, 4.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: r_top.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+    }
+    let tiling = std::sync::Arc::new(TilingPattern {
+        commands: std::sync::Arc::new(cell),
+        bbox: Rect::new(0.0, 0.0, 12.0, 4.0),
+        x_step: 2.0,
+        y_step: 4.0,
+        matrix: Matrix::identity(),
+        tiling_type: 1,
+    });
+    // 140×260 with 2×4 step = 70×65 = 4,550 > 4,096 tiles, 6×175 = 1,050 > 1,024 passes.
+    let page_rect = Rect::new(0.0, 0.0, 140.0, 260.0);
+    let mut full = Path::new();
+    full.rect(page_rect);
+    let mut r = zpdf::cpu::CpuRenderer::new();
+    r.begin_page(&PageRenderInfo {
+        page_rect,
+        scale: 1.0,
+        background: Color::rgba(0.0, 0.0, 0.0, 0.0),
+    })
+    .unwrap();
+    r.execute(&RenderCommand::FillPath {
+        path: full,
+        rule: FillRule::NonZero,
+        paint: Paint::Tiling(tiling),
+        alpha: 1.0,
+        overprint: None,
+    })
+    .unwrap();
+    let page = r.end_page().unwrap();
+    // Sample inside bottom strip (y_pdf = 129 -> iy = 259 - 129 = 130, x = 70):
+    let off = ((130 * page.width + 70) * 4) as usize;
+    let rgba = &page.data[off..off + 4];
+    assert!(
+        rgba.iter().all(|&c| (122..=134).contains(&c)),
+        "CPU dense affine tiling 50% white Normal mark on transparent target must retain alpha ~128 (NOT ~191), got {rgba:?}"
+    );
+}
+
+/// Regression: a dense affine cell with 24 overlapping copies × 176 spanning
+/// alternating Multiply/Screen segments (= 4,224 > 4,096) and a trailing black
+/// detail confined to `[0..1]×[0..2]` (visited only in the 24th/final copy)
+/// must evaluate all copies and preserve both the black detail and the ~170
+/// Multiply–Screen fixed point on CPU.
+#[test]
+fn dense_affine_tiling_4200_evaluations_preserves_trailing_detail_on_cpu() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_scr = b"<< /Type /ExtGState /BM /Screen >>".to_vec();
+    let mut cell_stream = String::new();
+    for k in 0..176 {
+        let gs = if k % 2 == 0 { "/GM" } else { "/GS" };
+        cell_stream.push_str(&format!("{gs} gs 0.5 0.5 0.5 rg 0 0 48 2 re f\n"));
+    }
+    cell_stream.push_str("/GM gs 0 0 0 rg 0 0 1 2 re f\n");
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 48 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 6 0 R /GS 7 0 R >> >>",
+        cell_stream.as_bytes(),
+    );
+    // 132×132 fill with 2×2 step = 66×66 = 4,356 > 4,096 tiles.
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 132 132 re f\n\
+          /Pattern cs /P0 scn 0 0 132 132 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 132 132] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        content,
+        cell,
+        gs_mul,
+        gs_scr,
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+    // x mod 2 == 0 is black detail; x mod 2 == 1 is ~170 gray.
+    assert_rgbish(
+        px_on(&page, 132.0, 1.0, 66.2, 66.5),
+        [0, 0, 0],
+        "CPU trailing black detail past 4,096 affine evaluations must remain black",
+    );
+    let bg = px_on(&page, 132.0, 1.0, 67.2, 66.5);
+    assert!(
+        bg.iter().all(|&c| (165..=176).contains(&c)),
+        "CPU paired Multiply/Screen strip past 4,096 evaluations must be ~170, got {bg:?}"
+    );
+}

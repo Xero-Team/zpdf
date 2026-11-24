@@ -40,7 +40,10 @@ fn key_of(op: &PageOp) -> BatchKey {
         } => BatchKey::Tile(*tile_id, *clip_ref),
         PageOp::Glyph { clip_ref, .. } => BatchKey::Glyph(*clip_ref),
         PageOp::StampClip { ref_value, .. } => BatchKey::StampClip(*ref_value),
-        PageOp::ResetStencil | PageOp::PushBlend { .. } | PageOp::PopBlend => BatchKey::Other,
+        PageOp::ResetStencil
+        | PageOp::PushBlend { .. }
+        | PageOp::PopBlend
+        | PageOp::AffineTile { .. } => BatchKey::Other,
     }
 }
 

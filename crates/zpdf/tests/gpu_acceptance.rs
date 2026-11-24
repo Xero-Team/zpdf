@@ -2370,3 +2370,287 @@ fn gpu_deeply_nested_non_isolated_groups_stay_linear_and_match_cpu() {
         "GPU and CPU must match on nested non-isolated groups, got {pct:.3}% differing"
     );
 }
+
+/// Regression: opaque 50%-gray `Darken` over a 0.25-gray page must stay ~64
+/// (NOT ~32 from affine black/white interpolation) even above 4,096 tiles AND
+/// above 1,024 overlapping passes on GPU and CPU.
+#[test]
+fn gpu_dense_darken_tiling_preserves_non_affine_backdrop() {
+    let gs_dark = b"<< /Type /ExtGState /BM /Darken >>".to_vec();
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let mut cell_stream = String::new();
+    for k in 0..175 {
+        if k == 0 {
+            cell_stream.push_str("/GD gs 0.5 0.5 0.5 rg 0 0 12 2 re f\n");
+        } else if k % 2 == 0 {
+            cell_stream.push_str("/GD gs 1 1 1 rg 0 2 12 2 re f\n");
+        } else {
+            cell_stream.push_str("/GM gs 1 1 1 rg 0 2 12 2 re f\n");
+        }
+    }
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 12 4] /XStep 2 /YStep 4 \
+         /Resources << /ExtGState << /GD 6 0 R /GM 7 0 R >> >>",
+        cell_stream.as_bytes(),
+    );
+    let content = stream_obj(
+        "",
+        b"0.25 0.25 0.25 rg 0 0 140 260 re f\n\
+          /Pattern cs /P0 scn 0 0 140 260 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        content,
+        cell,
+        gs_dark,
+        gs_mul,
+    ]);
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU dense Darken test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    let iy = 259 - 129;
+    let off = ((iy * gpu.width + 70) * 4) as usize;
+    let px = &gpu.data[off..off + 3];
+    assert!(
+        px.iter().all(|&c| (60..=68).contains(&c)),
+        "GPU dense Darken(0.5) over 0.25-gray page must stay ~64 (NOT ~32), got {px:?}"
+    );
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "GPU vs CPU dense Darken mismatch: {pct:.3}%"
+    );
+}
+
+/// Regression: on a transparent GPU target, the dense 3-seed affine tiling path
+/// must preserve the exact accumulated alpha (~128, NOT ~191) of a 50%-opaque
+/// white Normal mark when overlapping Multiply/Screen marks in a separate strip
+/// select the dense affine path.
+#[test]
+fn gpu_dense_affine_tiling_preserves_alpha_on_transparent_target() {
+    use zpdf::display_list::{
+        BlendMode, Color, DisplayList, FillRule, Paint, Path, RenderCommand, TilingPattern,
+    };
+    use zpdf_core::{Matrix, Rect};
+    use zpdf_render::PageRenderInfo;
+
+    let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 12.0, 4.0));
+    let mut r_bot = Path::new();
+    r_bot.rect(Rect::new(0.0, 0.0, 2.0, 2.0));
+    cell.push(RenderCommand::FillPath {
+        path: r_bot,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::white()),
+        alpha: 0.5,
+        overprint: None,
+    });
+    let mut r_top = Path::new();
+    r_top.rect(Rect::new(0.0, 2.0, 12.0, 4.0));
+    for k in 0..175 {
+        let mode = if k % 2 == 0 {
+            BlendMode::Multiply
+        } else {
+            BlendMode::Screen
+        };
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: mode,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 12.0, 4.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: r_top.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+    }
+    let tiling = std::sync::Arc::new(TilingPattern {
+        commands: std::sync::Arc::new(cell),
+        bbox: Rect::new(0.0, 0.0, 12.0, 4.0),
+        x_step: 2.0,
+        y_step: 4.0,
+        matrix: Matrix::identity(),
+        tiling_type: 1,
+    });
+    let page_rect = Rect::new(0.0, 0.0, 140.0, 260.0);
+    let mut full = Path::new();
+    full.rect(page_rect);
+    let cmd = RenderCommand::FillPath {
+        path: full,
+        rule: FillRule::NonZero,
+        paint: Paint::Tiling(tiling),
+        alpha: 1.0,
+        overprint: None,
+    };
+    let info = PageRenderInfo {
+        page_rect,
+        scale: 1.0,
+        background: Color::rgba(0.0, 0.0, 0.0, 0.0),
+    };
+
+    let gpu_res = with_shared_gpu_renderer(|r| {
+        r.begin_page(&info)?;
+        r.execute(&cmd)?;
+        r.end_page()
+    });
+    let gpu = match gpu_res {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) | Err(e) => {
+            eprintln!("skipping GPU dense transparent alpha test (no adapter?): {e}");
+            return;
+        }
+    };
+    let mut cpu_r = zpdf::cpu::CpuRenderer::new();
+    cpu_r.begin_page(&info).unwrap();
+    cpu_r.execute(&cmd).unwrap();
+    let cpu = cpu_r.end_page().unwrap();
+
+    let off = ((130 * gpu.width + 70) * 4) as usize;
+    let gpu_px = &gpu.data[off..off + 4];
+    let cpu_px = &cpu.data[off..off + 4];
+    assert!(
+        gpu_px.iter().all(|&c| (122..=134).contains(&c)),
+        "GPU dense affine tiling 50% white Normal mark on transparent target must retain alpha ~128 (NOT ~191), got {gpu_px:?} (cpu={cpu_px:?})"
+    );
+    for ch in 0..4 {
+        assert!(
+            (gpu_px[ch] as i32 - cpu_px[ch] as i32).abs() <= 2,
+            "GPU {gpu_px:?} must match CPU {cpu_px:?} on transparent dense affine strip"
+        );
+    }
+}
+
+/// Regression: a dense affine cell with 24 overlapping copies × 176 spanning
+/// alternating Multiply/Screen segments (= 4,224 > 4,096) and a trailing black
+/// detail confined to `[0..1]×[0..2]` (visited only in the final copy) must
+/// preserve both the black detail and the ~170 paired strip on GPU and CPU.
+#[test]
+fn gpu_dense_affine_tiling_4200_evaluations_preserves_trailing_detail() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_scr = b"<< /Type /ExtGState /BM /Screen >>".to_vec();
+    let mut cell_stream = String::new();
+    for k in 0..176 {
+        let gs = if k % 2 == 0 { "/GM" } else { "/GS" };
+        cell_stream.push_str(&format!("{gs} gs 0.5 0.5 0.5 rg 0 0 48 2 re f\n"));
+    }
+    cell_stream.push_str("/GM gs 0 0 0 rg 0 0 1 2 re f\n");
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 48 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 6 0 R /GS 7 0 R >> >>",
+        cell_stream.as_bytes(),
+    );
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 132 132 re f\n\
+          /Pattern cs /P0 scn 0 0 132 132 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 132 132] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        content,
+        cell,
+        gs_mul,
+        gs_scr,
+    ]);
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU dense 4200-pass affine test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 131 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let black = px(&gpu.data, 66, 66);
+    assert!(
+        black.iter().all(|&c| c <= 6),
+        "GPU trailing black detail past 4,096 affine evaluations must remain black, got {black:?}"
+    );
+    let gray = px(&gpu.data, 67, 66);
+    assert!(
+        gray.iter().all(|&c| (165..=176).contains(&c)),
+        "GPU paired Multiply/Screen strip past 4,096 evaluations must be ~170, got {gray:?}"
+    );
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "GPU vs CPU 4200-pass affine mismatch: {pct:.3}%"
+    );
+}

@@ -74,6 +74,18 @@ pub enum PageOp {
         tile_id: u32,
         clip_ref: u32,
     },
+    /// Draw an exact 3-seed affine dense tiling-pattern quad (from the textured
+    /// arena, sampling `tile_trans`, `tile0`, and `tile1` against the live
+    /// backdrop layer), testing `stencil == clip_ref`.
+    AffineTile {
+        range: MeshRange,
+        clip_ref: u32,
+        clips: Vec<ClipStamp>,
+        tile_trans: u32,
+        tile0: u32,
+        tile1: u32,
+        nearest: bool,
+    },
     /// Draw a rasterized-glyph quad (from the glyph arena, sampling the
     /// page's single atlas texture), testing `stencil == clip_ref`. Unlike
     /// `Image`, no texture id is carried — a page has exactly one atlas.
@@ -186,52 +198,34 @@ impl SyntheticTileKey {
     }
 }
 
-/// How a [`SyntheticTile`] is produced in `end_page`.
-pub enum SyntheticTileKind {
-    /// Standard recorded op stream rendered directly into the tile texture.
-    Direct(Vec<PageOp>),
-    /// Derived Multiply pass tile of an affine copy-order dense tiling collapse
-    /// (`f(1)` = `tile1`, `f(0)` = `tile0`, accumulated alpha = `tile_a`).
-    AffineMul { tile0: u32, tile1: u32, tile_a: u32 },
-    /// Derived Screen pass tile of an affine copy-order dense tiling collapse
-    /// (`f(0)` = `tile0`, accumulated alpha = `tile_a`).
-    AffineScr { tile0: u32, tile_a: u32 },
-}
-
 /// Recorded cell content for a dense tiling pattern (> 4,096 visible tiles),
 /// rendered once into an offscreen tile texture and sampled with `Repeat`.
 pub struct SyntheticTile {
     pub width: u32,
     pub height: u32,
     pub nearest: bool,
-    pub kind: SyntheticTileKind,
+    pub ops: Vec<PageOp>,
     /// Retains the source cell commands so `Arc::as_ptr` keys stay unique for the page.
     pub _keep_commands: std::sync::Arc<zpdf_display_list::DisplayList>,
 }
 
 impl SyntheticTile {
     pub fn ops(&self) -> &[PageOp] {
-        match &self.kind {
-            SyntheticTileKind::Direct(ops) => ops.as_slice(),
-            SyntheticTileKind::AffineMul { .. } | SyntheticTileKind::AffineScr { .. } => &[],
-        }
+        self.ops.as_slice()
     }
 
     pub fn has_blend_groups(&self) -> bool {
-        self.ops()
+        self.ops
             .iter()
-            .any(|o| matches!(o, PageOp::PushBlend { .. }))
+            .any(|o| matches!(o, PageOp::PushBlend { .. } | PageOp::AffineTile { .. }))
     }
 
     pub fn uses_reset(&self) -> bool {
-        self.ops().iter().any(|o| matches!(o, PageOp::ResetStencil))
+        self.ops.iter().any(|o| matches!(o, PageOp::ResetStencil))
     }
 
     pub fn needs_fullscreen(&self) -> bool {
-        match &self.kind {
-            SyntheticTileKind::Direct(_) => self.uses_reset() || self.has_blend_groups(),
-            SyntheticTileKind::AffineMul { .. } | SyntheticTileKind::AffineScr { .. } => true,
-        }
+        self.uses_reset() || self.has_blend_groups()
     }
 }
 
@@ -239,6 +233,7 @@ impl SyntheticTile {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlendFrameKind {
     Real,
+    RealIsolated,
     Passthrough,
     Skipped,
 }
@@ -277,6 +272,11 @@ pub struct PageRecorder {
     /// Logical outer depth while recording a soft-mask sub-list.
     blend_depth_offset: usize,
     blend_depth: usize,
+    /// True when the active page background was cleared opaque (`alpha >= 1.0`).
+    opaque_canvas: bool,
+    /// Nesting depth of groups whose target (or paired alpha-tracking layer)
+    /// starts transparent rather than guaranteed opaque.
+    isolated_depth: usize,
     /// Groups omitted after reaching the depth cap. Matching pops consume this
     /// counter instead of closing a real outer group.
     skipped_blend_depth: usize,
@@ -306,6 +306,18 @@ impl PageRecorder {
     pub fn with_page_rect(mut self, rect: zpdf_core::Rect) -> Self {
         self.page_rect = Some(rect);
         self
+    }
+
+    pub fn with_opaque_canvas(mut self, opaque: bool) -> Self {
+        self.opaque_canvas = opaque;
+        self
+    }
+
+    /// True when the active target (and any paired alpha-tracking layer) is
+    /// guaranteed opaque everywhere, so exact opaque-backdrop identity segments
+    /// (white `Multiply`/`Darken`, black `Screen`/`Lighten`) are provable no-ops.
+    pub fn is_opaque_backdrop(&self) -> bool {
+        self.opaque_canvas && self.isolated_depth == 0
     }
 
     pub fn page_rect(&self) -> Option<zpdf_core::Rect> {
@@ -361,6 +373,13 @@ impl PageRecorder {
         self.synthetic_tiles.push(tile);
         self.synthetic_tile_cache.insert(key, id);
         Some(id)
+    }
+
+    /// Latch an explicit recording failure (first failure remains authoritative).
+    pub fn set_recording_error(&mut self, reason: &'static str) {
+        if self.recording_error.is_none() {
+            self.recording_error = Some(reason);
+        }
     }
 
     /// Check at command/glyph boundaries and before appends. All nested work
@@ -569,6 +588,51 @@ impl PageRecorder {
             },
             tile_id,
             clip_ref: self.clip_depth,
+        });
+    }
+
+    /// Record an exact 3-seed affine tiling-pattern quad (4 textured vertices)
+    /// composited against the live destination layer at the current clip depth.
+    pub fn add_affine_tile(
+        &mut self,
+        quad: [TexturedVertex; 4],
+        tile_trans: u32,
+        tile0: u32,
+        tile1: u32,
+        nearest: bool,
+    ) {
+        if !self.reserve_geometry::<TexturedVertex>(
+            self.tex_vertices.len(),
+            self.tex_indices.len(),
+            4,
+            6,
+        ) {
+            return;
+        }
+        let base_vertex = self.tex_vertices.len() as u32;
+        let first_index = self.tex_indices.len() as u32;
+        self.tex_vertices.extend_from_slice(&quad);
+        self.tex_indices.extend_from_slice(&[
+            base_vertex,
+            base_vertex + 1,
+            base_vertex + 2,
+            base_vertex,
+            base_vertex + 2,
+            base_vertex + 3,
+        ]);
+        let clips = self.active_clips();
+        self.ops.push(PageOp::AffineTile {
+            range: MeshRange {
+                first_index,
+                index_count: 6,
+                base_vertex: 0,
+            },
+            clip_ref: self.clip_depth,
+            clips,
+            tile_trans,
+            tile0,
+            tile1,
+            nearest,
         });
     }
 
@@ -813,7 +877,8 @@ impl PageRecorder {
             unclipped_group: false,
         });
         self.blend_depth += 1;
-        self.blend_frames.push(BlendFrameKind::Real);
+        self.isolated_depth += 1;
+        self.blend_frames.push(BlendFrameKind::RealIsolated);
     }
 
     /// Record a passthrough non-isolated group (`Normal`, `alpha == 1`, no mask,
@@ -856,7 +921,14 @@ impl PageRecorder {
             unclipped_group: false,
         });
         self.blend_depth += 1;
-        self.blend_frames.push(BlendFrameKind::Real);
+        if mode != BlendMode::Normal {
+            // Non-isolated non-Normal groups maintain a transparent paired
+            // alpha-tracking layer for ISO §11.4.5 backdrop removal.
+            self.isolated_depth += 1;
+            self.blend_frames.push(BlendFrameKind::RealIsolated);
+        } else {
+            self.blend_frames.push(BlendFrameKind::Real);
+        }
     }
 
     /// Begin a non-isolated `Normal` group with constant `alpha` and optional
@@ -936,7 +1008,8 @@ impl PageRecorder {
             unclipped_group: false,
         });
         self.blend_depth += 1;
-        self.blend_frames.push(BlendFrameKind::Real);
+        self.isolated_depth += 1;
+        self.blend_frames.push(BlendFrameKind::RealIsolated);
     }
 
     /// Record a sub-sequence into the shared arena with the caller's current
@@ -954,6 +1027,8 @@ impl PageRecorder {
         let saved_blend_offset = std::mem::replace(&mut self.blend_depth_offset, nested_offset);
         let saved_skipped_blend_depth = std::mem::replace(&mut self.skipped_blend_depth, 0);
         let saved_blend_frames = std::mem::take(&mut self.blend_frames);
+        let saved_opaque_canvas = std::mem::replace(&mut self.opaque_canvas, false);
+        let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
         for entry in &self.clip_stack {
             if let Some(range) = entry.range {
                 self.ops.push(PageOp::StampClip {
@@ -971,6 +1046,8 @@ impl PageRecorder {
         self.blend_depth_offset = saved_blend_offset;
         self.skipped_blend_depth = saved_skipped_blend_depth;
         self.blend_frames = saved_blend_frames;
+        self.opaque_canvas = saved_opaque_canvas;
+        self.isolated_depth = saved_isolated_depth;
         sub
     }
 
@@ -991,6 +1068,8 @@ impl PageRecorder {
         let saved_blend_offset = std::mem::replace(&mut self.blend_depth_offset, nested_offset);
         let saved_skipped_blend_depth = std::mem::replace(&mut self.skipped_blend_depth, 0);
         let saved_blend_frames = std::mem::take(&mut self.blend_frames);
+        let saved_opaque_canvas = std::mem::replace(&mut self.opaque_canvas, false);
+        let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
         f(self);
         self.close_open_blends();
         let sub = std::mem::replace(&mut self.ops, saved_ops);
@@ -1000,6 +1079,8 @@ impl PageRecorder {
         self.blend_depth_offset = saved_blend_offset;
         self.skipped_blend_depth = saved_skipped_blend_depth;
         self.blend_frames = saved_blend_frames;
+        self.opaque_canvas = saved_opaque_canvas;
+        self.isolated_depth = saved_isolated_depth;
         sub
     }
 
@@ -1009,11 +1090,16 @@ impl PageRecorder {
             Some(BlendFrameKind::Skipped) => {
                 self.skipped_blend_depth = self.skipped_blend_depth.saturating_sub(1);
             }
+            Some(BlendFrameKind::RealIsolated) if self.blend_depth > 0 => {
+                self.ops.push(PageOp::PopBlend);
+                self.blend_depth -= 1;
+                self.isolated_depth = self.isolated_depth.saturating_sub(1);
+            }
             Some(BlendFrameKind::Real) if self.blend_depth > 0 => {
                 self.ops.push(PageOp::PopBlend);
                 self.blend_depth -= 1;
             }
-            Some(BlendFrameKind::Real) | None => {}
+            Some(BlendFrameKind::Real | BlendFrameKind::RealIsolated) | None => {}
         }
     }
 
@@ -1026,7 +1112,7 @@ impl PageRecorder {
     pub fn has_blend_groups(&self) -> bool {
         self.ops
             .iter()
-            .any(|o| matches!(o, PageOp::PushBlend { .. }))
+            .any(|o| matches!(o, PageOp::PushBlend { .. } | PageOp::AffineTile { .. }))
     }
 
     /// True if any `ResetStencil` op was recorded (i.e. clips were popped) and a

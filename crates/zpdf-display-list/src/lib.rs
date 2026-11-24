@@ -256,6 +256,40 @@ impl TilingBlendSegment {
             && sy1 > bbox.y0 - eps
             && sy0 < bbox.y0 + abs_y + eps
     }
+
+    /// True when this segment is a provable exact identity over any opaque
+    /// backdrop (`B_a == 1`): pure-white `Multiply`/`Darken` or pure-black
+    /// `Screen`/`Lighten` solid path fills/strokes with no overprint or nested
+    /// groups.
+    pub fn is_identity_on_opaque(&self) -> bool {
+        let want_white = match self.blend_mode {
+            BlendMode::Multiply | BlendMode::Darken => true,
+            BlendMode::Screen | BlendMode::Lighten => false,
+            _ => return false,
+        };
+        self.commands.commands.iter().all(|cmd| match cmd {
+            RenderCommand::FillPath {
+                paint: Paint::Solid(c),
+                overprint: None,
+                ..
+            }
+            | RenderCommand::StrokePath {
+                paint: Paint::Solid(c),
+                overprint: None,
+                ..
+            } => {
+                if want_white {
+                    c.r >= 1.0 && c.g >= 1.0 && c.b >= 1.0
+                } else {
+                    c.r <= 0.0 && c.g <= 0.0 && c.b <= 0.0
+                }
+            }
+            RenderCommand::PushClip { .. }
+            | RenderCommand::PushClipStroke { .. }
+            | RenderCommand::PopClip => true,
+            _ => false,
+        })
+    }
 }
 
 /// One step in a decomposed backdrop-dependent [`TilingPattern`] plan.
@@ -356,6 +390,30 @@ impl TilingBlendStep {
         } else {
             None
         }
+    }
+
+    /// True when every leaf blend operation in `steps` is strictly affine in
+    /// the premultiplied backdrop `(B_rgb, B_a)` per channel (`Normal`,
+    /// `Multiply`, `Screen`, and `OpacityGroup` wrappers around them), so the
+    /// combined effect of arbitrary overlapping copies is exactly represented
+    /// by transparent (`T, a_t`), black (`K`), and white (`K + M`) samples:
+    ///
+    /// - `out_a = a_t + (1 - a_t) * B_a`
+    /// - `out_rgb = (1 - B_a) * T + B_a * K + M * B_rgb`
+    ///
+    /// Non-affine blend modes such as `Darken` (`min(B, c)`), `Lighten`,
+    /// `Overlay`, `ColorDodge`, `Difference`, or non-separable HSL modes return
+    /// `false` so backends preserve copy order against the actual backdrop.
+    pub fn is_affine_in_backdrop(steps: &[Self]) -> bool {
+        steps.iter().all(|step| match step {
+            Self::Segment(seg) => {
+                matches!(
+                    seg.blend_mode,
+                    BlendMode::Normal | BlendMode::Multiply | BlendMode::Screen
+                ) || seg.is_identity_on_opaque()
+            }
+            Self::OpacityGroup { steps, .. } => Self::is_affine_in_backdrop(steps),
+        })
     }
 }
 
@@ -2241,5 +2299,58 @@ mod tiling_backdrop_tests {
         assert!(segs[0].intersects_period(&pat, 0, 0));
         assert!(!segs[1].intersects_period(&pat, -1, 0));
         assert!(segs[1].intersects_period(&pat, 0, 0));
+    }
+
+    #[test]
+    fn is_affine_in_backdrop_accepts_only_affine_blend_modes() {
+        let make_mode = |mode: BlendMode| -> TilingPattern {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 4.0, 4.0));
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: mode,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 4.0, 4.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::gray(0.5)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+            tiling_with(dl.commands)
+        };
+
+        for affine in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
+            let steps = make_mode(affine).blend_steps().expect("steps");
+            assert!(
+                TilingBlendStep::is_affine_in_backdrop(&steps),
+                "{affine:?} must be classified as affine in backdrop"
+            );
+        }
+        for non_affine in [
+            BlendMode::Darken,
+            BlendMode::Lighten,
+            BlendMode::Overlay,
+            BlendMode::Difference,
+            BlendMode::Exclusion,
+            BlendMode::ColorDodge,
+            BlendMode::ColorBurn,
+            BlendMode::HardLight,
+            BlendMode::SoftLight,
+            BlendMode::Hue,
+            BlendMode::Saturation,
+            BlendMode::Color,
+            BlendMode::Luminosity,
+        ] {
+            let steps = make_mode(non_affine).blend_steps().expect("steps");
+            assert!(
+                !TilingBlendStep::is_affine_in_backdrop(&steps),
+                "{non_affine:?} must NOT be classified as affine in backdrop"
+            );
+        }
     }
 }
