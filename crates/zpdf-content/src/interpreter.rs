@@ -901,11 +901,14 @@ fn command_matches_caller_fill(
         RenderCommand::DrawInlineImage(d) => {
             d.image.is_image_mask && (d.alpha - caller_alpha).abs() <= EPS
         }
-        RenderCommand::PushClip { .. }
-        | RenderCommand::PushClipStroke { .. }
-        | RenderCommand::PopClip
-        | RenderCommand::PopBlendGroup => true,
-        RenderCommand::PushBlendGroup { mask, .. } => mask.is_none(),
+        RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => false,
+        RenderCommand::PopClip | RenderCommand::PopBlendGroup => true,
+        RenderCommand::PushBlendGroup {
+            blend_mode,
+            alpha,
+            mask,
+            ..
+        } => mask.is_none() && *blend_mode == BlendMode::Normal && (*alpha - 1.0).abs() <= EPS,
     }
 }
 
@@ -6229,7 +6232,27 @@ impl<'a> ContentInterpreter<'a> {
                     // sharing one FontCache.
                     let target = format!("__inline_font_{:016x}", inline_font_key(font_dict));
                     bindings.push(CachedFontBinding::CacheSlot(name.0.clone(), target.clone()));
-                    if fc.get_by_name(&target).is_none() {
+                    if let Some((fid, _)) = fc.get_by_name(&target) {
+                        if matches!(
+                            fc.type3_source(fid),
+                            Some(zpdf_font::Type3Source::Unavailable)
+                        ) {
+                            let upgraded = match owner {
+                                Some(InlineFontOwner::Container(owner_id)) => {
+                                    fc.record_type3_container_source(fid, owner_id, name.0.clone());
+                                    true
+                                }
+                                Some(InlineFontOwner::ResourcesDict(res_id)) => {
+                                    fc.record_type3_resources_source(fid, res_id, name.0.clone());
+                                    true
+                                }
+                                None => false,
+                            };
+                            if upgraded {
+                                self.type3_font_resources.remove(&fid);
+                            }
+                        }
+                    } else {
                         match zpdf_document::font_loader::load_single_font_dict_with_fallback(
                             file,
                             font_dict,
@@ -7653,6 +7676,10 @@ impl<'a> ContentInterpreter<'a> {
             }
 
             let glyph_cmd_end = self.display_list.commands.len();
+            if self.active_type3_glyphs.is_empty() && glyph_cmd_end > glyph_cmd_start {
+                self.display_list
+                    .push_type3_glyph_range(glyph_cmd_start, glyph_cmd_end);
+            }
             let glyph_cmds = &self.display_list.commands[glyph_cmd_start..glyph_cmd_end];
             let emitted_paint = glyph_cmds.iter().any(is_paint_command);
             let fully_hidden_by_oc = glyph_oc_suppressed && !emitted_paint;
@@ -7673,7 +7700,7 @@ impl<'a> ContentInterpreter<'a> {
                     .all(|cmd| command_matches_caller_fill(cmd, paint_color, alpha));
             if completed
                 && glyph_verified
-                && (emitted_paint || is_whitespace_glyph)
+                && (emitted_paint != is_whitespace_glyph)
                 && !fully_hidden_by_oc
                 && !suppressed_by_none
                 && !glyph_image_dropped
@@ -13280,5 +13307,187 @@ mod tests {
             fc.get(0).is_some_and(|f| f.has_type3_programs()),
             "test setup must admit the small Type 3 program while rejecting its oversized source dict"
         );
+    }
+
+    #[test]
+    fn ownerless_inline_type3_recovers_when_reloadable_source_encountered_in_either_order() {
+        let stream_obj = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objs: &[Vec<u8>]| -> Vec<u8> {
+            let mut out = b"%PDF-1.7\n".to_vec();
+            let mut offs = Vec::with_capacity(objs.len());
+            for (i, body) in objs.iter().enumerate() {
+                offs.push(out.len());
+                out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = out.len();
+            let n = objs.len() + 1;
+            out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+            for off in offs {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            out.extend_from_slice(
+                format!("trailer\n<< /Size {n} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            );
+            out
+        };
+
+        // Oversized inline Type 3 font dictionary: small CharProc fits in 12 KiB,
+        // while 16 KiB `/Pad` exceeds `max_font_cache_bytes`.
+        let pad = "x".repeat(16_384);
+        let inline_font_pdf = format!(
+            "<< /Type /Font /Subtype /Type3 /FontMatrix [0.001 0 0 0.001 0 0] \
+             /CharProcs << /A 3 0 R >> /Encoding << /Differences [65 /A] >> \
+             /FirstChar 65 /LastChar 65 /Widths [1000] \
+             /Resources << /XObject << /Stamp 2 0 R >> >> \
+             /Pad ({pad}) >>"
+        );
+        let form_with_inline_res = stream_obj(
+            &format!(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Resources << /Font << /F3 {inline_font_pdf} >> >>"
+            ),
+            b"BT /F3 50 Tf 0 0 Td (A) Tj ET",
+        );
+        let indirect_res_dict = format!("<< /Font << /F3 {inline_font_pdf} >> >>").into_bytes();
+        let form_with_indirect_res = stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources 5 0 R",
+            b"BT /F3 50 Tf 0 0 Td (A) Tj ET",
+        );
+
+        // Obj 1: parent RED /Stamp; Obj 2: Type 3 GREEN /Stamp; Obj 3: CharProc /A;
+        // Obj 4: indirect Form with inline /Resources; Obj 5: indirect /Resources;
+        // Obj 6: Form pointing to indirect /Resources 5 0 R.
+        let pdf = assemble(&[
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 0 0 rg 0 0 100 100 re f",
+            ),
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"0 1 0 rg 0 0 100 100 re f",
+            ),
+            stream_obj("", b"1000 0 d0 /Stamp Do"),
+            form_with_inline_res,
+            indirect_res_dict,
+            form_with_indirect_res,
+        ]);
+        let file = zpdf_parser::PdfFile::parse(pdf).expect("parse pdf");
+        let container_stream = file
+            .resolve(ObjectId(4, 0))
+            .expect("obj 4")
+            .as_stream()
+            .expect("form stream 4")
+            .clone();
+        let indirect_res_stream = file
+            .resolve(ObjectId(6, 0))
+            .expect("obj 6")
+            .as_stream()
+            .expect("form stream 6")
+            .clone();
+        // Owner-less synthetic Form carrying the identical inline font dict.
+        let ownerless_stream = container_stream.clone();
+
+        let mut page_res = ResourceDict::default();
+        page_res.xobjects.insert("Stamp".into(), ObjectId(1, 0));
+
+        let limits = zpdf_core::ParseLimits {
+            max_font_cache_bytes: 12_000,
+            ..zpdf_core::ParseLimits::default()
+        };
+
+        let count_green_and_red = |cmds: &[RenderCommand]| -> (usize, usize) {
+            let mut green = 0usize;
+            let mut red = 0usize;
+            for cmd in cmds {
+                if let RenderCommand::FillPath {
+                    paint: Paint::Solid(c),
+                    ..
+                } = cmd
+                {
+                    if c.g > 0.9 && c.r < 0.1 {
+                        green += 1;
+                    }
+                    if c.r > 0.9 && c.g < 0.1 {
+                        red += 1;
+                    }
+                }
+            }
+            (green, red)
+        };
+
+        // Order 1: owner-less first (Unavailable) -> indirect Form container second (recovers).
+        {
+            let mut fc = FontCache::new();
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(&file, &page_res)
+                .with_fonts(&mut fc)
+                .with_limits(&limits);
+            interp.do_form_xobject(None, &ownerless_stream, &file);
+            assert_eq!(
+                count_green_and_red(&interp.display_list.commands),
+                (0, 0),
+                "owner-less oversized font must not paint before a reloadable source is seen"
+            );
+            interp.do_form_xobject(Some(ObjectId(4, 0)), &container_stream, &file);
+            // Subsequent draw of the owner-less form now also reuses the recovered source.
+            interp.do_form_xobject(None, &ownerless_stream, &file);
+            assert_eq!(
+                count_green_and_red(&interp.display_list.commands),
+                (2, 0),
+                "indirect Form container must upgrade Unavailable so both subsequent draws paint green /Stamp"
+            );
+            assert!(
+                fc.bytes_used() <= limits.max_font_cache_bytes,
+                "recovered container source must stay within budget"
+            );
+        }
+
+        // Order 2: indirect Form container first -> owner-less second (both paint green).
+        {
+            let mut fc = FontCache::new();
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(&file, &page_res)
+                .with_fonts(&mut fc)
+                .with_limits(&limits);
+            interp.do_form_xobject(Some(ObjectId(4, 0)), &container_stream, &file);
+            interp.do_form_xobject(None, &ownerless_stream, &file);
+            assert_eq!(
+                count_green_and_red(&interp.display_list.commands),
+                (2, 0),
+                "container-first encounter order must paint green /Stamp in both forms"
+            );
+            assert!(
+                fc.bytes_used() <= limits.max_font_cache_bytes,
+                "container-first source must stay within budget"
+            );
+        }
+
+        // Order 3: owner-less first (Unavailable) -> indirect /Resources dict second (recovers).
+        {
+            let mut fc = FontCache::new();
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(&file, &page_res)
+                .with_fonts(&mut fc)
+                .with_limits(&limits);
+            interp.do_form_xobject(None, &ownerless_stream, &file);
+            assert_eq!(count_green_and_red(&interp.display_list.commands), (0, 0));
+            interp.do_form_xobject(None, &indirect_res_stream, &file);
+            assert_eq!(
+                count_green_and_red(&interp.display_list.commands),
+                (1, 0),
+                "indirect /Resources dict must upgrade Unavailable and paint green /Stamp"
+            );
+            assert!(
+                fc.bytes_used() <= limits.max_font_cache_bytes,
+                "recovered /Resources source must stay within budget"
+            );
+        }
     }
 }

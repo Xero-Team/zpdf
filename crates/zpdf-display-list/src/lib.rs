@@ -15,6 +15,7 @@ pub struct DisplayList {
     pub commands: Vec<RenderCommand>,
     expanded_glyph_runs: Vec<ExpandedGlyphRun>,
     pattern_ranges: Vec<(usize, usize)>,
+    type3_glyph_ranges: Vec<(usize, usize)>,
 }
 
 impl DisplayList {
@@ -24,6 +25,7 @@ impl DisplayList {
             commands: Vec::new(),
             expanded_glyph_runs: Vec::new(),
             pattern_ranges: Vec::new(),
+            type3_glyph_ranges: Vec::new(),
         }
     }
 
@@ -32,17 +34,20 @@ impl DisplayList {
     }
 
     /// Truncate `self.commands` to `len`, dropping incomplete expanded glyph
-    /// runs and clipping pattern ranges to the surviving command prefix.
+    /// runs and clipping pattern and Type 3 glyph ranges to the surviving
+    /// command prefix.
     pub fn truncate_commands(&mut self, len: usize) {
         self.commands.truncate(len);
         self.expanded_glyph_runs.retain(|e| e.cmd_end <= len);
-        self.pattern_ranges.retain_mut(|(start, end)| {
-            if *start >= len {
-                return false;
-            }
-            *end = (*end).min(len);
-            *start < *end
-        });
+        for ranges in [&mut self.pattern_ranges, &mut self.type3_glyph_ranges] {
+            ranges.retain_mut(|(start, end)| {
+                if *start >= len {
+                    return false;
+                }
+                *end = (*end).min(len);
+                *start < *end
+            });
+        }
     }
 
     /// Record a semantic glyph run whose visual marks have already been
@@ -133,6 +138,51 @@ impl DisplayList {
             .pattern_ranges
             .partition_point(|&(start, _)| start <= cmd_idx);
         pos > 0 && cmd_idx < self.pattern_ranges[pos - 1].1
+    }
+
+    /// Record a command range `[cmd_start, cmd_end)` emitted while interpreting
+    /// an outermost Type 3 CharProc. Commands inside this range are glyph
+    /// artwork (not independent page-level text runs) when not substituted by
+    /// an [`ExpandedGlyphRun`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cmd_start > cmd_end`, `cmd_end > self.commands.len()`, or
+    /// `cmd_start` overlaps a previously recorded range.
+    pub fn push_type3_glyph_range(&mut self, cmd_start: usize, cmd_end: usize) {
+        assert!(
+            cmd_start <= cmd_end && cmd_end <= self.commands.len(),
+            "type3 glyph command range {cmd_start}..{cmd_end} out of bounds for {} commands",
+            self.commands.len()
+        );
+        if let Some(&(_, prev_end)) = self.type3_glyph_ranges.last() {
+            assert!(
+                cmd_start >= prev_end,
+                "type3 glyph command range {cmd_start}..{cmd_end} overlaps previous range ending at {prev_end}",
+            );
+        }
+        if cmd_start < cmd_end {
+            self.type3_glyph_ranges.push((cmd_start, cmd_end));
+        }
+    }
+
+    /// Discard all recorded Type 3 glyph command ranges.
+    pub fn clear_type3_glyph_ranges(&mut self) {
+        self.type3_glyph_ranges.clear();
+    }
+
+    /// Non-overlapping `[cmd_start, cmd_end)` ranges of commands emitted while
+    /// interpreting outermost Type 3 CharProcs.
+    pub fn type3_glyph_ranges(&self) -> &[(usize, usize)] {
+        &self.type3_glyph_ranges
+    }
+
+    /// Whether `commands[cmd_idx]` originated inside a Type 3 CharProc.
+    pub fn is_in_type3_glyph_range(&self, cmd_idx: usize) -> bool {
+        let pos = self
+            .type3_glyph_ranges
+            .partition_point(|&(start, _)| start <= cmd_idx);
+        pos > 0 && cmd_idx < self.type3_glyph_ranges[pos - 1].1
     }
 }
 
@@ -478,6 +528,27 @@ mod tests {
         assert_eq!(dl.commands.len(), 1);
         assert!(dl.pattern_ranges().is_empty());
         assert!(!dl.is_in_pattern_range(1));
+    }
+
+    #[test]
+    fn type3_glyph_ranges_track_membership_and_truncate_cleanly() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for _ in 0..5 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_type3_glyph_range(1, 3);
+        dl.push_type3_glyph_range(3, 5);
+        assert!(!dl.is_in_type3_glyph_range(0));
+        assert!(dl.is_in_type3_glyph_range(1));
+        assert!(dl.is_in_type3_glyph_range(2));
+        assert!(dl.is_in_type3_glyph_range(3));
+        assert!(dl.is_in_type3_glyph_range(4));
+        assert!(!dl.is_in_type3_glyph_range(5));
+
+        dl.truncate_commands(2);
+        assert_eq!(dl.type3_glyph_ranges(), &[(1, 2)]);
+        assert!(dl.is_in_type3_glyph_range(1));
+        assert!(!dl.is_in_type3_glyph_range(2));
     }
 }
 

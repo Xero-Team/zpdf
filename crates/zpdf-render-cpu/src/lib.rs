@@ -932,6 +932,98 @@ impl<'a> CpuRenderer<'a> {
         tiny_skia::StrokeDash::new(array, dash.phase * scale)
     }
 
+    /// Expand a display-list path stroke (including caps, joins, miter limit,
+    /// and dashes) into a filled outline in the path's own user coordinate
+    /// space.
+    ///
+    /// Used by exporters that need to apply a non-uniform transform to a
+    /// stroked path or stroked clip without distorting directional stroke
+    /// widths or dash lengths.
+    #[doc(hidden)]
+    pub fn stroke_path_to_outline(
+        path: &Path,
+        style: &StrokeStyle,
+        resolution_scale: f32,
+    ) -> Option<Path> {
+        let mut pb = tiny_skia::PathBuilder::new();
+        for elem in path {
+            match elem {
+                PathElement::MoveTo(p) => pb.move_to(p.x as f32, p.y as f32),
+                PathElement::LineTo(p) => pb.line_to(p.x as f32, p.y as f32),
+                PathElement::CurveTo(c1, c2, end) => pb.cubic_to(
+                    c1.x as f32,
+                    c1.y as f32,
+                    c2.x as f32,
+                    c2.y as f32,
+                    end.x as f32,
+                    end.y as f32,
+                ),
+                PathElement::Close => pb.close(),
+            }
+        }
+        let skia_path = pb.finish()?;
+        let res = resolution_scale.max(0.25);
+        let min_width = if style.width <= 0.0 { 1.0 / res } else { 0.0 };
+        let skia_stroke = Self::skia_stroke(style, 1.0, min_width);
+        // `tiny_skia::Path::stroke` does not apply `stroke.dash`; dash first
+        // identically to `Pixmap::stroke_path`.
+        let dashed_path;
+        let path_to_stroke = if let Some(ref dash) = skia_stroke.dash {
+            dashed_path = skia_path.dash(dash, res)?;
+            &dashed_path
+        } else {
+            &skia_path
+        };
+        let outlined = path_to_stroke.stroke(&skia_stroke, res)?;
+
+        let mut out = Path::new();
+        let mut cur = zpdf_core::Point::new(0.0, 0.0);
+        let mut subpath_start = cur;
+        for seg in outlined.segments() {
+            match seg {
+                tiny_skia::PathSegment::MoveTo(p) => {
+                    let pt = zpdf_core::Point::new(p.x as f64, p.y as f64);
+                    out.move_to(pt);
+                    cur = pt;
+                    subpath_start = pt;
+                }
+                tiny_skia::PathSegment::LineTo(p) => {
+                    let pt = zpdf_core::Point::new(p.x as f64, p.y as f64);
+                    out.line_to(pt);
+                    cur = pt;
+                }
+                tiny_skia::PathSegment::QuadTo(c, end) => {
+                    let q = zpdf_core::Point::new(c.x as f64, c.y as f64);
+                    let p2 = zpdf_core::Point::new(end.x as f64, end.y as f64);
+                    let c1 = zpdf_core::Point::new(
+                        cur.x + (2.0 / 3.0) * (q.x - cur.x),
+                        cur.y + (2.0 / 3.0) * (q.y - cur.y),
+                    );
+                    let c2 = zpdf_core::Point::new(
+                        p2.x + (2.0 / 3.0) * (q.x - p2.x),
+                        p2.y + (2.0 / 3.0) * (q.y - p2.y),
+                    );
+                    out.curve_to(c1, c2, p2);
+                    cur = p2;
+                }
+                tiny_skia::PathSegment::CubicTo(c1, c2, end) => {
+                    let p2 = zpdf_core::Point::new(end.x as f64, end.y as f64);
+                    out.curve_to(
+                        zpdf_core::Point::new(c1.x as f64, c1.y as f64),
+                        zpdf_core::Point::new(c2.x as f64, c2.y as f64),
+                        p2,
+                    );
+                    cur = p2;
+                }
+                tiny_skia::PathSegment::Close => {
+                    out.close();
+                    cur = subpath_start;
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Render a glyph run with a specific alpha override (used by knockout groups).
     fn render_glyph_run_with_alpha(&mut self, run: &GlyphRun, alpha_override: f32) {
         let font_cache = match self.font_cache {

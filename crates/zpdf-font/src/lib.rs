@@ -3824,7 +3824,8 @@ impl FontCache {
 
     /// Record a lightweight reload reference for an inline Type 3 font located
     /// in an indirect container object's `/Resources /Font`. Skips metrics-only
-    /// Type 3 entries and never overwrites an existing source binding for `id`.
+    /// Type 3 entries and never overwrites a usable source binding, while
+    /// allowing a reloadable reference to replace [`Type3Source::Unavailable`].
     #[doc(hidden)]
     pub fn record_type3_container_source(
         &mut self,
@@ -3832,7 +3833,10 @@ impl FontCache {
         owner_id: zpdf_core::ObjectId,
         font_name: String,
     ) {
-        if self.type3_sources.contains_key(&id) {
+        if matches!(
+            self.type3_sources.get(&id),
+            Some(existing) if !matches!(existing, Type3Source::Unavailable)
+        ) {
             return;
         }
         if !self.fonts.get(&id).is_some_and(|f| f.has_type3_programs()) {
@@ -3849,8 +3853,9 @@ impl FontCache {
 
     /// Record a lightweight reload reference for an inline Type 3 font located
     /// directly under `/Font /<name>` of an indirect `/Resources` dictionary.
-    /// Skips metrics-only Type 3 entries and never overwrites an existing
-    /// source binding for `id`.
+    /// Skips metrics-only Type 3 entries and never overwrites a usable source
+    /// binding, while allowing a reloadable reference to replace
+    /// [`Type3Source::Unavailable`].
     #[doc(hidden)]
     pub fn record_type3_resources_source(
         &mut self,
@@ -3858,7 +3863,10 @@ impl FontCache {
         resources_id: zpdf_core::ObjectId,
         font_name: String,
     ) {
-        if self.type3_sources.contains_key(&id) {
+        if matches!(
+            self.type3_sources.get(&id),
+            Some(existing) if !matches!(existing, Type3Source::Unavailable)
+        ) {
             return;
         }
         if !self.fonts.get(&id).is_some_and(|f| f.has_type3_programs()) {
@@ -3876,9 +3884,10 @@ impl FontCache {
     /// Record an owner-less inline Type 3 font dictionary for `id`, charging
     /// its estimated retained memory against `max_bytes` and [`Self::bytes_used`].
     ///
-    /// Skips metrics-only Type 3 entries, never overwrites an existing source
-    /// binding for `id`, and returns `false` without retaining the dictionary
-    /// when it would exceed `max_bytes`.
+    /// Skips metrics-only Type 3 entries, never overwrites a usable source
+    /// binding (while allowing replacement of [`Type3Source::Unavailable`]),
+    /// and returns `false` without retaining the dictionary when it would
+    /// exceed `max_bytes`.
     #[doc(hidden)]
     pub fn record_type3_inline_source_with_limit(
         &mut self,
@@ -3886,7 +3895,10 @@ impl FontCache {
         dict: Arc<zpdf_core::PdfDict>,
         max_bytes: u64,
     ) -> bool {
-        if self.type3_sources.contains_key(&id) {
+        if matches!(
+            self.type3_sources.get(&id),
+            Some(existing) if !matches!(existing, Type3Source::Unavailable)
+        ) {
             return true;
         }
         if !self.fonts.get(&id).is_some_and(|f| f.has_type3_programs()) {
@@ -6969,5 +6981,47 @@ mod tests {
             "code 65 absent from Type 3 /Encoding must not verify as 'A' via default simple_encoding"
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn type3_unavailable_source_can_be_upgraded_to_reloadable_reference() {
+        let mut char_procs = HashMap::new();
+        char_procs.insert("A".into(), Arc::from(b"500 0 d0 0 0 10 10 re f".as_slice()));
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding: vec!["A".into()],
+                widths: vec![500.0],
+                first_char: 0,
+            },
+            "T3Upgrade".into(),
+            Vec::new(),
+            CidWidths::new(500.0),
+        );
+        let mut cache = FontCache::new();
+        let fid = cache.insert("F1".into(), font);
+        cache.record_type3_source_unavailable(fid);
+        assert!(matches!(
+            cache.type3_source(fid),
+            Some(Type3Source::Unavailable)
+        ));
+
+        let container_id = zpdf_core::ObjectId(12, 0);
+        cache.record_type3_container_source(fid, container_id, "F3".into());
+        assert!(matches!(
+            cache.type3_source(fid),
+            Some(Type3Source::ContainerInlineFont {
+                owner_id,
+                font_name
+            }) if *owner_id == container_id && font_name == "F3"
+        ));
+
+        // Once upgraded to a usable source, later calls must not overwrite it.
+        cache.record_type3_resources_source(fid, zpdf_core::ObjectId(99, 0), "F9".into());
+        assert!(matches!(
+            cache.type3_source(fid),
+            Some(Type3Source::ContainerInlineFont { owner_id, .. }) if *owner_id == container_id
+        ));
     }
 }
