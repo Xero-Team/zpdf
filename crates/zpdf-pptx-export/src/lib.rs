@@ -752,20 +752,24 @@ impl<'a> SlideConverter<'a> {
                             skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
                         }
                     } else {
+                        let end = entry.cmd_end.min(commands.len());
+                        let range_has_overprint = entry.run.overprint.is_some()
+                            || commands[entry.cmd_start.min(end)..end]
+                                .iter()
+                                .any(|c| command_overprint(c).is_some());
                         let run_bounds = expanded_run_bounds(entry, commands, self.font_cache);
                         let overlapped_by_later_blend =
                             later_non_normal_blends.overlaps_at_or_after(entry.cmd_end, run_bounds);
                         if effective_alpha >= 1.0 - 1e-3
+                            && !range_has_overprint
                             && !overlapped_by_later_blend
                             && !self.clip_stack_constrains_rect(run_bounds)
                             && self.convert_glyph_run(&entry.run, true)?
                         {
-                            let end = entry.cmd_end.min(commands.len());
                             if end > cmd_idx {
                                 skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
                             }
                         } else {
-                            let end = entry.cmd_end.min(commands.len());
                             fallback_artwork_end = fallback_artwork_end.max(end);
                         }
                     }
@@ -895,7 +899,7 @@ impl<'a> SlideConverter<'a> {
             let in_artwork_range = cmd_idx < fallback_artwork_end
                 || display_list.is_in_type3_glyph_range(cmd_idx)
                 || display_list.is_in_pattern_range(cmd_idx);
-            self.convert_command(&commands[cmd_idx], in_artwork_range)?;
+            self.convert_command(commands, cmd_idx, in_artwork_range)?;
             cmd_idx += 1;
         }
         self.flush_pending_tiled_snapshots(commands)?;
@@ -1776,7 +1780,13 @@ impl<'a> SlideConverter<'a> {
         Ok(())
     }
 
-    fn convert_command(&mut self, cmd: &RenderCommand, in_artwork_range: bool) -> Result<()> {
+    fn convert_command(
+        &mut self,
+        all_commands: &[RenderCommand],
+        cmd_idx: usize,
+        in_artwork_range: bool,
+    ) -> Result<()> {
+        let cmd = &all_commands[cmd_idx];
         match cmd {
             RenderCommand::DrawGlyphRun(glyph_run) => {
                 let effective_alpha = effective_paint_alpha(&glyph_run.paint, glyph_run.alpha);
@@ -1784,11 +1794,18 @@ impl<'a> SlideConverter<'a> {
                     return Ok(());
                 }
                 if in_artwork_range {
+                    if glyph_run.overprint.is_some_and(|op| op.active == 0) {
+                        return Ok(());
+                    }
+                    let backdrop = glyph_run
+                        .overprint
+                        .is_some_and(|op| op.active != 0)
+                        .then_some((all_commands, cmd_idx, cmd_idx));
                     self.flatten_commands_group(
-                        std::slice::from_ref(cmd),
+                        &all_commands[cmd_idx..=cmd_idx],
                         None,
                         self.page_rect,
-                        None,
+                        backdrop,
                     )?;
                 } else {
                     self.convert_glyph_run(glyph_run, false)?;
@@ -1799,23 +1816,30 @@ impl<'a> SlideConverter<'a> {
                 rule,
                 paint,
                 alpha,
-                ..
+                overprint,
             } => {
                 let effective_alpha = effective_paint_alpha(paint, *alpha);
                 if effective_alpha <= 0.0 {
                     return Ok(());
                 }
+                if in_artwork_range && overprint.is_some_and(|op| op.active == 0) {
+                    return Ok(());
+                }
+                let overprint_backdrop =
+                    in_artwork_range && overprint.is_some_and(|op| op.active != 0);
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
                 let raster_artwork = in_artwork_range
-                    && (effective_alpha < 1.0 - 1e-3
+                    && (overprint_backdrop
+                        || effective_alpha < 1.0 - 1e-3
                         || artwork_fill_needs_raster(path, *rule, paint));
                 if clipped_artwork || raster_artwork {
+                    let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
                     self.flatten_commands_group(
-                        std::slice::from_ref(cmd),
+                        &all_commands[cmd_idx..=cmd_idx],
                         None,
                         self.page_rect,
-                        None,
+                        backdrop,
                     )?;
                 } else {
                     self.convert_fill_path(path, paint, effective_alpha, in_artwork_range)?;
@@ -1826,26 +1850,30 @@ impl<'a> SlideConverter<'a> {
                 style,
                 paint,
                 alpha,
-                ..
+                overprint,
             } => {
                 let effective_alpha = effective_paint_alpha(paint, *alpha);
                 if effective_alpha <= 0.0 {
                     return Ok(());
                 }
-                let has_dash = style
-                    .dash
-                    .as_ref()
-                    .is_some_and(|d| !d.array.is_empty() && d.array.iter().any(|&v| v > 0.0));
+                if in_artwork_range && overprint.is_some_and(|op| op.active == 0) {
+                    return Ok(());
+                }
+                let overprint_backdrop =
+                    in_artwork_range && overprint.is_some_and(|op| op.active != 0);
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
-                if clipped_artwork
-                    || (in_artwork_range && (effective_alpha < 1.0 - 1e-3 || has_dash))
-                {
+                let raster_artwork = in_artwork_range
+                    && (overprint_backdrop
+                        || effective_alpha < 1.0 - 1e-3
+                        || artwork_stroke_needs_raster(path, style, paint));
+                if clipped_artwork || raster_artwork {
+                    let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
                     self.flatten_commands_group(
-                        std::slice::from_ref(cmd),
+                        &all_commands[cmd_idx..=cmd_idx],
                         None,
                         self.page_rect,
-                        None,
+                        backdrop,
                     )?;
                 } else {
                     self.convert_stroke_path(path, style, paint, effective_alpha)?;
@@ -1932,7 +1960,10 @@ impl<'a> SlideConverter<'a> {
             return Ok(None);
         }
         let effective_alpha = effective_paint_alpha(&glyph_run.paint, glyph_run.alpha);
-        if effective_alpha <= 0.0 || (require_verified_all && effective_alpha < 1.0 - 1e-3) {
+        if effective_alpha <= 0.0
+            || (require_verified_all
+                && (effective_alpha < 1.0 - 1e-3 || glyph_run.overprint.is_some()))
+        {
             return Ok(None);
         }
 
@@ -2927,6 +2958,27 @@ impl NonNormalBlendIndex {
                 RenderCommand::PopBlendGroup => {
                     isolated_normal_depth = isolated_normal_depth.saturating_sub(1);
                 }
+                other
+                    if isolated_normal_depth == 0
+                        && command_overprint(other).is_some_and(|op| op.active != 0) =>
+                {
+                    if let Some(clip_rect) = clip_stack.last().copied().unwrap_or(Some(page_rect)) {
+                        let draw_rect = match compute_commands_bounds(
+                            std::slice::from_ref(other),
+                            (0.0, 0.0),
+                            font_cache,
+                        ) {
+                            CommandBounds::Empty => None,
+                            CommandBounds::Known(r) => {
+                                Some(Rect::new(r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0))
+                            }
+                            CommandBounds::Unknown => Some(clip_rect),
+                        };
+                        if let Some(rect) = draw_rect.and_then(|r| intersect_rect(r, clip_rect)) {
+                            index.insert(idx, rect);
+                        }
+                    }
+                }
                 _ => {}
             }
             idx += 1;
@@ -3014,8 +3066,19 @@ impl NonNormalBlendIndex {
     }
 }
 
+fn command_overprint(cmd: &RenderCommand) -> Option<zpdf_display_list::Overprint> {
+    match cmd {
+        RenderCommand::FillPath { overprint, .. } | RenderCommand::StrokePath { overprint, .. } => {
+            *overprint
+        }
+        RenderCommand::DrawGlyphRun(run) => run.overprint,
+        _ => None,
+    }
+}
+
 /// Whether flattening `cmds` depends on the already-painted page backdrop
-/// (a non-Normal blend group not shielded by an enclosing isolated Normal group).
+/// (a non-Normal blend group or partial-colorant overprint not shielded by an
+/// enclosing isolated Normal group).
 fn group_uses_page_backdrop(cmds: &[RenderCommand]) -> bool {
     let mut isolated_normal_depth = 0usize;
     for cmd in cmds {
@@ -3046,6 +3109,12 @@ fn group_uses_page_backdrop(cmds: &[RenderCommand]) -> bool {
             }
             RenderCommand::PopBlendGroup => {
                 isolated_normal_depth = isolated_normal_depth.saturating_sub(1);
+            }
+            other
+                if isolated_normal_depth == 0
+                    && command_overprint(other).is_some_and(|op| op.active != 0) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -3214,6 +3283,28 @@ fn artwork_fill_needs_raster(
     !matches!(paint, zpdf_display_list::Paint::Solid(_))
         || path_has_multiple_subpaths(path)
         || path_single_subpath_may_self_intersect(path)
+}
+
+/// Whether an artwork `StrokePath` must use the CPU raster fallback to preserve
+/// stroke geometry not carried by native PowerPoint `Line`/`FreeformPath` XML
+/// (dashes, non-solid paint, round/square caps, or joins/miter limits on
+/// multi-segment or curved paths).
+fn artwork_stroke_needs_raster(
+    path: &zpdf_display_list::Path,
+    style: &zpdf_display_list::StrokeStyle,
+    paint: &zpdf_display_list::Paint,
+) -> bool {
+    if !matches!(paint, zpdf_display_list::Paint::Solid(_)) {
+        return true;
+    }
+    let has_dash = style
+        .dash
+        .as_ref()
+        .is_some_and(|d| !d.array.is_empty() && d.array.iter().any(|&v| v > 0.0));
+    if has_dash || style.cap != zpdf_display_list::LineCap::Butt {
+        return true;
+    }
+    shape_recognizer::recognize_line(path).is_none()
 }
 
 fn path_control_bounds(path: &zpdf_display_list::Path) -> Option<Rect> {
@@ -11456,16 +11547,47 @@ mod export_tests {
             sample_pdf(60.0, 52.0)
         );
 
-        // Stroked four-cubic heart preserves its exact freeform cubic Bézier path.
-        let SlideElement::FreeformPath { path_data, .. } = &slide.elements[1] else {
+        // Stroked four-cubic heart also preserves its actual notched outline (and sharp
+        // notch join) rather than collapsing into an oval.
+        let SlideElement::Image {
+            x_emu: sx_emu,
+            y_emu: sy_emu,
+            image_data: stroke_png,
+            ..
+        } = &slide.elements[1]
+        else {
             panic!(
-                "stroked four-cubic heart must stay FreeformPath, got {:?}",
+                "stroked four-cubic heart must rasterize to preserve curves and joins, got {:?}",
                 slide.elements[1]
             );
         };
+        let stroke_rgba = image::load_from_memory(stroke_png)
+            .expect("decode stroked heart PNG")
+            .to_rgba8();
+        let sx_pt = *sx_emu as f64 / 12700.0;
+        let sy_pt = *sy_emu as f64 / 12700.0;
+        let sample_stroke_pdf = |pdf_x: f64, pdf_y: f64| -> [u8; 4] {
+            let ppt_y = 120.0 - pdf_y;
+            let px = ((pdf_x - sx_pt) * 2.0).round() as u32;
+            let py = ((ppt_y - sy_pt) * 2.0).round() as u32;
+            stroke_rgba.get_pixel(px, py).0
+        };
+        // Second glyph sits shifted +100pt in X: notch at (160, 88) and hollow center (160, 52)
+        // must remain transparent, while the bottom tip stroke at (160, 20) is opaque blue.
+        assert_eq!(
+            sample_stroke_pdf(160.0, 88.0)[3],
+            0,
+            "stroked heart inward top notch must stay transparent"
+        );
+        assert_eq!(
+            sample_stroke_pdf(160.0, 52.0)[3],
+            0,
+            "stroked heart interior must stay transparent"
+        );
         assert!(
-            path_data.contains("C "),
-            "stroked four-cubic heart must preserve cubic curve segments: {path_data}"
+            is_blue(sample_stroke_pdf(160.0, 20.0)),
+            "stroked heart bottom tip must be painted blue, got {:?}",
+            sample_stroke_pdf(160.0, 20.0)
         );
     }
 
@@ -11571,6 +11693,274 @@ mod export_tests {
             ),
             "genuine axis-aligned Type 3 rectangle must stay native Rectangle, got {:?}",
             slide.elements[1]
+        );
+    }
+
+    #[test]
+    fn type3_d0_overprint_honors_zero_ink_noop_and_partial_colorant_backdrop() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Cyan page backdrop (`0 1 1 rg`), followed by four `d0` Type 3 glyphs
+        // enabling `/op true /OP true /OPM 1` in DeviceCMYK:
+        // A (/zero_fill): zero CMYK ink fill -> Overprint { active: 0 } -> must emit NOTHING.
+        // B (/zero_stroke): zero CMYK ink stroke -> Overprint { active: 0 } -> must emit NOTHING.
+        // C (/yellow_fill): yellow-only CMYK overprint fill -> C(1) + Y(1) = green over cyan!
+        // D (/yellow_stroke): yellow-only CMYK overprint stroke -> C(1) + Y(1) = green over cyan!
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 440 120] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream(
+                "",
+                b"0 1 1 rg 0 0 440 120 re f BT /F1 100 Tf 10 10 Td (ABCD) Tj ET",
+            ), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 68 /Widths [1000 1000 1000 1000] \
+              /Resources << /ExtGState << /GSop 12 0 R >> >> >>"
+                .to_vec(), // 5
+            b"<< /zero_fill 8 0 R /zero_stroke 9 0 R /yellow_fill 10 0 R /yellow_stroke 11 0 R >>"
+                .to_vec(), // 6
+            b"<< /Type /Encoding /Differences [65 /zero_fill /zero_stroke /yellow_fill /yellow_stroke] >>"
+                .to_vec(), // 7
+            stream("", b"1000 0 d0 /GSop gs 0 0 0 0 k 0 0 800 800 re f"), // 8
+            stream("", b"1000 0 d0 /GSop gs 0 0 0 0 K 200 w 100 400 m 700 400 l S"), // 9
+            stream("", b"1000 0 d0 /GSop gs 0 0 1 0 k 0 0 800 800 re f"), // 10
+            stream("", b"1000 0 d0 /GSop gs 0 0 1 0 K 200 w 100 400 m 700 400 l S"), // 11
+            b"<< /Type /ExtGState /op true /OP true /OPM 1 >>".to_vec(),   // 12
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("overprint slide export");
+        // Only 3 elements: cyan background Rectangle + 2 yellow-over-cyan green overprint Images.
+        // Neither zero-ink overprint glyph should emit a white knockout shape.
+        assert_eq!(
+            slide.elements.len(),
+            3,
+            "zero-ink overprint glyphs must leave slide untouched while partial-colorant glyphs composite over backdrop: {:?}",
+            slide.elements
+        );
+        assert!(matches!(
+            slide.elements[0],
+            SlideElement::Rectangle {
+                fill_rgb: Some((0, 255, 255)),
+                ..
+            }
+        ));
+        for (idx, label) in [(1, "/yellow_fill"), (2, "/yellow_stroke")] {
+            let SlideElement::Image { image_data, .. } = &slide.elements[idx] else {
+                panic!(
+                    "{label} partial-colorant overprint must composite against backdrop as Image, got {:?}",
+                    slide.elements[idx]
+                );
+            };
+            let rgba = image::load_from_memory(image_data)
+                .expect("decode overprint PNG")
+                .to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let center = rgba.get_pixel(w / 2, h / 2).0;
+            assert!(
+                center[3] == 255 && center[0] < 15 && center[1] > 240 && center[2] < 15,
+                "{label} yellow overprint on cyan backdrop must composite to green, got {center:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn type3_opaque_strokes_preserve_caps_joins_and_miter_limit() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Five opaque stroked Type 3 glyphs at 100pt scale (1000 glyph units = 100pt):
+        // A (/butt_bar): short thick bar [300..500] at y=500, width=200 (20pt), butt cap (0 J).
+        // B (/square_bar): identical bar with projecting square cap (2 J -> extends to [200..600]).
+        // C (/miter_v): acute V-corner (350,200)-(500,600)-(650,200), width=100, miter join (0 j 10 M).
+        // D (/bevel_v): identical V-corner with bevel join (2 j 10 M).
+        // E (/low_miter_v): identical V-corner with low miter limit (0 j 1.2 M -> bevel fallback).
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 560 120] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"0 0 1 RG BT /F1 100 Tf 10 10 Td (ABCDE) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 69 /Widths [1000 1000 1000 1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /butt_bar 8 0 R /square_bar 9 0 R /miter_v 10 0 R /bevel_v 11 0 R /low_miter_v 12 0 R >>"
+                .to_vec(), // 6
+            b"<< /Type /Encoding /Differences [65 /butt_bar /square_bar /miter_v /bevel_v /low_miter_v] >>"
+                .to_vec(), // 7
+            stream("", b"1000 0 d0 200 w 0 J 300 500 m 500 500 l S"), // 8
+            stream("", b"1000 0 d0 200 w 2 J 300 500 m 500 500 l S"), // 9
+            stream("", b"1000 0 d0 100 w 0 j 10 M 350 200 m 500 600 l 650 200 l S"), // 10
+            stream("", b"1000 0 d0 100 w 2 j 10 M 350 200 m 500 600 l 650 200 l S"), // 11
+            stream("", b"1000 0 d0 100 w 0 j 1.2 M 350 200 m 500 600 l 650 200 l S"), // 12
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("stroke cap/join slide export");
+        assert_eq!(slide.elements.len(), 5);
+
+        let is_blue = |px: [u8; 4]| px[3] > 240 && px[2] > 240 && px[0] < 15 && px[1] < 15;
+        let sample_elem_pdf = |idx: usize, pdf_x: f64, pdf_y: f64, label: &str| -> [u8; 4] {
+            let SlideElement::Image {
+                x_emu,
+                y_emu,
+                image_data,
+                ..
+            } = &slide.elements[idx]
+            else {
+                panic!(
+                    "{label} must rasterize to preserve cap/join/miter geometry, got {:?}",
+                    slide.elements[idx]
+                );
+            };
+            let rgba = image::load_from_memory(image_data)
+                .expect("decode PNG")
+                .to_rgba8();
+            let x_pt = *x_emu as f64 / 12700.0;
+            let y_pt = *y_emu as f64 / 12700.0;
+            let ppt_y = 120.0 - pdf_y;
+            let px_f = ((pdf_x - x_pt) * 2.0).round();
+            let py_f = ((ppt_y - y_pt) * 2.0).round();
+            if px_f < 0.0
+                || py_f < 0.0
+                || px_f as u32 >= rgba.width()
+                || py_f as u32 >= rgba.height()
+            {
+                return [0, 0, 0, 0];
+            }
+            rgba.get_pixel(px_f as u32, py_f as u32).0
+        };
+
+        // A (/butt_bar): simple straight Butt-cap bar stays native Line spanning [40..60]pt.
+        let SlideElement::Line {
+            x1_emu,
+            x2_emu,
+            stroke_width_pt,
+            ..
+        } = &slide.elements[0]
+        else {
+            panic!(
+                "butt-cap straight bar should stay native Line, got {:?}",
+                slide.elements[0]
+            );
+        };
+        assert!(((*x2_emu - *x1_emu) as f64 / 12700.0 - 20.0).abs() < 0.1);
+        assert!((*stroke_width_pt - 20.0).abs() < 0.1);
+
+        // B (/square_bar) sits at origin x=110pt: bar [140..160]pt, width=20pt -> square caps
+        // extend half-width (10pt) to [130..170]pt, so x=134pt and x=166pt must be opaque blue!
+        assert!(
+            is_blue(sample_elem_pdf(1, 134.0, 60.0, "/square_bar")),
+            "projecting square cap must paint left extension at x=134"
+        );
+        assert!(
+            is_blue(sample_elem_pdf(1, 166.0, 60.0, "/square_bar")),
+            "projecting square cap must paint right extension at x=166"
+        );
+
+        // C (/miter_v) origin x=210, D (/bevel_v) origin x=310, E (/low_miter_v) origin x=410.
+        // Vertex is at glyph (500, 600) -> PDF y=70; miter spike projects ~14.2pt above y=70
+        // (up to ~84.2), whereas bevel cuts flat near y=72. Sample at y=78 (inside miter spike!).
+        assert!(
+            is_blue(sample_elem_pdf(2, 260.0, 78.0, "/miter_v")),
+            "high-limit Miter join must project its sharp spike to y=78"
+        );
+        assert_eq!(
+            sample_elem_pdf(3, 360.0, 78.0, "/bevel_v")[3],
+            0,
+            "Bevel join must NOT project a miter spike to y=78"
+        );
+        assert_eq!(
+            sample_elem_pdf(4, 460.0, 78.0, "/low_miter_v")[3],
+            0,
+            "low miter limit (1.2) must bevel the sharp corner instead of projecting to y=78"
         );
     }
 }
