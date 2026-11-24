@@ -728,7 +728,7 @@ fn parse_encoding(
             }
             .unwrap_or_else(|| default_simple_base(subtype));
             let mut encoding = Encoding::from_base(base);
-            apply_differences(&enc_dict, &mut encoding);
+            apply_differences(Some(file), &enc_dict, &mut encoding);
             Some(encoding)
         }
         // No /Encoding: symbolic fonts use their built-in cmap; others get a default.
@@ -744,10 +744,18 @@ fn default_simple_base(subtype: &str) -> &'static zpdf_font::encoding::EncodingT
     }
 }
 
-fn apply_differences(enc_dict: &zpdf_core::PdfDict, encoding: &mut zpdf_font::encoding::Encoding) {
-    if let Ok(diffs) = enc_dict.get_array("Differences") {
+fn apply_differences(
+    file: Option<&PdfFile>,
+    enc_dict: &zpdf_core::PdfDict,
+    encoding: &mut zpdf_font::encoding::Encoding,
+) {
+    let diffs_obj = match enc_dict.get("Differences") {
+        Some(PdfObject::Ref(r)) => file.and_then(|f| f.resolve(*r).ok()),
+        other => other.cloned(),
+    };
+    if let Some(PdfObject::Array(diffs)) = diffs_obj {
         let mut code = Some(0u16);
-        for obj in diffs {
+        for obj in &diffs {
             match obj {
                 PdfObject::Integer(n) => code = u8::try_from(*n).ok().map(u16::from),
                 PdfObject::Name(name) => {
@@ -1868,7 +1876,28 @@ mod tests {
         );
         let mut encoding =
             zpdf_font::encoding::Encoding::from_base(&zpdf_font::encoding::STANDARD_ENCODING);
-        apply_differences(&dict, &mut encoding);
+        apply_differences(None, &dict, &mut encoding);
+    }
+
+    #[test]
+    fn indirect_differences_updates_extraction_encoding() {
+        let file = PdfFile::parse(crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            "<< /Type /Font /Subtype /Type3 /FontMatrix [0.001 0 0 0.001 0 0] \
+             /FontBBox [0 0 1000 1000] /CharProcs << /B 5 0 R >> \
+             /Encoding 3 0 R /FirstChar 65 /LastChar 65 /Widths [600] >>",
+            "<< /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences 4 0 R >>",
+            "[65 /B]",
+            "<< /Length 2 >>\nstream\nd0\nendstream",
+        ]))
+        .expect("parse");
+        let font = load_single_font_with_provider(&file, ObjectId(2, 0), None).expect("font");
+        let mut decoded = String::new();
+        font.append_decoded_source_code(65, 1, &mut decoded);
+        assert_eq!(
+            decoded, "B",
+            "indirect /Differences array must remap extraction encoding from WinAnsi /A to /B"
+        );
     }
 
     /// Type 3 codes outside /Widths advance by /MissingWidth (0 by default),

@@ -1966,6 +1966,27 @@ impl<'a> CpuRenderer<'a> {
     }
 
     fn render_inline_image_with_alpha(&mut self, draw: &InlineImageDraw, alpha_override: f32) {
+        if !draw.image.premultiplied
+            && draw
+                .image
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] < 255)
+        {
+            let mut premul = draw.image.data.clone();
+            Self::premultiply_rgba(&mut premul);
+            self.render_rgba_image(
+                draw.image.width,
+                draw.image.height,
+                &premul,
+                &draw.transform,
+                alpha_override,
+                None,
+            );
+            return;
+        }
         self.render_rgba_image(
             draw.image.width,
             draw.image.height,
@@ -1974,6 +1995,21 @@ impl<'a> CpuRenderer<'a> {
             alpha_override,
             None,
         );
+    }
+
+    fn premultiply_rgba(data: &mut [u8]) {
+        for px in data.as_chunks_mut::<4>().0 {
+            let a = px[3] as u32;
+            if a == 0 {
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+            } else if a < 255 {
+                for c in &mut px[..3] {
+                    *c = ((*c as u32 * a + 127) / 255) as u8;
+                }
+            }
+        }
     }
 
     fn render_image_from_cache(
@@ -5202,6 +5238,46 @@ mod tests {
             group_coverage(&empty, None),
             (None, 0),
             "an untouched raster has no content and nothing to leak"
+        );
+    }
+
+    #[test]
+    fn inline_image_straight_alpha_matches_premultiplied_on_white() {
+        let render_inline = |data: Vec<u8>, premultiplied: bool| -> [u8; 4] {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+            dl.push(RenderCommand::DrawInlineImage(
+                zpdf_display_list::InlineImageDraw {
+                    image: Arc::new(zpdf_display_list::InlineImage {
+                        width: 1,
+                        height: 1,
+                        data,
+                        has_alpha: true,
+                        is_image_mask: false,
+                        premultiplied,
+                    }),
+                    transform: zpdf_core::Matrix::new(8.0, 0.0, 0.0, 8.0, 0.0, 0.0),
+                    alpha: 1.0,
+                },
+            ));
+            let page = CpuRenderer::new()
+                .render_display_list(&dl, 1.0)
+                .expect("render");
+            let idx = ((4 * page.width + 4) * 4) as usize;
+            page.data[idx..idx + 4].try_into().unwrap()
+        };
+
+        let straight = render_inline(vec![128, 0, 0, 128], false);
+        let premul = render_inline(vec![64, 0, 0, 128], true);
+        assert_eq!(
+            straight, premul,
+            "straight-alpha [128,0,0,128] must composite identically to premultiplied [64,0,0,128]"
+        );
+        assert!(
+            (187..=195).contains(&straight[0])
+                && (123..=131).contains(&straight[1])
+                && (123..=131).contains(&straight[2])
+                && straight[3] == 255,
+            "expected ~[191, 127, 127, 255] on white, got {straight:?}"
         );
     }
 }

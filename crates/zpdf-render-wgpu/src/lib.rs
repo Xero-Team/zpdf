@@ -752,9 +752,11 @@ impl<'a> WgpuRenderer<'a> {
                 }
                 record::ImageKey::Inline(idx) => {
                     if let Some(img) = rec.inline_images.get(idx as usize) {
+                        let pixels =
+                            image::premultiply_rgba_if_needed(&img.data, img.premultiplied);
                         tex_bgs.insert(
                             image_key,
-                            image::upload_rgba_bind_group(ctx, img.width, img.height, &img.data),
+                            image::upload_rgba_bind_group(ctx, img.width, img.height, &pixels),
                         );
                     }
                 }
@@ -1741,6 +1743,60 @@ mod resource_tests {
         assert_eq!(
             quantize_clear_color(&Color::rgba(f32::NAN, 0.5, f32::INFINITY, 1.0)),
             expect(0, 128, 255, 255)
+        );
+    }
+
+    #[test]
+    fn inline_image_straight_alpha_matches_premultiplied_on_gpu() {
+        let straight = [128u8, 0, 0, 128];
+        let premul = [64u8, 0, 0, 128];
+        assert_eq!(
+            image::premultiply_rgba_if_needed(&straight, false).as_ref(),
+            &premul
+        );
+        assert_eq!(
+            image::premultiply_rgba_if_needed(&premul, true).as_ref(),
+            &premul
+        );
+
+        let make_dl = |data: Vec<u8>, premultiplied: bool| {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+            dl.push(RenderCommand::DrawInlineImage(
+                zpdf_display_list::InlineImageDraw {
+                    image: std::sync::Arc::new(zpdf_display_list::InlineImage {
+                        width: 1,
+                        height: 1,
+                        data,
+                        has_alpha: true,
+                        is_image_mask: false,
+                        premultiplied,
+                    }),
+                    transform: zpdf_core::Matrix::new(8.0, 0.0, 0.0, 8.0, 0.0, 0.0),
+                    alpha: 1.0,
+                },
+            ));
+            dl
+        };
+        let mut renderer = WgpuRenderer::new();
+        let Ok(straight_page) =
+            renderer.render_display_list(&make_dl(straight.to_vec(), false), 1.0)
+        else {
+            // Headless environment without a GPU adapter: helper assertion above still ran.
+            return;
+        };
+        let premul_page = renderer
+            .render_display_list(&make_dl(premul.to_vec(), true), 1.0)
+            .expect("render premultiplied inline image");
+        let px_idx = ((4 * straight_page.width + 4) * 4) as usize;
+        assert_eq!(
+            &straight_page.data[px_idx..px_idx + 4],
+            &premul_page.data[px_idx..px_idx + 4],
+            "straight-alpha and premultiplied inline images must composite identically on white"
+        );
+        assert!(
+            straight_page.data[px_idx] <= 195 && straight_page.data[px_idx] >= 187,
+            "straight [128,0,0,128] on white should composite near [191,127,127], got {:?}",
+            &straight_page.data[px_idx..px_idx + 4]
         );
     }
 }

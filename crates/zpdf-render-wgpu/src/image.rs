@@ -96,6 +96,29 @@ pub fn upload_image_bind_group(ctx: &GpuContext, img: &DecodedImage) -> wgpu::Bi
     upload_rgba_bind_group(ctx, img.width, img.height, &img.data)
 }
 
+/// Premultiply straight-alpha RGBA8 bytes so they match the premultiplied-alpha
+/// textured pipeline; already-premultiplied or fully opaque inputs borrow the
+/// slice verbatim without copying.
+pub fn premultiply_rgba_if_needed(data: &[u8], premultiplied: bool) -> std::borrow::Cow<'_, [u8]> {
+    if premultiplied || !data.as_chunks::<4>().0.iter().any(|px| px[3] < 255) {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    let mut out = data.to_vec();
+    for px in out.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        if a == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        } else if a < 255 {
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Upload raw RGBA8 pixels to an `Rgba8Unorm` texture and build its bind group.
 pub fn upload_rgba_bind_group(
     ctx: &GpuContext,

@@ -377,7 +377,7 @@ fn type3_word_with_to_unicode_paints_once_and_preserves_semantic_run() {
         2 beginbfchar <01> <0048> <02> <0069> endbfchar\n\
         endcmap CMapName currentdict /CMap defineresource pop end end";
     let glyph = stream_obj("", b"1000 0 d0 /GS1 gs 1 0 0 rg 0 0 1000 1000 re f");
-    let content = b"BT /F1 60 Tf 10 20 Td <0102> Tj ET";
+    let content = b"/GS1 gs 1 0 0 rg BT /F1 60 Tf 10 20 Td <0102> Tj ET";
 
     let pdf = assemble(&[
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
@@ -1384,5 +1384,278 @@ fn type3_inline_font_in_form_reloads_from_container_under_small_budget() {
         px(&rendered, 50, 50),
         [0, 255, 0],
         "inline Type 3 font in indirect Form must still resolve its /Resources /XObject"
+    );
+}
+
+#[test]
+fn type3_d0_page_pattern_stays_anchored_to_page_while_glyph_pattern_moves_with_glyph() {
+    // Page-level colored tiling pattern: red left half [0..40], blue right half [40..80].
+    let page_pat = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 80 40] /XStep 80 /YStep 40 /Resources << >>",
+        b"1 0 0 rg 0 0 40 40 re f 0 0 1 rg 40 0 40 40 re f",
+    );
+    // Glyph-local colored tiling pattern in glyph space [0..1000]: green left [0..500],
+    // yellow right [500..1000] so it moves/scales with each glyph.
+    let glyph_pat = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 1000 1000] /XStep 1000 /YStep 1000 /Resources << >>",
+        b"0 1 0 rg 0 0 500 1000 re f 1 1 0 rg 500 0 500 1000 re f",
+    );
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 80] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> /Pattern << /PPage 10 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj(
+            "",
+            b"BT /F1 40 Tf 0 40 Td (AA) Tj ET BT /F1 40 Tf 0 0 Td (BB) Tj ET",
+        ), // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 66 /Widths [1000 1000] \
+          /Resources << /Pattern << /PGlyph 11 0 R >> >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R /B 9 0 R >>".to_vec(),           // 6
+        b"<< /Type /Encoding /Differences [65 /A /B] >>".to_vec(), // 7
+        stream_obj("", b"1000 0 d0 /Pattern cs /PPage scn 0 0 1000 1000 re f"), // 8
+        stream_obj("", b"1000 0 d0 /Pattern cs /PGlyph scn 0 0 1000 1000 re f"), // 9
+        page_pat,                                      // 10
+        glyph_pat,                                     // 11
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("render");
+
+    // Top row (pdf_y=40..80): first /A covers x=0..40 (page red),
+    // second /A covers x=40..80 (page blue) — proves /PPage stayed anchored to page space.
+    assert_eq!(px(&rendered, 20, 60), [255, 0, 0]);
+    assert_eq!(px(&rendered, 60, 60), [0, 0, 255]);
+    // Bottom row (pdf_y=0..40): both /B glyphs use font-local /PGlyph
+    // anchored to glyph space, so each 40pt glyph is green on its left half and yellow on its right.
+    assert_eq!(px(&rendered, 10, 20), [0, 255, 0]);
+    assert_eq!(px(&rendered, 30, 20), [255, 255, 0]);
+    assert_eq!(px(&rendered, 50, 20), [0, 255, 0]);
+    assert_eq!(px(&rendered, 70, 20), [255, 255, 0]);
+}
+
+#[test]
+fn type3_stencil_xobject_renders_without_external_image_cache() {
+    // 2x2 /ImageMask true XObject: top-left & bottom-right painted (bit 0).
+    let stencil = stream_obj(
+        "/Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 1 /ImageMask true",
+        &[0x40, 0x80],
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 80] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", b"0 0 1 rg BT /F1 80 Tf 0 0 Td (A) Tj ET"), // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] \
+          /Resources << /XObject << /Stencil 9 0 R >> >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                    // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        stream_obj(
+            "",
+            b"1000 0 0 0 1000 1000 d1 1000 0 0 1000 0 0 cm /Stencil Do",
+        ), // 8
+        stencil,                                       // 9
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+
+    // Fonts-only render (NO ImageCache attached): stencil XObject must still paint!
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .interpret(&content_bytes);
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&dl, 1.0)
+        .expect("render");
+    // Row 0 of stencil (pdf_y=40..80): top-left painted blue, top-right transparent white.
+    // Row 1 of stencil (pdf_y=0..40): bottom-left transparent white, bottom-right painted blue.
+    assert_eq!(px(&rendered, 10, 70), [0, 0, 255]);
+    assert_eq!(px(&rendered, 70, 70), [255, 255, 255]);
+    assert_eq!(px(&rendered, 10, 10), [255, 255, 255]);
+    assert_eq!(px(&rendered, 70, 10), [0, 0, 255]);
+}
+
+#[test]
+fn type3_d0_sets_own_color_under_separation_none_while_d1_stays_invisible() {
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 40] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> \
+          /ColorSpace << /CSNone [/Separation /None /DeviceGray 10 0 R] >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", b"/CSNone cs 1 scn BT /F1 40 Tf 0 0 Td (AB) Tj ET"), // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R /B 9 0 R >>".to_vec(),           // 6
+        b"<< /Type /Encoding /Differences [65 /A /B] >>".to_vec(), // 7
+        stream_obj("", b"1000 0 d0 1 0 0 rg 0 0 1000 1000 re f"), // 8 (d0 sets red)
+        stream_obj("", b"1000 0 0 0 1000 1000 d1 1 0 0 rg 0 0 1000 1000 re f"), // 9 (d1 inherits /None)
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>".to_vec(),   // 10
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .interpret(&content_bytes);
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&dl, 1.0)
+        .expect("render");
+
+    // /A (d0) sets red and paints at x=0..40; /B (d1) inherits /Separation /None and stays white.
+    assert_eq!(px(&rendered, 20, 20), [255, 0, 0]);
+    assert_eq!(px(&rendered, 60, 20), [255, 255, 255]);
+    assert!(
+        dl.expanded_glyph_runs().is_empty(),
+        "red d0 under /None keeps its red drawing and suppressed d1 emits no text: {:?}",
+        dl.expanded_glyph_runs()
+    );
+}
+
+#[test]
+fn type3_shading_pattern_inside_off_ocg_stays_hidden_without_image_cache() {
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R /OCProperties \
+          << /OCGs [10 0 R] /D << /BaseState /ON /OFF [10 0 R] >> >> >>"
+            .to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 60 60] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> /Pattern << /PSh 9 0 R >> \
+          /Properties << /OC1 10 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", b"BT /F1 60 Tf 0 0 Td (A) Tj ET"),      // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                            // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        stream_obj(
+            "",
+            b"1000 0 d0 /OC /OC1 BDC /Pattern cs /PSh scn 0 0 1000 1000 re f EMC",
+        ), // 8
+        b"<< /Type /Pattern /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB \
+          /Coords [0 0 60 0] /Extend [true true] \
+          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>"
+            .to_vec(), // 9
+        b"<< /Type /OCG /Name (Hidden) >>".to_vec(),           // 10
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let oc = doc.oc_config().expect("oc config");
+
+    // No ImageCache attached: hidden shading pattern must NOT leak via DrawInlineImage or solid fill.
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_optional_content(&oc)
+        .interpret(&content_bytes);
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&dl, 1.0)
+        .expect("render");
+    assert_eq!(
+        px(&rendered, 30, 30),
+        [255, 255, 255],
+        "shading pattern inside OFF OCG must stay hidden without ImageCache"
+    );
+    assert!(
+        dl.expanded_glyph_runs().is_empty(),
+        "fully OC-hidden shading glyph must not publish expanded text metadata"
+    );
+}
+
+#[test]
+fn type3_glyph_with_dropped_inline_image_excluded_from_expanded_runs() {
+    // /A paints a solid rectangle; /B paints a 2x2 inline bitmap (16 bytes RGBA).
+    let mut glyph_b = b"1000 0 0 0 1000 1000 d1 1000 0 0 1000 0 0 cm \
+        BI /IM true /W 2 /H 2 /BPC 1 ID "
+        .to_vec();
+    glyph_b.extend_from_slice(&[0x00, 0x00]);
+    glyph_b.extend_from_slice(b" EI");
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 50] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", b"0 0 0 rg BT /F1 40 Tf 5 5 Td (AB) Tj ET"), // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R /B 9 0 R >>".to_vec(),           // 6
+        b"<< /Type /Encoding /Differences [65 /A /B] >>".to_vec(), // 7
+        stream_obj("", b"1000 0 0 0 1000 1000 d1 0 0 800 800 re f"), // 8
+        stream_obj("", &glyph_b),                      // 9
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let (dl, stats) = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_image_cache_limit(8)
+        .interpret_with_stats(&content_bytes);
+
+    assert!(stats.diagnostics.resource_limit_reached);
+    assert_eq!(
+        dl.expanded_glyph_runs().len(),
+        1,
+        "only completed glyph /A should be published, got {:?}",
+        dl.expanded_glyph_runs()
+    );
+    let codes: Vec<u32> = dl.expanded_glyph_runs()[0]
+        .run
+        .glyphs
+        .iter()
+        .map(|g| g.code)
+        .collect();
+    assert_eq!(
+        codes,
+        vec![b'A' as u32],
+        "glyph /B whose inline bitmap was dropped must be excluded from expanded text metadata"
     );
 }

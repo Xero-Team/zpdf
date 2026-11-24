@@ -1942,9 +1942,8 @@ impl LoadedFont {
                     .get(byte as usize)
                     .map(String::as_str)
                     .filter(|name| !name.is_empty() && *name != ".notdef"),
-                _ => None,
-            }
-            .or_else(|| self.simple_glyph_name(byte));
+                _ => self.simple_glyph_name(byte),
+            };
             if let Some(s) = glyph_name.and_then(glyph_list::glyph_name_to_string) {
                 if !s.is_empty() {
                     out.push_str(&s);
@@ -3735,6 +3734,9 @@ pub enum Type3Source {
     /// retained only when its estimated byte size fits in the font cache
     /// budget and accounted for in [`FontCache::bytes_used`].
     Inline(Arc<zpdf_core::PdfDict>),
+    /// Owner-less inline Type 3 font whose source dictionary exceeded the font
+    /// cache budget, so its font/glyph `/Resources` scope could not be retained.
+    Unavailable,
 }
 
 /// Page/display-list font store keyed by [`FontId`].
@@ -3904,6 +3906,20 @@ impl FontCache {
             self.reclaim_standby_for(new_permanent, max_bytes);
         }
         true
+    }
+
+    /// Record that an owner-less inline Type 3 font's source dictionary could
+    /// not be retained within the cache budget, so callers must not replay its
+    /// CharProcs against an enclosing parent `/Resources` scope.
+    #[doc(hidden)]
+    pub fn record_type3_source_unavailable(&mut self, id: FontId) {
+        if self.type3_sources.contains_key(&id) {
+            return;
+        }
+        if !self.fonts.get(&id).is_some_and(|f| f.has_type3_programs()) {
+            return;
+        }
+        self.type3_sources.insert(id, Type3Source::Unavailable);
     }
 
     /// Look up the source PDF dictionary location for Type 3 font `id`.
@@ -6881,5 +6897,37 @@ mod tests {
             "provider fallback should succeed once max_bytes covers permanent_bytes + fallback_cost"
         );
         assert!(cache.bytes_used() <= generous_max);
+    }
+
+    #[test]
+    fn type3_unmapped_code_does_not_verify_via_simple_default_encoding() {
+        let mut char_procs = std::collections::HashMap::new();
+        char_procs.insert(
+            "logo".to_string(),
+            Arc::<[u8]>::from(b"500 0 d0".as_slice()),
+        );
+        let mut t3_encoding = vec![String::new(); 67];
+        t3_encoding[66] = "logo".to_string();
+        let mut font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding: t3_encoding,
+                widths: vec![500.0],
+                first_char: 66,
+            },
+            "SparseType3".into(),
+            Vec::new(),
+            CidWidths::new(500.0),
+        );
+        // Simulate `attach_text_mappings` installing StandardEncoding (where 65 => "A").
+        font.encoding = Some(encoding::Encoding::from_base(&encoding::STANDARD_ENCODING));
+
+        let mut out = String::new();
+        assert!(
+            !font.append_verified_type3_unicode(65, 1, &mut out),
+            "code 65 absent from Type 3 /Encoding must not verify as 'A' via default simple_encoding"
+        );
+        assert!(out.is_empty());
     }
 }
