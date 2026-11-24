@@ -152,6 +152,7 @@ enum Frame {
         prev_non_isolated_depth: usize,
     },
     NonIsolatedFilterGroup {
+        blend_mode: BlendMode,
         alpha: f32,
         mask_id: Option<u32>,
     },
@@ -263,10 +264,10 @@ struct PatternDefKey {
 /// overlapping affine backdrop-dependent tiling fill or stroke before
 /// collapsing into the order-preserving 3-seed affine filter fallback.
 const MAX_SVG_TILING_BLEND_PASSES: usize = 1024;
-/// Bounded pass ceiling for overlapping non-affine backdrop-dependent cells
-/// (e.g. `Darken` / `Lighten`) that must keep exact per-copy draw order
-/// against the live backdrop rather than using the affine shortcut.
-const MAX_SVG_NON_AFFINE_PASSES: usize = 8192;
+/// Total pass ceiling across bounded filter chunks for overlapping non-affine
+/// (or opacity-grouped) backdrop-dependent cells that must keep exact per-copy
+/// draw order against the live backdrop rather than using the affine shortcut.
+const MAX_SVG_NON_AFFINE_TOTAL_PASSES: usize = 65_536;
 /// Cap on per-copy step evaluations inside the SVG affine tile collapse
 /// (`p_trans`, `f(0)`, `f(1)`), matching the `MAX_TILING_OVERLAP_COPIES × MAX_SEGMENTS` budget.
 const MAX_AFFINE_TILE_PASSES: usize = 65_536;
@@ -278,8 +279,24 @@ const MAX_BACKDROP_SNAPSHOTS: usize = 64;
 /// Cap on total filter steps batched inside a single SVG `<filter>` chain.
 const MAX_BACKDROP_FILTER_PASSES: usize = 8192;
 
+/// One operation inside an SVG backdrop-dependent tiling pattern plan.
+#[derive(Clone)]
+enum TilingPlanOp {
+    /// Composite tiling pattern `p{pat_id}` onto the running backdrop using `blend_mode`.
+    Pattern { pat_id: u32, blend_mode: BlendMode },
+    /// Save the running backdrop (and any active group-alpha track) before
+    /// evaluating a cell-internal non-isolated `OpacityGroup`.
+    PushOpacityGroup,
+    /// Mix the completed cell-internal `OpacityGroup` back into the saved
+    /// backdrop with constant `alpha` and optional mask pattern `p{mask_pat_id}`.
+    PopOpacityGroup {
+        alpha: f32,
+        mask_pat_id: Option<u32>,
+    },
+}
+
 enum TilingPassPlan {
-    Passes(Vec<(u32, BlendMode)>),
+    Ops(Vec<TilingPlanOp>),
     Affine { t_id: u32, k_id: u32, mk_id: u32 },
 }
 
@@ -290,16 +307,22 @@ enum BackdropStep {
     /// Intervening non-Normal blended element/group wrapped in `<g id="ov{id}">`
     /// and composited via `<feBlend mode="..."/>` onto the running backdrop.
     BlendOverlay { ov_id: u32, blend_mode: BlendMode },
-    /// Save the running filter backdrop onto an internal stack before
-    /// evaluating a non-isolated Normal group against the live parent.
-    PushNonIsolatedGroup,
-    /// Merge the completed non-isolated Normal group back into the saved
-    /// backdrop using `<g id="s{weight_id}">` (`cur * w + saved * (1 - w)`).
-    PopNonIsolatedGroup { weight_id: u32 },
-    /// Multi-pass tiling pattern evaluated against the running backdrop and
-    /// mixed once through `<g id="s{shape_id}">`.
+    /// Save the running filter backdrop (and start a fresh transparent group
+    /// alpha track when `blend_mode != Normal`) before evaluating a
+    /// non-isolated group against the live parent.
+    PushNonIsolatedGroup { blend_mode: BlendMode },
+    /// Merge the completed non-isolated group back into the saved backdrop:
+    /// for `Normal`, mixes via `weight_id` (`cur * w + saved * (1 - w)`); for
+    /// non-`Normal` (ISO 32000-1 §11.4.5), removes `(1 - α_g) * saved` from
+    /// `cur`, applies optional `weight_id`, and blends onto `saved`.
+    PopNonIsolatedGroup {
+        blend_mode: BlendMode,
+        weight_id: Option<u32>,
+    },
+    /// Multi-pass / opacity-grouped tiling pattern evaluated against the
+    /// running backdrop and mixed once through `<g id="s{shape_id}">`.
     MultiPass {
-        passes: Vec<(u32, BlendMode)>,
+        ops: Vec<TilingPlanOp>,
         shape_id: u32,
     },
     /// Exact 3-seed affine collapse evaluated from transparent-seeded
@@ -502,17 +525,26 @@ impl<'a> SvgWriter<'a> {
                     let blend = blend_css(*blend_mode);
                     let isolates =
                         *isolated || eff_alpha < 1.0 || blend.is_some() || mask_id.is_some();
-                    let is_non_isolated_normal = !*isolated
-                        && *blend_mode == BlendMode::Normal
-                        && (eff_alpha < 1.0 || mask_id.is_some());
+                    let is_non_isolated_group =
+                        !*isolated && (eff_alpha < 1.0 || mask_id.is_some() || blend.is_some());
                     if depth == 0
-                        && is_non_isolated_normal
+                        && is_non_isolated_group
                         && (self.pending_backdrop.is_some() || !self.out.is_empty())
-                        && self.enqueue_backdrop_step(BackdropStep::PushNonIsolatedGroup, 1, false)
+                        && self.enqueue_backdrop_step(
+                            BackdropStep::PushNonIsolatedGroup {
+                                blend_mode: *blend_mode,
+                            },
+                            1,
+                            false,
+                        )
                     {
                         self.blend_depth += 1;
                         self.non_isolated_filter_depth += 1;
+                        if *blend_mode != BlendMode::Normal {
+                            self.isolated_depth += 1;
+                        }
                         frames.push(Frame::NonIsolatedFilterGroup {
+                            blend_mode: *blend_mode,
                             alpha: eff_alpha,
                             mask_id,
                         });
@@ -554,9 +586,13 @@ impl<'a> SvgWriter<'a> {
                 }
                 RenderCommand::PopBlendGroup => match frames.last() {
                     Some(Frame::NonIsolatedFilterGroup { .. }) => {
-                        if let Some(Frame::NonIsolatedFilterGroup { alpha, mask_id }) = frames.pop()
+                        if let Some(Frame::NonIsolatedFilterGroup {
+                            blend_mode,
+                            alpha,
+                            mask_id,
+                        }) = frames.pop()
                         {
-                            self.close_non_isolated_filter_group(alpha, mask_id);
+                            self.close_non_isolated_filter_group(blend_mode, alpha, mask_id);
                         }
                     }
                     Some(Frame::Blend { .. }) => {
@@ -593,8 +629,12 @@ impl<'a> SvgWriter<'a> {
         // A malformed stream can leave frames unclosed; keep the SVG well-formed.
         for frame in frames.drain(..).rev() {
             match frame {
-                Frame::NonIsolatedFilterGroup { alpha, mask_id } => {
-                    self.close_non_isolated_filter_group(alpha, mask_id);
+                Frame::NonIsolatedFilterGroup {
+                    blend_mode,
+                    alpha,
+                    mask_id,
+                } => {
+                    self.close_non_isolated_filter_group(blend_mode, alpha, mask_id);
                 }
                 Frame::Blend {
                     open,
@@ -1277,9 +1317,169 @@ impl<'a> SvgWriter<'a> {
         Some((t_id, k_id, mk_id))
     }
 
-    /// Resolve a tiling pattern into either per-segment `(pattern_id, BlendMode)`
-    /// passes or an order-preserving affine collapse `(k_id, mk_id, a_id)` when
-    /// overlapping copies exceed [`MAX_SVG_TILING_BLEND_PASSES`].
+    fn has_real_opacity_group(steps: &[zpdf_display_list::TilingBlendStep]) -> bool {
+        steps.iter().any(|step| match step {
+            zpdf_display_list::TilingBlendStep::Segment(_) => false,
+            zpdf_display_list::TilingBlendStep::OpacityGroup {
+                alpha,
+                mask,
+                steps: inner,
+            } => {
+                let a = if alpha.is_finite() {
+                    alpha.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                a < 1.0 || mask.is_some() || Self::has_real_opacity_group(inner)
+            }
+        })
+    }
+
+    fn ops_has_opacity_group(ops: &[TilingPlanOp]) -> bool {
+        ops.iter().any(|op| {
+            matches!(
+                op,
+                TilingPlanOp::PushOpacityGroup | TilingPlanOp::PopOpacityGroup { .. }
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_tiling_step_ops(
+        &mut self,
+        tiling: &zpdf_display_list::TilingPattern,
+        steps: &[zpdf_display_list::TilingBlendStep],
+        overlap_shift: Option<(i64, i64)>,
+        opaque_bg: bool,
+        depth: u8,
+        remaining: &mut usize,
+        exhausted: &mut bool,
+        ops: &mut Vec<TilingPlanOp>,
+    ) {
+        for step in steps {
+            if *exhausted || self.check_over_budget() {
+                return;
+            }
+            match step {
+                zpdf_display_list::TilingBlendStep::Segment(seg) => {
+                    if let Some((di, dj)) = overlap_shift {
+                        if !seg.intersects_period(tiling, di, dj) {
+                            continue;
+                        }
+                    }
+                    if opaque_bg && seg.is_identity_on_opaque() {
+                        continue;
+                    }
+                    if *remaining == 0 {
+                        *exhausted = true;
+                        return;
+                    }
+                    *remaining -= 1;
+                    let copy_mode = if overlap_shift.is_none() {
+                        seg.blend_mode
+                    } else {
+                        BlendMode::Normal
+                    };
+                    if let Some(pat_id) = self.emit_tiling_pattern_def_for(
+                        tiling,
+                        &seg.commands,
+                        seg.segment_id,
+                        overlap_shift,
+                        copy_mode,
+                        seg.bounds,
+                        depth,
+                    ) {
+                        ops.push(TilingPlanOp::Pattern {
+                            pat_id,
+                            blend_mode: seg.blend_mode,
+                        });
+                    }
+                }
+                zpdf_display_list::TilingBlendStep::OpacityGroup {
+                    alpha,
+                    mask,
+                    steps: inner,
+                } => {
+                    if let Some((di, dj)) = overlap_shift {
+                        if mask
+                            .as_ref()
+                            .is_some_and(|m| !m.intersects_period(tiling, di, dj))
+                            || !zpdf_display_list::TilingBlendStep::any_intersects_period(
+                                inner, tiling, di, dj,
+                            )
+                        {
+                            continue;
+                        }
+                    }
+                    let a = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    if a >= 1.0 && mask.is_none() {
+                        self.collect_tiling_step_ops(
+                            tiling,
+                            inner,
+                            overlap_shift,
+                            opaque_bg,
+                            depth,
+                            remaining,
+                            exhausted,
+                            ops,
+                        );
+                        continue;
+                    }
+                    let start_len = ops.len();
+                    ops.push(TilingPlanOp::PushOpacityGroup);
+                    self.collect_tiling_step_ops(
+                        tiling,
+                        inner,
+                        overlap_shift,
+                        opaque_bg,
+                        depth,
+                        remaining,
+                        exhausted,
+                        ops,
+                    );
+                    if *exhausted || self.over_budget {
+                        return;
+                    }
+                    if ops.len() == start_len + 1 {
+                        ops.pop();
+                        continue;
+                    }
+                    let mask_pat_id = match mask {
+                        Some(m_seg) => self.emit_tiling_pattern_def_for(
+                            tiling,
+                            &m_seg.commands,
+                            m_seg.segment_id,
+                            overlap_shift,
+                            BlendMode::Normal,
+                            m_seg.bounds,
+                            depth,
+                        ),
+                        None => None,
+                    };
+                    if mask.is_some() && mask_pat_id.is_none() {
+                        ops.truncate(start_len);
+                        continue;
+                    }
+                    ops.push(TilingPlanOp::PopOpacityGroup {
+                        alpha: a,
+                        mask_pat_id,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Resolve a tiling pattern into either per-segment / opacity-grouped
+    /// [`TilingPlanOp`] steps or an order-preserving affine collapse
+    /// `(t_id, k_id, mk_id)` when overlapping affine copies exceed
+    /// [`MAX_SVG_TILING_BLEND_PASSES`].
     fn emit_tiling_plan(
         &mut self,
         tiling: &zpdf_display_list::TilingPattern,
@@ -1302,9 +1502,7 @@ impl<'a> SvgWriter<'a> {
                     .max(0) as usize;
                 let overlap_count = overlap_nx.saturating_mul(overlap_ny);
                 let total_segs = zpdf_display_list::TilingBlendStep::count_segments(&steps);
-                let has_opacity_group = steps
-                    .iter()
-                    .any(|s| matches!(s, zpdf_display_list::TilingBlendStep::OpacityGroup { .. }));
+                let has_opacity_group = Self::has_real_opacity_group(&steps);
 
                 let uniform_assoc = zpdf_display_list::TilingBlendStep::uniform_blend_mode(&steps)
                     .filter(|&m| matches!(m, BlendMode::Multiply | BlendMode::Screen));
@@ -1315,122 +1513,106 @@ impl<'a> SvgWriter<'a> {
                         if let Some(id) =
                             self.emit_tiling_pattern_def_collapsed(tiling, &steps, mode, depth)
                         {
-                            return TilingPassPlan::Passes(vec![(id, mode)]);
+                            return TilingPassPlan::Ops(vec![TilingPlanOp::Pattern {
+                                pat_id: id,
+                                blend_mode: mode,
+                            }]);
                         }
                     }
                 }
 
-                // Collect flat segments when there are no nested OpacityGroups.
-                let mut flat_segments = Vec::with_capacity(total_segs);
-                let mut all_flat = true;
-                for step in &steps {
-                    match step {
-                        zpdf_display_list::TilingBlendStep::Segment(seg) => {
-                            flat_segments.push(seg);
-                        }
-                        zpdf_display_list::TilingBlendStep::OpacityGroup { .. } => {
-                            all_flat = false;
-                            break;
-                        }
-                    }
-                }
-                if all_flat {
-                    let mut passes = Vec::new();
-                    let mut remaining = MAX_SVG_TILING_BLEND_PASSES;
-                    let separate_copies = if overlap_count > 1 {
-                        let mut total_passes = 0usize;
-                        'count: for dj in overlap.dj.clone() {
-                            for di in overlap.di.clone() {
-                                total_passes = total_passes.saturating_add(
-                                    zpdf_display_list::TilingBlendStep::count_intersecting_passes(
-                                        &steps, tiling, di, dj,
-                                    ),
-                                );
-                                if total_passes > MAX_SVG_TILING_BLEND_PASSES {
-                                    break 'count;
-                                }
+                let mut remaining = MAX_SVG_NON_AFFINE_TOTAL_PASSES;
+                let separate_copies = if overlap_count > 1 {
+                    let mut total_passes = 0usize;
+                    'count: for dj in overlap.dj.clone() {
+                        for di in overlap.di.clone() {
+                            total_passes = total_passes.saturating_add(
+                                zpdf_display_list::TilingBlendStep::count_intersecting_passes(
+                                    &steps, tiling, di, dj,
+                                ),
+                            );
+                            if total_passes > MAX_SVG_TILING_BLEND_PASSES {
+                                break 'count;
                             }
                         }
-                        if total_passes > MAX_SVG_TILING_BLEND_PASSES {
-                            if depth == 0
-                                && zpdf_display_list::TilingBlendStep::is_affine_in_backdrop(&steps)
+                    }
+                    if total_passes > MAX_SVG_TILING_BLEND_PASSES {
+                        if depth == 0
+                            && !has_opacity_group
+                            && zpdf_display_list::TilingBlendStep::is_affine_in_backdrop(&steps)
+                        {
+                            if let Some((t_id, k_id, mk_id)) =
+                                self.emit_tiling_pattern_def_affine(tiling, &steps, depth)
                             {
-                                if let Some((t_id, k_id, mk_id)) =
-                                    self.emit_tiling_pattern_def_affine(tiling, &steps, depth)
-                                {
-                                    return TilingPassPlan::Affine { t_id, k_id, mk_id };
-                                }
-                            }
-                            if self.over_budget {
-                                return TilingPassPlan::Passes(Vec::new());
-                            }
-                            // Non-affine blend modes (e.g. Darken/Lighten) cannot be
-                            // interpolated from black/white samples: preserve exact
-                            // per-copy draw order against the actual backdrop.
-                            remaining = MAX_SVG_NON_AFFINE_PASSES;
-                            true
-                        } else {
-                            true
-                        }
-                    } else {
-                        false
-                    };
-                    let opaque_bg = self.opaque_backdrop(depth);
-                    if separate_copies {
-                        'copies: for dj in overlap.dj.clone() {
-                            for di in overlap.di.clone() {
-                                for seg in &flat_segments {
-                                    if remaining == 0 || self.check_over_budget() {
-                                        break 'copies;
-                                    }
-                                    if !seg.intersects_period(tiling, di, dj) {
-                                        continue;
-                                    }
-                                    if opaque_bg && seg.is_identity_on_opaque() {
-                                        continue;
-                                    }
-                                    remaining -= 1;
-                                    if let Some(id) = self.emit_tiling_pattern_def_for(
-                                        tiling,
-                                        &seg.commands,
-                                        seg.segment_id,
-                                        Some((di, dj)),
-                                        BlendMode::Normal,
-                                        seg.bounds,
-                                        depth,
-                                    ) {
-                                        passes.push((id, seg.blend_mode));
-                                    }
-                                }
+                                return TilingPassPlan::Affine { t_id, k_id, mk_id };
                             }
                         }
+                        if self.over_budget {
+                            return TilingPassPlan::Ops(Vec::new());
+                        }
+                        // Non-affine blend modes (e.g. Darken/Lighten) and cells
+                        // with real OpacityGroups cannot use the flat affine
+                        // pattern shortcut: preserve exact per-copy draw order
+                        // across bounded filter chunks up to the total ceiling.
+                        remaining = MAX_SVG_NON_AFFINE_TOTAL_PASSES;
+                        true
                     } else {
-                        for seg in &flat_segments {
-                            if remaining == 0 {
-                                break;
+                        true
+                    }
+                } else {
+                    false
+                };
+
+                let opaque_bg = self.opaque_backdrop(depth);
+                let mut ops = Vec::new();
+                let mut exhausted = false;
+                if separate_copies {
+                    'copies: for dj in overlap.dj.clone() {
+                        for di in overlap.di.clone() {
+                            if exhausted || self.check_over_budget() {
+                                break 'copies;
                             }
-                            remaining -= 1;
-                            if let Some(id) = self.emit_tiling_pattern_def_for(
+                            self.collect_tiling_step_ops(
                                 tiling,
-                                &seg.commands,
-                                seg.segment_id,
-                                None,
-                                seg.blend_mode,
-                                seg.bounds,
+                                &steps,
+                                Some((di, dj)),
+                                opaque_bg,
                                 depth,
-                            ) {
-                                passes.push((id, seg.blend_mode));
-                            }
+                                &mut remaining,
+                                &mut exhausted,
+                                &mut ops,
+                            );
                         }
                     }
-                    return TilingPassPlan::Passes(passes);
+                } else {
+                    self.collect_tiling_step_ops(
+                        tiling,
+                        &steps,
+                        None,
+                        opaque_bg,
+                        depth,
+                        &mut remaining,
+                        &mut exhausted,
+                        &mut ops,
+                    );
                 }
+                if self.over_budget {
+                    return TilingPassPlan::Ops(Vec::new());
+                }
+                if !exhausted {
+                    return TilingPassPlan::Ops(ops);
+                }
+                tracing::warn!(
+                    limit = MAX_SVG_NON_AFFINE_TOTAL_PASSES,
+                    "svg tiling blend plan exceeded total pass ceiling; falling back to complete isolated pattern"
+                );
+            } else {
+                tracing::warn!(
+                    "svg tiling pattern has unsegmentable backdrop-dependent marks; falling back to isolated pattern"
+                );
             }
-            tracing::warn!(
-                "svg tiling pattern has unsegmentable backdrop-dependent marks; falling back to isolated pattern"
-            );
         }
-        TilingPassPlan::Passes(
+        TilingPassPlan::Ops(
             self.emit_tiling_pattern_def_for(
                 tiling,
                 &tiling.commands,
@@ -1440,9 +1622,343 @@ impl<'a> SvgWriter<'a> {
                 None,
                 depth,
             )
-            .map(|id| vec![(id, BlendMode::Normal)])
+            .map(|pat_id| {
+                vec![TilingPlanOp::Pattern {
+                    pat_id,
+                    blend_mode: BlendMode::Normal,
+                }]
+            })
             .unwrap_or_default(),
         )
+    }
+
+    /// Emit filter primitives evaluating `ops` against `init_color` (and
+    /// optionally tracking accumulated group alpha against `init_alpha`),
+    /// returning the resulting `(color_result, alpha_result)` names.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_filter_tiling_ops(
+        defs: &mut String,
+        w: f64,
+        h: f64,
+        pat_rects: &HashMap<u32, u32>,
+        tag: usize,
+        ops: &[TilingPlanOp],
+        init_color: &str,
+        init_alpha: Option<&str>,
+    ) -> (String, Option<String>) {
+        let mut acc = init_color.to_string();
+        let mut acc_a = init_alpha.map(str::to_string);
+        let mut stack: Vec<(String, Option<String>)> = Vec::new();
+        for (p_idx, op) in ops.iter().enumerate() {
+            match op {
+                TilingPlanOp::Pattern { pat_id, blend_mode } => {
+                    let rid = pat_rects[pat_id];
+                    let pat_res = format!("p{tag}_{p_idx}");
+                    let next_acc = format!("a{tag}_{p_idx}");
+                    let _ = write!(defs, "<feImage href=\"#pr{rid}\" x=\"0\" y=\"0\" width=\"");
+                    push_num(defs, w);
+                    defs.push_str("\" height=\"");
+                    push_num(defs, h);
+                    let _ = writeln!(defs, "\" result=\"{pat_res}\"/>");
+                    if let Some(name) = blend_css(*blend_mode) {
+                        let _ = writeln!(
+                            defs,
+                            "<feBlend in=\"{pat_res}\" in2=\"{acc}\" mode=\"{name}\" result=\"{next_acc}\"/>"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            defs,
+                            "<feComposite in=\"{pat_res}\" in2=\"{acc}\" operator=\"over\" result=\"{next_acc}\"/>"
+                        );
+                    }
+                    acc = next_acc;
+                    if let Some(ref cur_a) = acc_a {
+                        let next_a = format!("aa{tag}_{p_idx}");
+                        let _ = writeln!(
+                            defs,
+                            "<feComposite in=\"{pat_res}\" in2=\"{cur_a}\" operator=\"over\" result=\"{next_a}\"/>"
+                        );
+                        acc_a = Some(next_a);
+                    }
+                }
+                TilingPlanOp::PushOpacityGroup => {
+                    stack.push((acc.clone(), acc_a.clone()));
+                }
+                TilingPlanOp::PopOpacityGroup { alpha, mask_pat_id } => {
+                    let (s_acc, s_acc_a) =
+                        stack.pop().unwrap_or_else(|| (acc.clone(), acc_a.clone()));
+                    let next_acc = format!("a{tag}_{p_idx}");
+                    if let Some(m_pat_id) = mask_pat_id {
+                        let m_rid = pat_rects[m_pat_id];
+                        let m_raw = format!("om{tag}_{p_idx}");
+                        let _ = write!(
+                            defs,
+                            "<feImage href=\"#pr{m_rid}\" x=\"0\" y=\"0\" width=\""
+                        );
+                        push_num(defs, w);
+                        defs.push_str("\" height=\"");
+                        push_num(defs, h);
+                        let _ = writeln!(defs, "\" result=\"{m_raw}\"/>");
+                        let wt_name = if *alpha < 1.0 {
+                            let m_scaled = format!("omw{tag}_{p_idx}");
+                            let _ = write!(
+                                defs,
+                                "<feComponentTransfer in=\"{m_raw}\" result=\"{m_scaled}\"><feFuncA type=\"linear\" slope=\""
+                            );
+                            push_num(defs, *alpha as f64);
+                            defs.push_str("\"/></feComponentTransfer>\n");
+                            m_scaled
+                        } else {
+                            m_raw
+                        };
+                        let rw = format!("orw{tag}_{p_idx}");
+                        let bw = format!("obw{tag}_{p_idx}");
+                        let _ = writeln!(
+                            defs,
+                            "<feComposite in=\"{acc}\" in2=\"{wt_name}\" operator=\"in\" result=\"{rw}\"/>"
+                        );
+                        let _ = writeln!(
+                            defs,
+                            "<feComposite in=\"{s_acc}\" in2=\"{wt_name}\" operator=\"out\" result=\"{bw}\"/>"
+                        );
+                        let _ = writeln!(
+                            defs,
+                            "<feComposite in=\"{rw}\" in2=\"{bw}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_acc}\"/>"
+                        );
+                        acc = next_acc;
+                        if let (Some(ca), Some(sa)) = (acc_a.as_ref(), s_acc_a.as_ref()) {
+                            let rwa = format!("orwa{tag}_{p_idx}");
+                            let bwa = format!("obwa{tag}_{p_idx}");
+                            let next_a = format!("aa{tag}_{p_idx}");
+                            let _ = writeln!(
+                                defs,
+                                "<feComposite in=\"{ca}\" in2=\"{wt_name}\" operator=\"in\" result=\"{rwa}\"/>"
+                            );
+                            let _ = writeln!(
+                                defs,
+                                "<feComposite in=\"{sa}\" in2=\"{wt_name}\" operator=\"out\" result=\"{bwa}\"/>"
+                            );
+                            let _ = writeln!(
+                                defs,
+                                "<feComposite in=\"{rwa}\" in2=\"{bwa}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_a}\"/>"
+                            );
+                            acc_a = Some(next_a);
+                        }
+                    } else {
+                        let a = alpha.clamp(0.0, 1.0) as f64;
+                        let inv = 1.0 - a;
+                        let _ = write!(
+                            defs,
+                            "<feComposite in=\"{acc}\" in2=\"{s_acc}\" operator=\"arithmetic\" k1=\"0\" k2=\""
+                        );
+                        push_num(defs, a);
+                        defs.push_str("\" k3=\"");
+                        push_num(defs, inv);
+                        let _ = writeln!(defs, "\" k4=\"0\" result=\"{next_acc}\"/>");
+                        acc = next_acc;
+                        if let (Some(ca), Some(sa)) = (acc_a.as_ref(), s_acc_a.as_ref()) {
+                            let next_a = format!("aa{tag}_{p_idx}");
+                            let _ = write!(
+                                defs,
+                                "<feComposite in=\"{ca}\" in2=\"{sa}\" operator=\"arithmetic\" k1=\"0\" k2=\""
+                            );
+                            push_num(defs, a);
+                            defs.push_str("\" k3=\"");
+                            push_num(defs, inv);
+                            let _ = writeln!(defs, "\" k4=\"0\" result=\"{next_a}\"/>");
+                            acc_a = Some(next_a);
+                        }
+                    }
+                }
+            }
+        }
+        (acc, acc_a)
+    }
+
+    /// Evaluate a dense non-affine / opacity-grouped tiling op stream exceeding
+    /// [`MAX_BACKDROP_FILTER_PASSES`] in bounded sequential `<filter>` chunks
+    /// (splitting only at top-level `OpacityGroup` depth 0) while applying
+    /// `shape_id` (coverage + object opacity) ONCE on the final chunk against
+    /// the original pre-fill backdrop snapshot.
+    fn emit_chunked_tiling_ops(&mut self, ops: &[TilingPlanOp], shape_id: u32) -> bool {
+        if self.non_isolated_filter_depth > 0 || ops.is_empty() {
+            return false;
+        }
+        let mut chunks: Vec<&[TilingPlanOp]> = Vec::new();
+        let mut chunk_start = 0usize;
+        let mut group_depth = 0usize;
+        let mut last_top_boundary = 0usize;
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                TilingPlanOp::PushOpacityGroup => group_depth += 1,
+                TilingPlanOp::PopOpacityGroup { .. } => {
+                    group_depth = group_depth.saturating_sub(1);
+                }
+                TilingPlanOp::Pattern { .. } => {}
+            }
+            if group_depth == 0 {
+                let end = i + 1;
+                if end - chunk_start > MAX_BACKDROP_FILTER_PASSES {
+                    if last_top_boundary > chunk_start {
+                        chunks.push(&ops[chunk_start..last_top_boundary]);
+                        chunk_start = last_top_boundary;
+                    }
+                    if end - chunk_start > MAX_BACKDROP_FILTER_PASSES {
+                        // One indivisible top-level OpacityGroup exceeds the per-filter cap.
+                        return false;
+                    }
+                }
+                last_top_boundary = end;
+            }
+        }
+        if chunk_start < ops.len() {
+            if ops.len() - chunk_start > MAX_BACKDROP_FILTER_PASSES {
+                return false;
+            }
+            chunks.push(&ops[chunk_start..]);
+        }
+        if chunks.is_empty() {
+            return false;
+        }
+
+        self.flush_pending_backdrop();
+        if self.backdrop_snapshots.saturating_add(chunks.len()) > MAX_BACKDROP_SNAPSHOTS {
+            return false;
+        }
+        let Some(orig_bg_id) = self.snapshot_page_backdrop(true) else {
+            return false;
+        };
+
+        let w = self.page_width;
+        let h = self.page_height;
+        let mut pat_rects: HashMap<u32, u32> = HashMap::new();
+        for op in ops {
+            let pat_id = match op {
+                TilingPlanOp::Pattern { pat_id, .. } => Some(*pat_id),
+                TilingPlanOp::PopOpacityGroup { mask_pat_id, .. } => *mask_pat_id,
+                TilingPlanOp::PushOpacityGroup => None,
+            };
+            if let Some(pid) = pat_id {
+                if let std::collections::hash_map::Entry::Vacant(e) = pat_rects.entry(pid) {
+                    self.next_id += 1;
+                    let rid = self.next_id;
+                    let _ = write!(self.defs, "<rect id=\"pr{rid}\" x=\"0\" y=\"0\" width=\"");
+                    push_num(&mut self.defs, w);
+                    self.defs.push_str("\" height=\"");
+                    push_num(&mut self.defs, h);
+                    let _ = writeln!(self.defs, "\" fill=\"url(#p{pid})\"/>");
+                    e.insert(rid);
+                }
+            }
+        }
+
+        let mut prev_g = orig_bg_id;
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let is_last = chunk_idx + 1 == chunks.len();
+            let fid = self.fresh_id();
+            let _ = write!(
+                self.defs,
+                "<filter id=\"f{fid}\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
+            );
+            push_num(&mut self.defs, w);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, h);
+            self.defs
+                .push_str("\" color-interpolation-filters=\"sRGB\">\n");
+            let (acc, _) = Self::emit_filter_tiling_ops(
+                &mut self.defs,
+                w,
+                h,
+                &pat_rects,
+                chunk_idx,
+                chunk,
+                "SourceGraphic",
+                None,
+            );
+            if is_last {
+                let _ = write!(
+                    self.defs,
+                    "<feImage href=\"#b{orig_bg_id}\" x=\"0\" y=\"0\" width=\""
+                );
+                push_num(&mut self.defs, w);
+                self.defs.push_str("\" height=\"");
+                push_num(&mut self.defs, h);
+                self.defs.push_str("\" result=\"orig\"/>\n");
+                let _ = write!(
+                    self.defs,
+                    "<feImage href=\"#s{shape_id}\" x=\"0\" y=\"0\" width=\""
+                );
+                push_num(&mut self.defs, w);
+                self.defs.push_str("\" height=\"");
+                push_num(&mut self.defs, h);
+                self.defs.push_str("\" result=\"wt\"/>\n");
+                let _ = writeln!(
+                    self.defs,
+                    "<feComposite in=\"{acc}\" in2=\"wt\" operator=\"in\" result=\"rw\"/>"
+                );
+                let _ = writeln!(
+                    self.defs,
+                    "<feComposite in=\"orig\" in2=\"wt\" operator=\"out\" result=\"bw\"/>"
+                );
+                self.defs.push_str(
+                    "<feComposite in=\"rw\" in2=\"bw\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\"/>\n",
+                );
+            }
+            self.defs.push_str("</filter>\n");
+            if is_last {
+                let _ = writeln!(
+                    self.out,
+                    "<use href=\"#b{prev_g}\" filter=\"url(#f{fid})\"/>"
+                );
+            } else {
+                let next_g = self.fresh_id();
+                self.backdrop_snapshots += 1;
+                let _ = writeln!(
+                    self.defs,
+                    "<g id=\"b{next_g}\"><use href=\"#b{prev_g}\" filter=\"url(#f{fid})\"/></g>"
+                );
+                prev_g = next_g;
+            }
+        }
+        true
+    }
+
+    /// Emit `ops` inside an already-open isolated `<g>` wrapper (used only when
+    /// nested inside a `<pattern>`/`<mask>` or after snapshot exhaustion).
+    fn emit_isolated_tiling_ops(&mut self, ops: &[TilingPlanOp]) {
+        let mut stack: Vec<String> = Vec::new();
+        for op in ops {
+            let target = stack.last_mut().unwrap_or(&mut self.out);
+            match op {
+                TilingPlanOp::Pattern { pat_id, blend_mode } => {
+                    target.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                    push_num(target, self.page_width);
+                    target.push_str("\" height=\"");
+                    push_num(target, self.page_height);
+                    let _ = write!(target, "\" fill=\"url(#p{pat_id})\"");
+                    if let Some(name) = blend_css(*blend_mode) {
+                        let _ = write!(target, " style=\"mix-blend-mode:{name};\"");
+                    }
+                    target.push_str("/>\n");
+                }
+                TilingPlanOp::PushOpacityGroup => {
+                    stack.push(String::new());
+                }
+                TilingPlanOp::PopOpacityGroup { alpha, .. } => {
+                    if let Some(inner) = stack.pop() {
+                        let parent = stack.last_mut().unwrap_or(&mut self.out);
+                        parent.push_str("<g");
+                        push_opacity(parent, "opacity", *alpha);
+                        parent.push_str(">\n");
+                        parent.push_str(&inner);
+                        parent.push_str("</g>\n");
+                    }
+                }
+            }
+        }
+        for leftover in stack {
+            self.out.push_str(&leftover);
+        }
     }
 
     /// Flush any open batch of backdrop-dependent filter steps into `self.out`
@@ -1484,11 +2000,25 @@ impl<'a> SvgWriter<'a> {
             match step {
                 BackdropStep::Overlay(_)
                 | BackdropStep::BlendOverlay { .. }
-                | BackdropStep::PushNonIsolatedGroup
+                | BackdropStep::PushNonIsolatedGroup { .. }
                 | BackdropStep::PopNonIsolatedGroup { .. } => {}
-                BackdropStep::MultiPass { passes, .. } => {
-                    for &(pat_id, _) in passes {
-                        register_pat(&mut self.defs, &mut self.next_id, pat_id);
+                BackdropStep::MultiPass { ops, .. } => {
+                    for op in ops {
+                        match op {
+                            TilingPlanOp::Pattern { pat_id, .. } => {
+                                register_pat(&mut self.defs, &mut self.next_id, *pat_id);
+                            }
+                            TilingPlanOp::PopOpacityGroup {
+                                mask_pat_id: Some(m_id),
+                                ..
+                            } => {
+                                register_pat(&mut self.defs, &mut self.next_id, *m_id);
+                            }
+                            TilingPlanOp::PushOpacityGroup
+                            | TilingPlanOp::PopOpacityGroup {
+                                mask_pat_id: None, ..
+                            } => {}
+                        }
                     }
                 }
                 BackdropStep::Affine {
@@ -1513,7 +2043,8 @@ impl<'a> SvgWriter<'a> {
             .push_str("\" color-interpolation-filters=\"sRGB\">\n");
 
         let mut cur = String::from("SourceGraphic");
-        let mut group_stack: Vec<String> = Vec::new();
+        let mut ga: Option<String> = None;
+        let mut group_stack: Vec<(String, Option<String>)> = Vec::new();
         for (idx, step) in pending.steps.iter().enumerate() {
             match step {
                 BackdropStep::Overlay(ov_id) => {
@@ -1532,6 +2063,14 @@ impl<'a> SvgWriter<'a> {
                         "<feComposite in=\"{ov_res}\" in2=\"{cur}\" operator=\"over\" result=\"{next_cur}\"/>"
                     );
                     cur = next_cur;
+                    if let Some(ref cur_ga) = ga {
+                        let next_ga = format!("ga{idx}");
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{ov_res}\" in2=\"{cur_ga}\" operator=\"over\" result=\"{next_ga}\"/>"
+                        );
+                        ga = Some(next_ga);
+                    }
                 }
                 BackdropStep::BlendOverlay { ov_id, blend_mode } => {
                     let ov_res = format!("ov{idx}");
@@ -1556,65 +2095,154 @@ impl<'a> SvgWriter<'a> {
                         );
                     }
                     cur = next_cur;
-                }
-                BackdropStep::PushNonIsolatedGroup => {
-                    group_stack.push(cur.clone());
-                }
-                BackdropStep::PopNonIsolatedGroup { weight_id } => {
-                    let saved = group_stack.pop().unwrap_or_else(|| cur.clone());
-                    let wt_res = format!("gw{idx}");
-                    let rw_res = format!("grw{idx}");
-                    let bw_res = format!("gbw{idx}");
-                    let next_cur = format!("c{idx}");
-                    let _ = write!(
-                        self.defs,
-                        "<feImage href=\"#s{weight_id}\" x=\"0\" y=\"0\" width=\""
-                    );
-                    push_num(&mut self.defs, w);
-                    self.defs.push_str("\" height=\"");
-                    push_num(&mut self.defs, h);
-                    let _ = writeln!(self.defs, "\" result=\"{wt_res}\"/>");
-                    let _ = writeln!(
-                        self.defs,
-                        "<feComposite in=\"{cur}\" in2=\"{wt_res}\" operator=\"in\" result=\"{rw_res}\"/>"
-                    );
-                    let _ = writeln!(
-                        self.defs,
-                        "<feComposite in=\"{saved}\" in2=\"{wt_res}\" operator=\"out\" result=\"{bw_res}\"/>"
-                    );
-                    let _ = writeln!(
-                        self.defs,
-                        "<feComposite in=\"{rw_res}\" in2=\"{bw_res}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_cur}\"/>"
-                    );
-                    cur = next_cur;
-                }
-                BackdropStep::MultiPass { passes, shape_id } => {
-                    let mut acc = cur.clone();
-                    for (p_idx, &(pat_id, blend_mode)) in passes.iter().enumerate() {
-                        let rid = pat_rects[&pat_id];
-                        let pat_res = format!("p{idx}_{p_idx}");
-                        let next_acc = format!("a{idx}_{p_idx}");
-                        let _ = write!(
+                    if let Some(ref cur_ga) = ga {
+                        let next_ga = format!("ga{idx}");
+                        let _ = writeln!(
                             self.defs,
-                            "<feImage href=\"#pr{rid}\" x=\"0\" y=\"0\" width=\""
+                            "<feComposite in=\"{ov_res}\" in2=\"{cur_ga}\" operator=\"over\" result=\"{next_ga}\"/>"
                         );
-                        push_num(&mut self.defs, w);
-                        self.defs.push_str("\" height=\"");
-                        push_num(&mut self.defs, h);
-                        let _ = writeln!(self.defs, "\" result=\"{pat_res}\"/>");
-                        if let Some(name) = blend_css(blend_mode) {
+                        ga = Some(next_ga);
+                    }
+                }
+                BackdropStep::PushNonIsolatedGroup { blend_mode } => {
+                    group_stack.push((cur.clone(), ga.clone()));
+                    if *blend_mode != BlendMode::Normal {
+                        let zero_a = format!("gaz{idx}");
+                        let _ = writeln!(
+                            self.defs,
+                            "<feFlood flood-color=\"#000000\" flood-opacity=\"0\" result=\"{zero_a}\"/>"
+                        );
+                        ga = Some(zero_a);
+                    }
+                }
+                BackdropStep::PopNonIsolatedGroup {
+                    blend_mode,
+                    weight_id,
+                } => {
+                    let (saved, saved_ga) =
+                        group_stack.pop().unwrap_or_else(|| (cur.clone(), None));
+                    if *blend_mode == BlendMode::Normal {
+                        if let Some(wid) = weight_id {
+                            let wt_res = format!("gw{idx}");
+                            let rw_res = format!("grw{idx}");
+                            let bw_res = format!("gbw{idx}");
+                            let next_cur = format!("c{idx}");
+                            let _ = write!(
+                                self.defs,
+                                "<feImage href=\"#s{wid}\" x=\"0\" y=\"0\" width=\""
+                            );
+                            push_num(&mut self.defs, w);
+                            self.defs.push_str("\" height=\"");
+                            push_num(&mut self.defs, h);
+                            let _ = writeln!(self.defs, "\" result=\"{wt_res}\"/>");
                             let _ = writeln!(
                                 self.defs,
-                                "<feBlend in=\"{pat_res}\" in2=\"{acc}\" mode=\"{name}\" result=\"{next_acc}\"/>"
+                                "<feComposite in=\"{cur}\" in2=\"{wt_res}\" operator=\"in\" result=\"{rw_res}\"/>"
+                            );
+                            let _ = writeln!(
+                                self.defs,
+                                "<feComposite in=\"{saved}\" in2=\"{wt_res}\" operator=\"out\" result=\"{bw_res}\"/>"
+                            );
+                            let _ = writeln!(
+                                self.defs,
+                                "<feComposite in=\"{rw_res}\" in2=\"{bw_res}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_cur}\"/>"
+                            );
+                            cur = next_cur;
+                            if let (Some(cur_ga), Some(sg)) = (ga.as_ref(), saved_ga.as_ref()) {
+                                let rwa = format!("grwa{idx}");
+                                let bwa = format!("gbwa{idx}");
+                                let next_ga = format!("ga{idx}");
+                                let _ = writeln!(
+                                    self.defs,
+                                    "<feComposite in=\"{cur_ga}\" in2=\"{wt_res}\" operator=\"in\" result=\"{rwa}\"/>"
+                                );
+                                let _ = writeln!(
+                                    self.defs,
+                                    "<feComposite in=\"{sg}\" in2=\"{wt_res}\" operator=\"out\" result=\"{bwa}\"/>"
+                                );
+                                let _ = writeln!(
+                                    self.defs,
+                                    "<feComposite in=\"{rwa}\" in2=\"{bwa}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_ga}\"/>"
+                                );
+                                ga = Some(next_ga);
+                            } else {
+                                ga = saved_ga;
+                            }
+                        } else {
+                            ga = saved_ga;
+                        }
+                    } else {
+                        // ISO 32000-1 §11.4.5 backdrop removal for a non-isolated
+                        // non-Normal group:
+                        //   P_g = P_n - (1 - α_g) * P_0
+                        // then apply optional constant opacity + soft mask weight
+                        // and composite onto `saved` with `blend_mode`.
+                        let cur_ga = ga.unwrap_or_else(|| cur.clone());
+                        let bg_rem = format!("br{idx}");
+                        let pg = format!("pg{idx}");
+                        let next_cur = format!("c{idx}");
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{saved}\" in2=\"{cur_ga}\" operator=\"out\" result=\"{bg_rem}\"/>"
+                        );
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{cur}\" in2=\"{bg_rem}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"-1\" k4=\"0\" result=\"{pg}\"/>"
+                        );
+                        let pg_final = if let Some(wid) = weight_id {
+                            let wt_res = format!("gw{idx}");
+                            let pg_w = format!("pgw{idx}");
+                            let _ = write!(
+                                self.defs,
+                                "<feImage href=\"#s{wid}\" x=\"0\" y=\"0\" width=\""
+                            );
+                            push_num(&mut self.defs, w);
+                            self.defs.push_str("\" height=\"");
+                            push_num(&mut self.defs, h);
+                            let _ = writeln!(self.defs, "\" result=\"{wt_res}\"/>");
+                            let _ = writeln!(
+                                self.defs,
+                                "<feComposite in=\"{pg}\" in2=\"{wt_res}\" operator=\"in\" result=\"{pg_w}\"/>"
+                            );
+                            pg_w
+                        } else {
+                            pg
+                        };
+                        if let Some(name) = blend_css(*blend_mode) {
+                            let _ = writeln!(
+                                self.defs,
+                                "<feBlend in=\"{pg_final}\" in2=\"{saved}\" mode=\"{name}\" result=\"{next_cur}\"/>"
                             );
                         } else {
                             let _ = writeln!(
                                 self.defs,
-                                "<feComposite in=\"{pat_res}\" in2=\"{acc}\" operator=\"over\" result=\"{next_acc}\"/>"
+                                "<feComposite in=\"{pg_final}\" in2=\"{saved}\" operator=\"over\" result=\"{next_cur}\"/>"
                             );
                         }
-                        acc = next_acc;
+                        cur = next_cur;
+                        if let Some(sg) = saved_ga {
+                            let next_ga = format!("ga{idx}");
+                            let _ = writeln!(
+                                self.defs,
+                                "<feComposite in=\"{pg_final}\" in2=\"{sg}\" operator=\"over\" result=\"{next_ga}\"/>"
+                            );
+                            ga = Some(next_ga);
+                        } else {
+                            ga = None;
+                        }
                     }
+                }
+                BackdropStep::MultiPass { ops, shape_id } => {
+                    let (acc, acc_a) = Self::emit_filter_tiling_ops(
+                        &mut self.defs,
+                        w,
+                        h,
+                        &pat_rects,
+                        idx,
+                        ops,
+                        &cur,
+                        ga.as_deref(),
+                    );
                     let wt_res = format!("w{idx}");
                     let rw_res = format!("rw{idx}");
                     let bw_res = format!("bw{idx}");
@@ -1640,6 +2268,24 @@ impl<'a> SvgWriter<'a> {
                         "<feComposite in=\"{rw_res}\" in2=\"{bw_res}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_cur}\"/>"
                     );
                     cur = next_cur;
+                    if let (Some(aa), Some(cur_ga)) = (acc_a, ga.as_ref()) {
+                        let rwa = format!("rwa{idx}");
+                        let bwa = format!("bwa{idx}");
+                        let next_ga = format!("ga{idx}");
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{aa}\" in2=\"{wt_res}\" operator=\"in\" result=\"{rwa}\"/>"
+                        );
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{cur_ga}\" in2=\"{wt_res}\" operator=\"out\" result=\"{bwa}\"/>"
+                        );
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{rwa}\" in2=\"{bwa}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_ga}\"/>"
+                        );
+                        ga = Some(next_ga);
+                    }
                 }
                 BackdropStep::Affine {
                     t_id,
@@ -1736,6 +2382,29 @@ impl<'a> SvgWriter<'a> {
                         "<feComposite in=\"{rw_res}\" in2=\"{bw_res}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_cur}\"/>"
                     );
                     cur = next_cur;
+                    if let Some(ref cur_ga) = ga {
+                        let aa = format!("aa{idx}");
+                        let rwa = format!("rwa{idx}");
+                        let bwa = format!("bwa{idx}");
+                        let next_ga = format!("ga{idx}");
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{pt}\" in2=\"{cur_ga}\" operator=\"over\" result=\"{aa}\"/>"
+                        );
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{aa}\" in2=\"{wt_res}\" operator=\"in\" result=\"{rwa}\"/>"
+                        );
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{cur_ga}\" in2=\"{wt_res}\" operator=\"out\" result=\"{bwa}\"/>"
+                        );
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{rwa}\" in2=\"{bwa}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_ga}\"/>"
+                        );
+                        ga = Some(next_ga);
+                    }
                 }
             }
         }
@@ -1800,12 +2469,17 @@ impl<'a> SvgWriter<'a> {
         step_cost: usize,
         allow_empty: bool,
     ) -> bool {
+        let batch_limit = if self.non_isolated_filter_depth > 0 {
+            MAX_SVG_NON_AFFINE_TOTAL_PASSES
+        } else {
+            MAX_BACKDROP_FILTER_PASSES
+        };
         if let Some(ref p) = self.pending_backdrop {
             let extra = usize::from(!self.out.is_empty());
             if p.total_passes
                 .saturating_add(extra)
                 .saturating_add(step_cost)
-                <= MAX_BACKDROP_FILTER_PASSES
+                <= batch_limit
             {
                 self.absorb_out_into_pending();
                 if let Some(ref mut p) = self.pending_backdrop {
@@ -1821,7 +2495,7 @@ impl<'a> SvgWriter<'a> {
         }
         if (allow_empty || !self.out.is_empty())
             && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS
-            && step_cost <= MAX_BACKDROP_FILTER_PASSES
+            && step_cost <= batch_limit
         {
             if let Some(bg_id) = self.snapshot_page_backdrop(allow_empty) {
                 self.pending_backdrop = Some(PendingBackdrop {
@@ -1882,13 +2556,21 @@ impl<'a> SvgWriter<'a> {
                 self.out.push_str(&placement);
                 self.out.push_str("/>\n");
             }
-            TilingPassPlan::Passes(passes) => {
-                if passes.is_empty() {
+            TilingPassPlan::Ops(ops) => {
+                if ops.is_empty() {
                     return;
                 }
-                let has_non_normal = passes.iter().any(|&(_, m)| m != BlendMode::Normal);
-                if passes.len() > 1 {
-                    if depth == 0 && (self.pending_backdrop.is_some() || !self.out.is_empty()) {
+                let single_pattern = match ops.as_slice() {
+                    [TilingPlanOp::Pattern { pat_id, blend_mode }] => Some((*pat_id, *blend_mode)),
+                    _ => None,
+                };
+                if single_pattern.is_none() {
+                    let has_opacity_group = Self::ops_has_opacity_group(&ops);
+                    if depth == 0
+                        && (self.pending_backdrop.is_some()
+                            || !self.out.is_empty()
+                            || has_opacity_group)
+                    {
                         let shape_id = self.fresh_id();
                         let placement = self.placement_attrs();
                         let _ = write!(
@@ -1901,16 +2583,24 @@ impl<'a> SvgWriter<'a> {
                         push_opacity(&mut self.defs, "fill-opacity", opacity);
                         self.defs.push_str(&placement);
                         self.defs.push_str("/></g>\n");
-                        let pass_count = passes.len();
-                        if self.enqueue_backdrop_step(
-                            BackdropStep::MultiPass {
-                                passes: passes.clone(),
-                                shape_id,
-                            },
-                            pass_count,
-                            false,
-                        ) {
-                            return;
+                        if ops.len() > MAX_BACKDROP_FILTER_PASSES
+                            && self.non_isolated_filter_depth == 0
+                        {
+                            if self.emit_chunked_tiling_ops(&ops, shape_id) {
+                                return;
+                            }
+                        } else {
+                            let pass_count = ops.len();
+                            if self.enqueue_backdrop_step(
+                                BackdropStep::MultiPass {
+                                    ops: ops.clone(),
+                                    shape_id,
+                                },
+                                pass_count,
+                                has_opacity_group,
+                            ) {
+                                return;
+                            }
                         }
                     }
 
@@ -1941,60 +2631,47 @@ impl<'a> SvgWriter<'a> {
                         let _ = write!(self.out, " mask=\"url(#m{m})\"");
                     }
                     self.out.push_str(">\n");
-                    for (id, blend_mode) in passes {
-                        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                        push_num(&mut self.out, self.page_width);
-                        self.out.push_str("\" height=\"");
-                        push_num(&mut self.out, self.page_height);
-                        let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
-                        if let Some(name) = blend_css(blend_mode) {
-                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                        }
-                        self.out.push_str("/>\n");
-                    }
+                    self.emit_isolated_tiling_ops(&ops);
                     self.out.push_str("</g>\n");
                     return;
                 }
-                if depth == 0 && self.pending_backdrop.is_some() && has_non_normal {
-                    if let [(id, blend_mode)] = passes.as_slice() {
-                        let ov_id = self.fresh_id();
-                        let placement = self.placement_attrs();
-                        let _ = write!(
-                            self.defs,
-                            "<g id=\"ov{ov_id}\"><path d=\"{d}\" fill=\"url(#p{id})\""
-                        );
-                        if *rule == FillRule::EvenOdd {
-                            self.defs.push_str(" fill-rule=\"evenodd\"");
-                        }
-                        push_opacity(&mut self.defs, "fill-opacity", opacity);
-                        self.defs.push_str(&placement);
-                        self.defs.push_str("/></g>\n");
-                        if self.enqueue_backdrop_step(
-                            BackdropStep::BlendOverlay {
-                                ov_id,
-                                blend_mode: *blend_mode,
-                            },
-                            1,
-                            false,
-                        ) {
-                            return;
-                        }
+                let Some((id, blend_mode)) = single_pattern else {
+                    return;
+                };
+                if depth == 0 && self.pending_backdrop.is_some() && blend_mode != BlendMode::Normal
+                {
+                    let ov_id = self.fresh_id();
+                    let placement = self.placement_attrs();
+                    let _ = write!(
+                        self.defs,
+                        "<g id=\"ov{ov_id}\"><path d=\"{d}\" fill=\"url(#p{id})\""
+                    );
+                    if *rule == FillRule::EvenOdd {
+                        self.defs.push_str(" fill-rule=\"evenodd\"");
+                    }
+                    push_opacity(&mut self.defs, "fill-opacity", opacity);
+                    self.defs.push_str(&placement);
+                    self.defs.push_str("/></g>\n");
+                    if self.enqueue_backdrop_step(
+                        BackdropStep::BlendOverlay { ov_id, blend_mode },
+                        1,
+                        false,
+                    ) {
+                        return;
                     }
                     self.flush_pending_backdrop();
                 }
                 let placement = self.placement_attrs();
-                for (id, blend_mode) in passes {
-                    let _ = write!(self.out, "<path d=\"{d}\" fill=\"url(#p{id})\"");
-                    if *rule == FillRule::EvenOdd {
-                        self.out.push_str(" fill-rule=\"evenodd\"");
-                    }
-                    push_opacity(&mut self.out, "fill-opacity", opacity);
-                    if let Some(name) = blend_css(blend_mode) {
-                        let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                    }
-                    self.out.push_str(&placement);
-                    self.out.push_str("/>\n");
+                let _ = write!(self.out, "<path d=\"{d}\" fill=\"url(#p{id})\"");
+                if *rule == FillRule::EvenOdd {
+                    self.out.push_str(" fill-rule=\"evenodd\"");
                 }
+                push_opacity(&mut self.out, "fill-opacity", opacity);
+                if let Some(name) = blend_css(blend_mode) {
+                    let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                }
+                self.out.push_str(&placement);
+                self.out.push_str("/>\n");
             }
         }
     }
@@ -2120,14 +2797,22 @@ impl<'a> SvgWriter<'a> {
                         self.out.push_str(&placement);
                         self.out.push_str("/>\n");
                     }
-                    TilingPassPlan::Passes(passes) => {
-                        if passes.is_empty() {
+                    TilingPassPlan::Ops(ops) => {
+                        if ops.is_empty() {
                             return;
                         }
-                        let has_non_normal = passes.iter().any(|&(_, m)| m != BlendMode::Normal);
-                        if passes.len() > 1 {
+                        let single_pattern = match ops.as_slice() {
+                            [TilingPlanOp::Pattern { pat_id, blend_mode }] => {
+                                Some((*pat_id, *blend_mode))
+                            }
+                            _ => None,
+                        };
+                        if single_pattern.is_none() {
+                            let has_opacity_group = Self::ops_has_opacity_group(&ops);
                             if depth == 0
-                                && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                && (self.pending_backdrop.is_some()
+                                    || !self.out.is_empty()
+                                    || has_opacity_group)
                             {
                                 let shape_id = self.fresh_id();
                                 let placement = self.placement_attrs();
@@ -2139,16 +2824,24 @@ impl<'a> SvgWriter<'a> {
                                 push_stroke_attrs(&mut self.defs, style, self.scale);
                                 self.defs.push_str(&placement);
                                 self.defs.push_str("/></g>\n");
-                                let pass_count = passes.len();
-                                if self.enqueue_backdrop_step(
-                                    BackdropStep::MultiPass {
-                                        passes: passes.clone(),
-                                        shape_id,
-                                    },
-                                    pass_count,
-                                    false,
-                                ) {
-                                    return;
+                                if ops.len() > MAX_BACKDROP_FILTER_PASSES
+                                    && self.non_isolated_filter_depth == 0
+                                {
+                                    if self.emit_chunked_tiling_ops(&ops, shape_id) {
+                                        return;
+                                    }
+                                } else {
+                                    let pass_count = ops.len();
+                                    if self.enqueue_backdrop_step(
+                                        BackdropStep::MultiPass {
+                                            ops: ops.clone(),
+                                            shape_id,
+                                        },
+                                        pass_count,
+                                        has_opacity_group,
+                                    ) {
+                                        return;
+                                    }
                                 }
                             }
 
@@ -2184,59 +2877,48 @@ impl<'a> SvgWriter<'a> {
                                 self.out,
                                 " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
                             );
-                            for (id, blend_mode) in passes {
-                                self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                                push_num(&mut self.out, self.page_width);
-                                self.out.push_str("\" height=\"");
-                                push_num(&mut self.out, self.page_height);
-                                let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
-                                if let Some(name) = blend_css(blend_mode) {
-                                    let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                                }
-                                self.out.push_str("/>\n");
-                            }
+                            self.emit_isolated_tiling_ops(&ops);
                             self.out.push_str("</g>\n");
                             return;
                         }
-                        if depth == 0 && self.pending_backdrop.is_some() && has_non_normal {
-                            if let [(id, blend_mode)] = passes.as_slice() {
-                                let ov_id = self.fresh_id();
-                                let placement = self.placement_attrs();
-                                let _ = write!(
-                                    self.defs,
-                                    "<g id=\"ov{ov_id}\"><path d=\"{d}\" fill=\"none\" stroke=\"url(#p{id})\""
-                                );
-                                push_opacity(&mut self.defs, "stroke-opacity", opacity);
-                                push_stroke_attrs(&mut self.defs, style, self.scale);
-                                self.defs.push_str(&placement);
-                                self.defs.push_str("/></g>\n");
-                                if self.enqueue_backdrop_step(
-                                    BackdropStep::BlendOverlay {
-                                        ov_id,
-                                        blend_mode: *blend_mode,
-                                    },
-                                    1,
-                                    false,
-                                ) {
-                                    return;
-                                }
+                        let Some((id, blend_mode)) = single_pattern else {
+                            return;
+                        };
+                        if depth == 0
+                            && self.pending_backdrop.is_some()
+                            && blend_mode != BlendMode::Normal
+                        {
+                            let ov_id = self.fresh_id();
+                            let placement = self.placement_attrs();
+                            let _ = write!(
+                                self.defs,
+                                "<g id=\"ov{ov_id}\"><path d=\"{d}\" fill=\"none\" stroke=\"url(#p{id})\""
+                            );
+                            push_opacity(&mut self.defs, "stroke-opacity", opacity);
+                            push_stroke_attrs(&mut self.defs, style, self.scale);
+                            self.defs.push_str(&placement);
+                            self.defs.push_str("/></g>\n");
+                            if self.enqueue_backdrop_step(
+                                BackdropStep::BlendOverlay { ov_id, blend_mode },
+                                1,
+                                false,
+                            ) {
+                                return;
                             }
                             self.flush_pending_backdrop();
                         }
                         let placement = self.placement_attrs();
-                        for (id, blend_mode) in passes {
-                            let _ = write!(
-                                self.out,
-                                "<path d=\"{d}\" fill=\"none\" stroke=\"url(#p{id})\""
-                            );
-                            push_opacity(&mut self.out, "stroke-opacity", opacity);
-                            if let Some(name) = blend_css(blend_mode) {
-                                let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                            }
-                            push_stroke_attrs(&mut self.out, style, self.scale);
-                            self.out.push_str(&placement);
-                            self.out.push_str("/>\n");
+                        let _ = write!(
+                            self.out,
+                            "<path d=\"{d}\" fill=\"none\" stroke=\"url(#p{id})\""
+                        );
+                        push_opacity(&mut self.out, "stroke-opacity", opacity);
+                        if let Some(name) = blend_css(blend_mode) {
+                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
                         }
+                        push_stroke_attrs(&mut self.out, style, self.scale);
+                        self.out.push_str(&placement);
+                        self.out.push_str("/>\n");
                     }
                 }
             }
@@ -2339,27 +3021,39 @@ impl<'a> SvgWriter<'a> {
         self.out.push_str("</g>\n");
     }
 
-    fn close_non_isolated_filter_group(&mut self, alpha: f32, mask_id: Option<u32>) {
+    fn close_non_isolated_filter_group(
+        &mut self,
+        blend_mode: BlendMode,
+        alpha: f32,
+        mask_id: Option<u32>,
+    ) {
         self.absorb_out_into_pending();
         self.blend_depth = self.blend_depth.saturating_sub(1);
         self.non_isolated_filter_depth = self.non_isolated_filter_depth.saturating_sub(1);
-        let weight_id = self.fresh_id();
-        let _ = write!(
-            self.defs,
-            "<g id=\"s{weight_id}\"><rect x=\"0\" y=\"0\" width=\""
-        );
-        push_num(&mut self.defs, self.page_width);
-        self.defs.push_str("\" height=\"");
-        push_num(&mut self.defs, self.page_height);
-        self.defs.push_str("\" fill=\"#ffffff\"");
-        push_opacity(&mut self.defs, "fill-opacity", alpha);
-        if let Some(mid) = mask_id {
-            let _ = write!(self.defs, " mask=\"url(#m{mid})\"");
+        if blend_mode != BlendMode::Normal {
+            self.isolated_depth = self.isolated_depth.saturating_sub(1);
         }
-        self.defs.push_str("/></g>\n");
+        let weight_id = if alpha < 1.0 || mask_id.is_some() || blend_mode == BlendMode::Normal {
+            let id = self.fresh_id();
+            let _ = write!(self.defs, "<g id=\"s{id}\"><rect x=\"0\" y=\"0\" width=\"");
+            push_num(&mut self.defs, self.page_width);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, self.page_height);
+            self.defs.push_str("\" fill=\"#ffffff\"");
+            push_opacity(&mut self.defs, "fill-opacity", alpha);
+            if let Some(mid) = mask_id {
+                let _ = write!(self.defs, " mask=\"url(#m{mid})\"");
+            }
+            self.defs.push_str("/></g>\n");
+            Some(id)
+        } else {
+            None
+        };
         if let Some(ref mut p) = self.pending_backdrop {
-            p.steps
-                .push(BackdropStep::PopNonIsolatedGroup { weight_id });
+            p.steps.push(BackdropStep::PopNonIsolatedGroup {
+                blend_mode,
+                weight_id,
+            });
             p.total_passes = p.total_passes.saturating_add(1);
         }
     }
@@ -2682,31 +3376,46 @@ impl<'a> SvgWriter<'a> {
                 push_opacity(&mut self.out, "fill-opacity", opacity);
                 self.out.push_str("/>\n");
             }
-            TilingPassPlan::Passes(passes) => {
-                if passes.is_empty() {
+            TilingPassPlan::Ops(ops) => {
+                if ops.is_empty() {
                     return;
                 }
-                let has_non_normal = passes.iter().any(|&(_, m)| m != BlendMode::Normal);
+                let single_pattern = match ops.as_slice() {
+                    [TilingPlanOp::Pattern { pat_id, blend_mode }] => Some((*pat_id, *blend_mode)),
+                    _ => None,
+                };
+                let has_opacity_group = Self::ops_has_opacity_group(&ops);
                 if depth == 0
-                    && (passes.len() > 1 || (self.pending_backdrop.is_some() && has_non_normal))
+                    && (single_pattern.is_none()
+                        || (self.pending_backdrop.is_some()
+                            && single_pattern.is_some_and(|(_, m)| m != BlendMode::Normal)))
                 {
-                    if self.pending_backdrop.is_some() || !self.out.is_empty() {
+                    if self.pending_backdrop.is_some() || !self.out.is_empty() || has_opacity_group
+                    {
                         let shape_id = self.fresh_id();
                         let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
                         push_opacity(&mut self.defs, "opacity", opacity);
                         self.defs.push_str(">\n");
                         self.defs.push_str(&shape_body);
                         self.defs.push_str("</g>\n");
-                        let pass_count = passes.len();
-                        if self.enqueue_backdrop_step(
-                            BackdropStep::MultiPass {
-                                passes: passes.clone(),
-                                shape_id,
-                            },
-                            pass_count,
-                            false,
-                        ) {
-                            return;
+                        if ops.len() > MAX_BACKDROP_FILTER_PASSES
+                            && self.non_isolated_filter_depth == 0
+                        {
+                            if self.emit_chunked_tiling_ops(&ops, shape_id) {
+                                return;
+                            }
+                        } else {
+                            let pass_count = ops.len();
+                            if self.enqueue_backdrop_step(
+                                BackdropStep::MultiPass {
+                                    ops: ops.clone(),
+                                    shape_id,
+                                },
+                                pass_count,
+                                has_opacity_group,
+                            ) {
+                                return;
+                            }
                         }
                     }
                     self.flush_pending_backdrop();
@@ -2716,26 +3425,7 @@ impl<'a> SvgWriter<'a> {
                     self.defs,
                     "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
                 );
-                if passes.len() > 1 {
-                    self.out.push_str("<g");
-                    push_opacity(&mut self.out, "opacity", opacity);
-                    let _ = writeln!(
-                        self.out,
-                        " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
-                    );
-                    for (id, blend_mode) in passes {
-                        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                        push_num(&mut self.out, self.page_width);
-                        self.out.push_str("\" height=\"");
-                        push_num(&mut self.out, self.page_height);
-                        let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
-                        if let Some(name) = blend_css(blend_mode) {
-                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                        }
-                        self.out.push_str("/>\n");
-                    }
-                    self.out.push_str("</g>\n");
-                } else if let Some((id, blend_mode)) = passes.into_iter().next() {
+                if let Some((id, blend_mode)) = single_pattern {
                     self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
                     push_num(&mut self.out, self.page_width);
                     self.out.push_str("\" height=\"");
@@ -2749,6 +3439,15 @@ impl<'a> SvgWriter<'a> {
                         let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
                     }
                     self.out.push_str("/>\n");
+                } else {
+                    self.out.push_str("<g");
+                    push_opacity(&mut self.out, "opacity", opacity);
+                    let _ = writeln!(
+                        self.out,
+                        " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
+                    );
+                    self.emit_isolated_tiling_ops(&ops);
+                    self.out.push_str("</g>\n");
                 }
             }
         }
@@ -5793,6 +6492,291 @@ mod tests {
             right.red(),
             right.green(),
             right.blue()
+        );
+    }
+
+    #[test]
+    fn outer_screen_blend_mode_on_backdrop_dependent_tiling_evaluates_cell_first_in_svg() {
+        // Matches `outer_screen_blend_mode_on_backdrop_dependent_tiling_evaluates_cell_first`:
+        // left half [0..50] opaque blue, right half [50..100] opaque 50% gray,
+        // white Multiply tiling cell painted under outer non-isolated Screen
+        // over [10..90]×[10..90].
+        // - Over blue: Multiply(white, blue) = blue -> Screen(blue, blue) = blue (NOT white!).
+        // - Over 50% gray: Multiply(white, 0.5) = 0.5 -> Screen(0.5, 0.5) = 0.75 (~191).
+        // - Outside [10..90]: untouched page backdrop.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let page_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut dl = DisplayList::new(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 50.0, 100.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(50.0, 0.0, 100.0, 100.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(10.0, 10.0, 90.0, 90.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(10.0, 10.0, 90.0, 90.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let pixmap = render_svg_resvg(&dl, &SvgOptions::default(), 100, 100);
+        let blue_in = pixmap.pixel(25, 50).expect("in bounds");
+        assert!(
+            blue_in.red() <= 4 && blue_in.green() <= 4 && blue_in.blue() >= 251,
+            "SVG white Multiply under non-isolated Screen over blue must stay blue (NOT white), got ({},{},{})",
+            blue_in.red(),
+            blue_in.green(),
+            blue_in.blue()
+        );
+        let gray_in = pixmap.pixel(75, 50).expect("in bounds");
+        let g_rgb = [gray_in.red(), gray_in.green(), gray_in.blue()];
+        assert!(
+            g_rgb.iter().all(|&c| (186..=196).contains(&c)),
+            "SVG white Multiply under non-isolated Screen over 50% gray must be ~191, got {g_rgb:?}"
+        );
+        let gray_out = pixmap.pixel(95, 50).expect("in bounds");
+        let go_rgb = [gray_out.red(), gray_out.green(), gray_out.blue()];
+        assert!(
+            go_rgb.iter().all(|&c| (124..=132).contains(&c)),
+            "SVG untouched 50% gray outside non-isolated Screen fill must stay ~128, got {go_rgb:?}"
+        );
+    }
+
+    #[test]
+    fn cell_opacity_group_around_darken_mark_preserves_backdrop_in_svg() {
+        // A pattern cell containing a 50%-opacity non-isolated group around an
+        // opaque 50%-gray Darken mark produces a valid `OpacityGroup` whose mode
+        // (`Darken`) is excluded from `uniform_assoc`. It must stay in the live
+        // backdrop blend plan:
+        // - Over 25% gray (~64): Darken(0.5, 0.25) = 0.25 -> 50% group keeps 0.25 (~64, NOT ~96).
+        // - Over 80% gray (~204): Darken(0.5, 0.80) = 0.50 -> 50% group blends to 0.65 (~166).
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Darken,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let page_rect = Rect::new(0.0, 0.0, 80.0, 40.0);
+        let mut dl = DisplayList::new(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 40.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.25)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(40.0, 0.0, 80.0, 40.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.8)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 80.0, 40.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let pixmap = render_svg_resvg(&dl, &SvgOptions::default(), 80, 40);
+        let left = pixmap.pixel(20, 20).expect("in bounds");
+        let l_rgb = [left.red(), left.green(), left.blue()];
+        assert!(
+            l_rgb.iter().all(|&c| (60..=68).contains(&c)),
+            "SVG cell OpacityGroup(0.5) around Darken(0.5) over 25% gray must stay ~64 (NOT ~96), got {l_rgb:?}"
+        );
+        let right = pixmap.pixel(60, 20).expect("in bounds");
+        let r_rgb = [right.red(), right.green(), right.blue()];
+        assert!(
+            r_rgb.iter().all(|&c| (160..=172).contains(&c)),
+            "SVG cell OpacityGroup(0.5) around Darken(0.5) over 80% gray must blend to ~166, got {r_rgb:?}"
+        );
+    }
+
+    #[test]
+    fn dense_non_affine_65_copies_128_segments_preserves_last_copy_detail_in_svg() {
+        // 65 overlapping copies (BBox [0..130]×[0..2], XStep=2, YStep=2) × 128
+        // spanning Darken/Lighten gray segments consume 64*128 = 8,192 passes
+        // after copy 64; a black Darken detail confined to [0..1]×[0..2] (only
+        // visited in copy 65) must be preserved across bounded chunks, and
+        // 50% object opacity must still apply once across chunks.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 130.0, 2.0));
+        for k in 0..128 {
+            let (mode, gray) = if k % 2 == 0 {
+                (BlendMode::Darken, 0.6)
+            } else {
+                (BlendMode::Lighten, 0.4)
+            };
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: mode,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 130.0, 2.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 130.0, 2.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::gray(gray)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Darken,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 1.0, 2.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 1.0, 2.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 130.0, 2.0),
+            x_step: 2.0,
+            y_step: 2.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Compact 16×8 page rendered at 16×8 px keeps resvg fast while testing
+        // both 100% opacity (left half [0..8]) and 50% opacity (right half [8..16]).
+        let page_rect = Rect::new(0.0, 0.0, 16.0, 8.0);
+        let mut dl = DisplayList::new(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 8.0, 8.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(8.0, 0.0, 16.0, 8.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 0.5,
+            overprint: None,
+        });
+
+        let pixmap = render_svg_resvg(
+            &dl,
+            &SvgOptions {
+                background: Some(Color::white()),
+                ..SvgOptions::default()
+            },
+            16,
+            8,
+        );
+        // x=4 (even -> cell x=[0..1], copy-65 black detail at 100% opacity): ~0.
+        let opaque_black = pixmap.pixel(4, 4).expect("in bounds");
+        let ob_rgb = [
+            opaque_black.red(),
+            opaque_black.green(),
+            opaque_black.blue(),
+        ];
+        assert!(
+            ob_rgb.iter().all(|&c| c <= 4),
+            "SVG 65th-copy black detail past 8,192 non-affine passes must remain black, got {ob_rgb:?}"
+        );
+        // x=5 (odd -> cell x=[1..2], clamped to 0.6 by Darken(0.6)/Lighten(0.4) over white): ~153.
+        let opaque_gray = pixmap.pixel(5, 4).expect("in bounds");
+        let og_rgb = [opaque_gray.red(), opaque_gray.green(), opaque_gray.blue()];
+        assert!(
+            og_rgb.iter().all(|&c| (148..=158).contains(&c)),
+            "SVG 65-copy Darken(0.6)/Lighten(0.4) over white must be ~153, got {og_rgb:?}"
+        );
+        // x=10 (even -> cell x=[0..1], copy-65 black detail at 50% opacity over white): ~128.
+        let half_black = pixmap.pixel(10, 4).expect("in bounds");
+        let hb_rgb = [half_black.red(), half_black.green(), half_black.blue()];
+        assert!(
+            hb_rgb.iter().all(|&c| (122..=134).contains(&c)),
+            "SVG 65th-copy black detail at 50% object opacity across chunks must be ~128, got {hb_rgb:?}"
         );
     }
 }

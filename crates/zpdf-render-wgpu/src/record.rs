@@ -313,6 +313,12 @@ impl PageRecorder {
         self
     }
 
+    #[cfg(test)]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     /// True when the active target (and any paired alpha-tracking layer) is
     /// guaranteed opaque everywhere, so exact opaque-backdrop identity segments
     /// (white `Multiply`/`Darken`, black `Screen`/`Lighten`) are provable no-ops.
@@ -974,6 +980,43 @@ impl PageRecorder {
         });
         self.blend_depth += 1;
         self.blend_frames.push(BlendFrameKind::Real);
+        let saved_stack = std::mem::take(&mut self.clip_stack);
+        let saved_depth = std::mem::replace(&mut self.clip_depth, 0);
+        body(self);
+        self.clip_stack = saved_stack;
+        self.clip_depth = saved_depth;
+        self.pop_blend();
+    }
+
+    /// Evaluate `body` inside an unclipped isolated `Normal` group starting from
+    /// transparent, then composite through `shape_mask` ONCE at `alpha` and
+    /// restore the parent's active clip stack. Because `shape_mask` already
+    /// incorporates the active clip stack (via [`Self::record_subops_clipped`]),
+    /// suppressing the inherited clip inside the color layer prevents
+    /// multiplying resolved clip coverage twice on anti-aliased edges.
+    pub fn with_isolated_shape_mask(
+        &mut self,
+        alpha: f32,
+        shape_mask: MaskOps,
+        body: impl FnOnce(&mut Self),
+    ) {
+        if !self.can_push_blend() {
+            body(self);
+            return;
+        }
+        let clips = self.active_clips();
+        self.ops.push(PageOp::PushBlend {
+            mode: BlendMode::Normal,
+            alpha,
+            clips,
+            mask: Some(shape_mask),
+            overprint: None,
+            non_isolated: false,
+            unclipped_group: true,
+        });
+        self.blend_depth += 1;
+        self.isolated_depth += 1;
+        self.blend_frames.push(BlendFrameKind::RealIsolated);
         let saved_stack = std::mem::take(&mut self.clip_stack);
         let saved_depth = std::mem::replace(&mut self.clip_depth, 0);
         body(self);

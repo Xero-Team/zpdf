@@ -2719,3 +2719,114 @@ fn gpu_dense_affine_tiling_4200_evaluations_preserves_trailing_detail() {
         "GPU vs CPU 4200-pass affine mismatch: {pct:.3}%"
     );
 }
+
+/// Regression: a `DrawGlyphRun` painted with a non-backdrop-dependent (Normal)
+/// solid black tiling pattern inside an inherited clip must apply the clip's
+/// anti-aliased edge coverage ONCE — matching a clipped solid black glyph
+/// (~128 on a 50%-coverage clip edge, NOT ~191 from multiplying clip coverage
+/// in both the color layer and `shape_mask`).
+#[test]
+fn gpu_clipped_normal_tiling_glyph_applies_inherited_clip_once() {
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+        b"0 0 0 rg 0 0 10 10 re f",
+    );
+    let build_pdf = |paint_cmds: &[u8]| {
+        let content = stream_obj("", paint_cmds);
+        assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 80] /Contents 4 0 R \
+              /Resources << /Pattern << /P0 5 0 R >> /Font << /F1 6 0 R >> >> >>"
+                .to_vec(), // 3
+            content,                                       // 4
+            cell.clone(),                                  // 5
+            b"<< /Type /Font /Subtype /TrueType /BaseFont /ZpdfSans /FirstChar 65 \
+              /LastChar 65 /Widths [500] /FontDescriptor 7 0 R >>"
+                .to_vec(), // 6
+            b"<< /Type /FontDescriptor /FontName /ZpdfSans /Flags 32 \
+              /FontBBox [0 -200 700 800] /FontFile2 8 0 R >>"
+                .to_vec(), // 7
+            stream_obj(&format!("/Length1 {}", TEST_TTF.len()), TEST_TTF), // 8
+        ])
+    };
+
+    // Extract the Normal Paint::Tiling and a solid-black clipped DrawGlyphRun
+    // whose opaque square glyph covers x=[10..60], y=[10..70], clipped at the
+    // half-pixel vertical edge x = 25.5 (pixel x=25 has ~50% clip coverage).
+    let pat_pdf = build_pdf(b"/Pattern cs /P0 scn 0 0 10 10 re f");
+    let doc_p = PdfDocument::open(pat_pdf).expect("open pat pdf");
+    let page_p = doc_p.page(0).expect("page 0");
+    let mut fonts_p = doc_p.load_page_fonts(&page_p);
+    let content_p = doc_p.page_content_bytes(&page_p).expect("content");
+    let mut images_p = ImageCache::new();
+    let pat_dl = ContentInterpreter::new(page_p.media_box)
+        .with_fonts(&mut fonts_p)
+        .with_document(doc_p.file(), &page_p.resources)
+        .with_images(&mut images_p)
+        .interpret(&content_p);
+    let tiling_paint = pat_dl
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            zpdf::display_list::RenderCommand::FillPath {
+                paint: p @ zpdf::display_list::Paint::Tiling(_),
+                ..
+            } => Some(p.clone()),
+            _ => None,
+        })
+        .expect("normal tiling paint");
+
+    let solid_pdf = build_pdf(b"q 25.5 0 50 80 re W n 0 0 0 rg BT /F1 80 Tf 10 10 Td (A) Tj ET Q");
+    let doc = PdfDocument::open(solid_pdf).expect("open solid pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content");
+    let mut images = ImageCache::new();
+    let solid_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content);
+    let mut tiling_dl = solid_dl.clone();
+    let mut patched = 0usize;
+    for cmd in &mut tiling_dl.commands {
+        if let zpdf::display_list::RenderCommand::DrawGlyphRun(run) = cmd {
+            run.paint = tiling_paint.clone();
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 1, "expected one DrawGlyphRun to patch");
+
+    let solid_gpu = match render_gpu_shared(&solid_dl, Some(&fonts), Some(&images), 1.0) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skipping GPU clipped tiling glyph test (no adapter?): {e}");
+            return;
+        }
+    };
+    let tiling_gpu =
+        render_gpu_shared(&tiling_dl, Some(&fonts), Some(&images), 1.0).expect("tiling glyph gpu");
+
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 79 - y_pdf;
+        let off = ((iy * solid_gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let interior = px(&tiling_gpu.data, 35, 35);
+    assert!(
+        interior.iter().all(|&c| c <= 4),
+        "clipped Normal tiling glyph interior must be opaque black, got {interior:?}"
+    );
+    let edge_solid = px(&solid_gpu.data, 25, 35);
+    let edge_tiling = px(&tiling_gpu.data, 25, 35);
+    assert!(
+        (110..=145).contains(&edge_solid[0]),
+        "sanity check: clipped solid glyph edge at x=25.5 must be ~128, got {edge_solid:?}"
+    );
+    assert!(
+        (edge_tiling[0] as i32 - edge_solid[0] as i32).abs() <= 8,
+        "clipped Normal tiling glyph edge must match clipped solid glyph ({edge_solid:?}) rather than double-clipping to ~191, got {edge_tiling:?}"
+    );
+}

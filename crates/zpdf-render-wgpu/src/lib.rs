@@ -899,18 +899,6 @@ impl<'a> WgpuRenderer<'a> {
         // Render dense tiling-pattern cells once into repeat-sampled textures
         // before the main page pass. Ordered bottom-up so nested dense tiles
         // are already present in `tile_bgs` when outer tiles sample them.
-        enum TileOutput {
-            Single(Box<blend::RenderLayer>),
-            Pooled(blend::LayerPool, usize),
-        }
-        impl TileOutput {
-            fn sampleable_view(&self) -> &wgpu::TextureView {
-                match self {
-                    Self::Single(layer) => layer.sampleable_view(),
-                    Self::Pooled(pool, idx) => pool.get(*idx).sampleable_view(),
-                }
-            }
-        }
         let mut tile_bgs: std::collections::HashMap<u32, wgpu::BindGroup> =
             std::collections::HashMap::with_capacity(synthetic_tiles.len());
         let mut tile_outputs: Vec<TileOutput> = Vec::with_capacity(synthetic_tiles.len());
@@ -947,8 +935,6 @@ impl<'a> WgpuRenderer<'a> {
                 &ctx.pipelines.repeat_sampler
             };
             let output = {
-                let cur_tile_views: Vec<&wgpu::TextureView> =
-                    tile_outputs.iter().map(|o| o.sampleable_view()).collect();
                 let tile_res = ReplayRes {
                     pipelines: &ctx.pipelines,
                     bind_group: &tile_page_bg,
@@ -956,7 +942,7 @@ impl<'a> WgpuRenderer<'a> {
                     tex: tex_buffers.as_ref().map(|(v, i)| (v, i)),
                     tex_bgs: &tex_bgs,
                     tile_bgs: &tile_bgs,
-                    tile_views: &cur_tile_views,
+                    tile_outputs: &tile_outputs,
                     glyph: glyph_buffers.as_ref().map(|(v, i)| (v, i)),
                     glyph_bg: glyph_bg.as_ref(),
                     fs_range: tile_fs_ranges[idx],
@@ -1032,8 +1018,6 @@ impl<'a> WgpuRenderer<'a> {
             tile_bgs.insert(idx as u32, tile_bg);
         }
 
-        let tile_views: Vec<&wgpu::TextureView> =
-            tile_outputs.iter().map(|o| o.sampleable_view()).collect();
         let res = ReplayRes {
             pipelines: &ctx.pipelines,
             bind_group: &bind_group,
@@ -1041,7 +1025,7 @@ impl<'a> WgpuRenderer<'a> {
             tex: tex_buffers.as_ref().map(|(v, i)| (v, i)),
             tex_bgs: &tex_bgs,
             tile_bgs: &tile_bgs,
-            tile_views: &tile_views,
+            tile_outputs: &tile_outputs,
             glyph: glyph_buffers.as_ref().map(|(v, i)| (v, i)),
             glyph_bg: glyph_bg.as_ref(),
             fs_range,
@@ -1135,6 +1119,22 @@ impl<'a> WgpuRenderer<'a> {
     }
 }
 
+/// Rendered synthetic tiling output retained until submission so later tiles
+/// and the main page can sample it in O(1) without cloning texture views.
+enum TileOutput {
+    Single(Box<blend::RenderLayer>),
+    Pooled(blend::LayerPool, usize),
+}
+
+impl TileOutput {
+    fn sampleable_view(&self) -> &wgpu::TextureView {
+        match self {
+            Self::Single(layer) => layer.sampleable_view(),
+            Self::Pooled(pool, idx) => pool.get(*idx).sampleable_view(),
+        }
+    }
+}
+
 /// Shared GPU resources for replaying recorded ops into a render pass.
 struct ReplayRes<'a> {
     pipelines: &'a pipelines::Pipelines,
@@ -1143,7 +1143,7 @@ struct ReplayRes<'a> {
     tex: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     tex_bgs: &'a std::collections::HashMap<u32, wgpu::BindGroup>,
     tile_bgs: &'a std::collections::HashMap<u32, wgpu::BindGroup>,
-    tile_views: &'a [&'a wgpu::TextureView],
+    tile_outputs: &'a [TileOutput],
     /// Glyph-atlas quad buffers, present iff any glyph took the atlas path.
     glyph: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     /// The page's single atlas texture bind group (no per-op id, unlike `tex_bgs`).
@@ -2019,6 +2019,22 @@ fn record_tiling_pattern_rasterized(
                             if a <= 0.0 {
                                 continue;
                             }
+                            if *remaining_passes == 0 {
+                                // Check whether any visible inner segment still needs a pass
+                                // before recording mask geometry or blend frames.
+                                emit_steps(
+                                    rec,
+                                    tiling,
+                                    inner_steps,
+                                    overlap_shift,
+                                    seg_quad,
+                                    quad_opaque,
+                                    seg_alpha,
+                                    remaining_passes,
+                                    get_or_record_tile,
+                                );
+                                continue;
+                            }
                             let mask_ops = match inner_mask {
                                 Some(m_seg) => {
                                     let Some(tile_id) = get_or_record_tile(
@@ -2331,7 +2347,7 @@ fn record_tiling_pattern_rasterized(
             if separate_copies {
                 'copies: for dj in overlap.dj.clone() {
                     for di in overlap.di.clone() {
-                        if !rec.can_record() || remaining_passes == 0 {
+                        if !rec.can_record() {
                             break 'copies;
                         }
                         emit_steps(
@@ -2538,17 +2554,19 @@ fn record_tiling_glyph_run(
     if opacity <= 0.0 || !rec.can_record() {
         return;
     }
-    let bounds = glyph::glyph_run_page_bounds_transformed(fonts, run, outer_ctm)
-        .or_else(|| rec.page_rect())
-        .unwrap_or_else(|| zpdf_core::Rect::new(0.0, 0.0, 0.0, 0.0));
-    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        return;
-    }
     let paint_masked = |rec: &mut PageRecorder, eff_opacity: f32| {
+        let mut mask_bounds = None;
         let shape_ops = rec.record_subops_clipped(|r| {
-            glyph::render_glyph_run_mask_transformed(r, fonts, map, run, outer_ctm);
+            mask_bounds =
+                glyph::render_glyph_run_mask_and_bounds_transformed(r, fonts, map, run, outer_ctm);
         });
-        if shape_ops.is_empty() {
+        if shape_ops.is_empty() || !rec.can_record() {
+            return;
+        }
+        let bounds = mask_bounds
+            .or_else(|| rec.page_rect())
+            .unwrap_or_else(|| zpdf_core::Rect::new(0.0, 0.0, 0.0, 0.0));
+        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
             return;
         }
         let shape_mask = record::MaskOps {
@@ -2577,23 +2595,19 @@ fn record_tiling_glyph_run(
                 );
             });
         } else {
-            rec.push_blend(
-                zpdf_display_list::BlendMode::Normal,
-                eff_opacity,
-                Some(shape_mask),
-            );
-            record_tiling_pattern(
-                rec,
-                tiling,
-                outer_ctm,
-                bounds,
-                1.0,
-                Some(fonts),
-                images,
-                map,
-                depth,
-            );
-            rec.pop_blend();
+            rec.with_isolated_shape_mask(eff_opacity, shape_mask, |r| {
+                record_tiling_pattern(
+                    r,
+                    tiling,
+                    outer_ctm,
+                    bounds,
+                    1.0,
+                    Some(fonts),
+                    images,
+                    map,
+                    depth,
+                );
+            });
         }
     };
     match run.overprint {
@@ -2991,9 +3005,15 @@ fn composite_into(
                 )?;
                 if let (Some((tvb, tib)), Some(v_trans), Some(v0), Some(v1)) = (
                     res.tex,
-                    res.tile_views.get(*tile_trans as usize),
-                    res.tile_views.get(*tile0 as usize),
-                    res.tile_views.get(*tile1 as usize),
+                    res.tile_outputs
+                        .get(*tile_trans as usize)
+                        .map(TileOutput::sampleable_view),
+                    res.tile_outputs
+                        .get(*tile0 as usize)
+                        .map(TileOutput::sampleable_view),
+                    res.tile_outputs
+                        .get(*tile1 as usize)
+                        .map(TileOutput::sampleable_view),
                 ) {
                     budget.charge_pass(1)?;
                     let sampler = if *nearest {
@@ -4486,6 +4506,165 @@ mod resource_tests {
         assert!(
             matches!(err, WgpuRenderError::Unsupported(_)),
             "expected Unsupported budget error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dense_non_affine_copy_boundary_exhaustion_sets_recording_error() {
+        // 128 overlapping copies × 128 non-affine Darken segments = 16,384
+        // (exact pass budget) must succeed; adding a 129th overlapping copy
+        // must hit copy 129 in `emit_steps` and latch a recording error rather
+        // than returning a silent partial recording.
+        let run_case = |copies: usize| -> Result<(), WgpuRenderError> {
+            let bbox_w = (copies * 2) as f64;
+            let mut cell = DisplayList::new(Rect::new(0.0, 0.0, bbox_w, 2.0));
+            let mut span = zpdf_display_list::Path::new();
+            span.rect(Rect::new(0.0, 0.0, bbox_w, 2.0));
+            for _ in 0..128 {
+                cell.push(RenderCommand::PushBlendGroup {
+                    blend_mode: zpdf_display_list::BlendMode::Darken,
+                    isolated: true,
+                    knockout: false,
+                    bounds: Rect::new(0.0, 0.0, bbox_w, 2.0),
+                    alpha: 1.0,
+                    mask: None,
+                });
+                cell.push(RenderCommand::FillPath {
+                    path: span.clone(),
+                    rule: zpdf_display_list::FillRule::NonZero,
+                    paint: Paint::Solid(Color::gray(0.5)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+                cell.push(RenderCommand::PopBlendGroup);
+            }
+            let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+                commands: std::sync::Arc::new(cell),
+                bbox: Rect::new(0.0, 0.0, bbox_w, 2.0),
+                x_step: 2.0,
+                y_step: 2.0,
+                matrix: zpdf_core::Matrix::identity(),
+                tiling_type: 1,
+            });
+            // 140×140 with 2×2 step = 4,900 > 4,096 tiles -> rasterized path.
+            let page_rect = Rect::new(0.0, 0.0, 140.0, 140.0);
+            let map = PageMap::new(page_rect, 1.0);
+            let limits = zpdf_core::ParseLimits {
+                max_gpu_texture_bytes: 256 * 1024 * 1024,
+                ..zpdf_core::ParseLimits::default()
+            };
+            let mut rec = PageRecorder::default()
+                .with_limits(&limits)
+                .with_page_rect(page_rect)
+                .with_opaque_canvas(true);
+            record_tiling_pattern_rasterized(
+                &mut rec,
+                &tiling,
+                &zpdf_core::Matrix::identity(),
+                page_rect,
+                zpdf_core::Matrix::identity(),
+                1.0,
+                None,
+                None,
+                &map,
+                0,
+            );
+            rec.ensure_within_budget()
+        };
+
+        assert!(
+            run_case(128).is_ok(),
+            "exact 16,384 non-affine passes (128×128) must succeed without false exhaustion"
+        );
+        let err = run_case(129).expect_err("129th copy past 16,384 passes must report exhaustion");
+        assert!(
+            matches!(err, WgpuRenderError::Unsupported(_)),
+            "expected Unsupported recording-budget error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn patterned_glyph_run_honors_expired_recording_deadline() {
+        // A long patterned glyph run must immediately observe an expired
+        // PageRecorder deadline without pre-parsing glyph outlines for all
+        // occurrences.
+        let ttf = include_bytes!("../../zpdf-font/tests/fixtures/var.ttf");
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::TrueType,
+            "ZpdfSans".into(),
+            ttf.to_vec(),
+            zpdf_font::CidWidths::new(500.0),
+        );
+        let mut fonts = zpdf_font::FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut sq = zpdf_display_list::Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let glyphs = vec![
+            zpdf_display_list::PositionedGlyph {
+                glyph_id: 1,
+                x: 0.0,
+                y: 0.0,
+                code: b'A' as u32,
+                code_len: 1,
+                advance: 12.0,
+            };
+            50_000
+        ];
+        let run = zpdf_display_list::GlyphRun {
+            font_id,
+            font_size: 24.0,
+            transform: zpdf_core::Matrix::translate(10.0, 10.0),
+            glyphs,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 1.0,
+            h_scale: 1.0,
+            overprint: None,
+        };
+
+        let page_rect = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let map = PageMap::new(page_rect, 1.0);
+        let mut rec = PageRecorder::default()
+            .with_limits(&zpdf_core::ParseLimits::default())
+            .with_page_rect(page_rect)
+            .with_deadline(zpdf_core::time::Instant::now());
+        let start = zpdf_core::time::Instant::now();
+        record_tiling_glyph_run(
+            &mut rec,
+            &run,
+            &tiling,
+            &zpdf_core::Matrix::identity(),
+            &fonts,
+            None,
+            &map,
+            0,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "expired deadline must bail out immediately without walking 50,000 glyphs, took {elapsed:?}"
+        );
+        assert!(rec.ops.is_empty(), "expired run must not emit ops");
+        assert!(
+            rec.ensure_within_budget().is_err(),
+            "expired run must latch budget error"
         );
     }
 }

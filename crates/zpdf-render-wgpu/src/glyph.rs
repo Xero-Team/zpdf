@@ -57,78 +57,25 @@ pub fn render_glyph_run_transformed(
 /// Render one glyph run's coverage as opaque white (`[1.0; 4]`) under `ctm`,
 /// ignoring `run.paint` and `run.alpha`, so `Paint::Tiling` glyph runs can use
 /// the glyph outlines / atlas / Type 3 shapes as an alpha coverage mask.
-pub fn render_glyph_run_mask_transformed(
+///
+/// Simultaneously computes the conservative page-space bounding box of outline
+/// glyphs during the budgeted pass (honoring `rec.can_record()` and avoiding
+/// duplicate `font.glyph_outline` reparsing on warm atlas hits). Returns `None`
+/// for Type 3 fonts, empty runs, or when recording stops early (callers fall
+/// back to `rec.page_rect()`).
+pub fn render_glyph_run_mask_and_bounds_transformed(
     rec: &mut PageRecorder,
     fonts: &FontCache,
     map: &PageMap,
     run: &GlyphRun,
     ctm: &Matrix,
-) {
-    let tm = if *ctm == Matrix::identity() {
-        run.transform
-    } else {
-        ctm.concat(&run.transform)
-    };
-    render_glyph_run_colored(rec, fonts, map, run, &tm, [1.0, 1.0, 1.0, 1.0]);
-}
-
-/// Conservative page-space bounding box of `run` under `ctm` for outline fonts.
-/// Returns `None` for Type 3 or unknown fonts (callers fall back to page rect).
-pub fn glyph_run_page_bounds_transformed(
-    fonts: &FontCache,
-    run: &GlyphRun,
-    ctm: &Matrix,
 ) -> Option<zpdf_core::Rect> {
-    let font = fonts.get(run.font_id)?;
-    if !font.has_font_data() || font.is_type3() {
-        return None;
-    }
-    let upem = font.units_per_em;
-    if !(upem.is_finite() && upem > 0.0) {
-        return None;
-    }
     let tm = if *ctm == Matrix::identity() {
         run.transform
     } else {
         ctm.concat(&run.transform)
     };
-    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
-    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-    let mut visit = |gx: f64, gy: f64, off: (f32, f32)| {
-        let tx = gx / upem * run.font_size as f64 * run.h_scale as f64 + off.0 as f64;
-        let ty = gy / upem * run.font_size as f64 + off.1 as f64;
-        let px = tm.a * tx + tm.c * ty + tm.e;
-        let py = tm.b * tx + tm.d * ty + tm.f;
-        if px.is_finite() && py.is_finite() {
-            x0 = x0.min(px);
-            y0 = y0.min(py);
-            x1 = x1.max(px);
-            y1 = y1.max(py);
-        }
-    };
-    for g in &run.glyphs {
-        let Some(outline) = font.glyph_outline(g.glyph_id) else {
-            continue;
-        };
-        let off = (g.x, g.y);
-        for cmd in &outline.commands {
-            match *cmd {
-                OutlineCommand::MoveTo(x, y) | OutlineCommand::LineTo(x, y) => visit(x, y, off),
-                OutlineCommand::QuadTo(x1p, y1p, x, y) => {
-                    visit(x1p, y1p, off);
-                    visit(x, y, off);
-                }
-                OutlineCommand::CurveTo(x1p, y1p, x2p, y2p, x, y) => {
-                    visit(x1p, y1p, off);
-                    visit(x2p, y2p, off);
-                    visit(x, y, off);
-                }
-                OutlineCommand::Close => {}
-            }
-        }
-    }
-    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() && x1 > x0 && y1 > y0)
-        .then(|| zpdf_core::Rect::new(x0 - 1.0, y0 - 1.0, x1 + 1.0, y1 + 1.0))
+    render_glyph_run_colored(rec, fonts, map, run, &tm, [1.0, 1.0, 1.0, 1.0], true)
 }
 
 fn render_glyph_run_with_tm(
@@ -145,7 +92,7 @@ fn render_glyph_run_with_tm(
     if color[3] == 0.0 {
         return; // fully transparent — contributes nothing (CPU draws invisibly)
     }
-    render_glyph_run_colored(rec, fonts, map, run, tm, color);
+    let _ = render_glyph_run_colored(rec, fonts, map, run, tm, color, false);
 }
 
 fn render_glyph_run_colored(
@@ -155,17 +102,16 @@ fn render_glyph_run_colored(
     run: &GlyphRun,
     tm: &Matrix,
     color: [f32; 4],
-) {
-    let Some(font) = fonts.get(run.font_id) else {
-        return;
-    };
+    track_bounds: bool,
+) -> Option<zpdf_core::Rect> {
+    let font = fonts.get(run.font_id)?;
     if !font.has_font_data() {
-        return;
+        return None;
     }
 
     if font.is_type3() {
         render_type3(rec, font, run, tm, color, map, run.h_scale);
-        return;
+        return None;
     }
 
     let x = GlyphXform {
@@ -187,9 +133,20 @@ fn render_glyph_run_colored(
         None
     };
 
+    let (mut min_px, mut min_py) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_px, mut max_py) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut touch_px = |px: f32, py: f32| {
+        if track_bounds && px.is_finite() && py.is_finite() {
+            min_px = min_px.min(px);
+            min_py = min_py.min(py);
+            max_px = max_px.max(px);
+            max_py = max_py.max(py);
+        }
+    };
+
     for g in &run.glyphs {
         if !rec.can_record() {
-            return;
+            return None;
         }
         let atlas_key = atlas_key_size.map(|(x_millipx_per_em, y_millipx_per_em)| GlyphKey {
             font_id: run.font_id,
@@ -201,6 +158,8 @@ fn render_glyph_run_colored(
             let origin = outline_to_pixel(0.0, 0.0, (g.x, g.y), tm, &x);
             let quad =
                 glyph_atlas::glyph_quad(entry, rec.glyph_atlas.size(), (origin.x, origin.y), color);
+            touch_px(quad[0].pos[0], quad[0].pos[1]);
+            touch_px(quad[2].pos[0], quad[2].pos[1]);
             rec.add_glyph_quad(quad);
             continue;
         }
@@ -217,6 +176,8 @@ fn render_glyph_run_colored(
                     (origin.x, origin.y),
                     color,
                 );
+                touch_px(quad[0].pos[0], quad[0].pos[1]);
+                touch_px(quad[2].pos[0], quad[2].pos[1]);
                 rec.add_glyph_quad(quad);
                 continue;
             }
@@ -224,10 +185,34 @@ fn render_glyph_run_colored(
 
         if let Some(path) = build_outline_path(&outline, (g.x, g.y), tm, &x) {
             if let Some(mesh) = fill_lyon_path(&path, FillRule::NonZero, color) {
+                if track_bounds {
+                    for v in &mesh.vertices {
+                        touch_px(v.pos[0], v.pos[1]);
+                    }
+                }
                 rec.add_mesh(mesh);
             }
         }
     }
+
+    if track_bounds
+        && map.scale.is_finite()
+        && map.scale > 0.0
+        && min_px.is_finite()
+        && min_py.is_finite()
+        && max_px > min_px
+        && max_py > min_py
+    {
+        let inv = 1.0 / map.scale as f64;
+        let x0 = min_px as f64 * inv + map.x0 as f64 - 1.0;
+        let x1 = max_px as f64 * inv + map.x0 as f64 + 1.0;
+        let y0 = map.y1 as f64 - max_py as f64 * inv - 1.0;
+        let y1 = map.y1 as f64 - min_py as f64 * inv + 1.0;
+        if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() {
+            return Some(zpdf_core::Rect::new(x0, y0, x1, y1));
+        }
+    }
+    None
 }
 
 /// A glyph run is atlas-eligible when its transform has no rotation/shear
