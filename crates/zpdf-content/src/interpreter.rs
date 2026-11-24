@@ -883,23 +883,54 @@ fn colors_close(a: Color, b: Color) -> bool {
         && (a.a - b.a).abs() <= EPS
 }
 
+fn overprint_matches(a: Option<Overprint>, b: Option<Overprint>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.active == y.active
+                && x.cmyk
+                    .iter()
+                    .zip(y.cmyk.iter())
+                    .all(|(cx, cy)| (cx - cy).abs() <= 1e-3)
+        }
+        _ => false,
+    }
+}
+
 fn command_matches_caller_fill(
     cmd: &RenderCommand,
     caller_color: Color,
     caller_alpha: f32,
+    caller_overprint: Option<Overprint>,
 ) -> bool {
     const EPS: f32 = 1e-3;
     match cmd {
-        RenderCommand::FillPath { paint, alpha, .. }
-        | RenderCommand::StrokePath { paint, alpha, .. } => {
+        RenderCommand::FillPath {
+            paint,
+            alpha,
+            overprint,
+            ..
+        }
+        | RenderCommand::StrokePath {
+            paint,
+            alpha,
+            overprint,
+            ..
+        } => {
             matches!(*paint, Paint::Solid(c) if colors_close(c, caller_color) && (*alpha - caller_alpha).abs() <= EPS)
+                && overprint_matches(*overprint, caller_overprint)
         }
         RenderCommand::DrawGlyphRun(run) => {
             matches!(run.paint, Paint::Solid(c) if colors_close(c, caller_color) && (run.alpha - caller_alpha).abs() <= EPS)
+                && overprint_matches(run.overprint, caller_overprint)
         }
-        RenderCommand::DrawImage(d) => d.is_image_mask && (d.alpha - caller_alpha).abs() <= EPS,
+        RenderCommand::DrawImage(d) => {
+            d.is_image_mask && (d.alpha - caller_alpha).abs() <= EPS && caller_overprint.is_none()
+        }
         RenderCommand::DrawInlineImage(d) => {
-            d.image.is_image_mask && (d.alpha - caller_alpha).abs() <= EPS
+            d.image.is_image_mask
+                && (d.alpha - caller_alpha).abs() <= EPS
+                && caller_overprint.is_none()
         }
         RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => false,
         RenderCommand::PopClip | RenderCommand::PopBlendGroup => true,
@@ -7697,7 +7728,7 @@ impl<'a> ContentInterpreter<'a> {
             let matches_caller_paint = !glyph_local_image_paint
                 && glyph_cmds
                     .iter()
-                    .all(|cmd| command_matches_caller_fill(cmd, paint_color, alpha));
+                    .all(|cmd| command_matches_caller_fill(cmd, paint_color, alpha, overprint));
             if completed
                 && glyph_verified
                 && (emitted_paint != is_whitespace_glyph)

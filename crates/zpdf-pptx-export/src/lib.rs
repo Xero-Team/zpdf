@@ -1790,17 +1790,12 @@ impl<'a> SlideConverter<'a> {
         match cmd {
             RenderCommand::DrawGlyphRun(glyph_run) => {
                 let effective_alpha = effective_paint_alpha(&glyph_run.paint, glyph_run.alpha);
-                if effective_alpha <= 0.0 {
+                if effective_alpha <= 0.0 || glyph_run.overprint.is_some_and(|op| op.active == 0) {
                     return Ok(());
                 }
-                if in_artwork_range {
-                    if glyph_run.overprint.is_some_and(|op| op.active == 0) {
-                        return Ok(());
-                    }
-                    let backdrop = glyph_run
-                        .overprint
-                        .is_some_and(|op| op.active != 0)
-                        .then_some((all_commands, cmd_idx, cmd_idx));
+                let overprint_backdrop = glyph_run.overprint.is_some_and(|op| op.active != 0);
+                if in_artwork_range || overprint_backdrop {
+                    let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
                     self.flatten_commands_group(
                         &all_commands[cmd_idx..=cmd_idx],
                         None,
@@ -1819,20 +1814,16 @@ impl<'a> SlideConverter<'a> {
                 overprint,
             } => {
                 let effective_alpha = effective_paint_alpha(paint, *alpha);
-                if effective_alpha <= 0.0 {
+                if effective_alpha <= 0.0 || overprint.is_some_and(|op| op.active == 0) {
                     return Ok(());
                 }
-                if in_artwork_range && overprint.is_some_and(|op| op.active == 0) {
-                    return Ok(());
-                }
-                let overprint_backdrop =
-                    in_artwork_range && overprint.is_some_and(|op| op.active != 0);
+                let overprint_backdrop = overprint.is_some_and(|op| op.active != 0);
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
-                let raster_artwork = in_artwork_range
-                    && (overprint_backdrop
-                        || effective_alpha < 1.0 - 1e-3
-                        || artwork_fill_needs_raster(path, *rule, paint));
+                let raster_artwork = overprint_backdrop
+                    || (in_artwork_range
+                        && (effective_alpha < 1.0 - 1e-3
+                            || artwork_fill_needs_raster(path, *rule, paint)));
                 if clipped_artwork || raster_artwork {
                     let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
                     self.flatten_commands_group(
@@ -1853,20 +1844,16 @@ impl<'a> SlideConverter<'a> {
                 overprint,
             } => {
                 let effective_alpha = effective_paint_alpha(paint, *alpha);
-                if effective_alpha <= 0.0 {
+                if effective_alpha <= 0.0 || overprint.is_some_and(|op| op.active == 0) {
                     return Ok(());
                 }
-                if in_artwork_range && overprint.is_some_and(|op| op.active == 0) {
-                    return Ok(());
-                }
-                let overprint_backdrop =
-                    in_artwork_range && overprint.is_some_and(|op| op.active != 0);
+                let overprint_backdrop = overprint.is_some_and(|op| op.active != 0);
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
-                let raster_artwork = in_artwork_range
-                    && (overprint_backdrop
-                        || effective_alpha < 1.0 - 1e-3
-                        || artwork_stroke_needs_raster(path, style, paint));
+                let raster_artwork = overprint_backdrop
+                    || (in_artwork_range
+                        && (effective_alpha < 1.0 - 1e-3
+                            || artwork_stroke_needs_raster(path, style, paint)));
                 if clipped_artwork || raster_artwork {
                     let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
                     self.flatten_commands_group(
@@ -12090,6 +12077,272 @@ mod export_tests {
         assert!(
             cyan_px[3] == 255 && cyan_px[0] < 15 && cyan_px[1] > 240 && cyan_px[2] > 240,
             "uncovered portion of isolated Form must remain cyan, got {cyan_px:?}"
+        );
+    }
+
+    #[test]
+    fn page_level_overprint_fill_stroke_and_text_composite_over_type3_artwork() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Three mapped cyan Type 3 glyphs (A at [20..84], B at [140..204], C at [250..314]),
+        // overlapped respectively by:
+        // 1. a page-level yellow-only overprinting rectangle [60..120]x[30..94]
+        // 2. a page-level yellow-only overprinting thick stroke [180..235] at y=62
+        // 3. a page-level yellow-only overprinting Type 1 Helvetica text run "(MM)" straddling x=314.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 140] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R /F2 9 0 R >> /ExtGState << /GSop 10 0 R >> >> >>"
+                .to_vec(), // 3
+            stream(
+                "",
+                b"0 1 1 rg \
+                  BT /F1 80 Tf 20 30 Td (A) Tj ET \
+                  BT /F1 80 Tf 140 30 Td (B) Tj ET \
+                  BT /F1 80 Tf 250 30 Td (C) Tj ET \
+                  q /GSop gs 0 0 1 0 k 60 30 60 64 re f Q \
+                  q /GSop gs 0 0 1 0 K 24 w 180 62 m 235 62 l S Q \
+                  q /GSop gs 0 0 1 0 k BT /F2 72 Tf 270 36 Td (MM) Tj ET Q",
+            ), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 67 /Widths [1000 1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /A 8 0 R /B 8 0 R /C 8 0 R >>".to_vec(),  // 6
+            b"<< /Type /Encoding /Differences [65 /A /B /C] >>".to_vec(), // 7
+            stream("", b"1000 0 d0 0 0 800 800 re f"),     // 8
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 9
+            b"<< /Type /ExtGState /op true /OP true /OPM 1 >>".to_vec(), // 10
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("page overprint export");
+        // All 3 overlapped Type 3 glyphs fall back to cyan Rectangles, and all 3 page-level
+        // overprints (fill, stroke, text) export as backdrop-composited Images -> 6 elements.
+        assert_eq!(
+            slide.elements.len(),
+            6,
+            "unexpected elements: {:?}",
+            slide.elements
+        );
+        assert!(
+            !slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::TextBox { .. })),
+            "overlapped Type 3 glyphs and overprinting page text must not export as plain TextBox"
+        );
+
+        let is_green = |px: [u8; 4]| px[3] == 255 && px[0] < 15 && px[1] > 240 && px[2] < 15;
+        let is_yellow = |px: [u8; 4]| px[3] == 255 && px[0] > 240 && px[1] > 240 && px[2] < 15;
+
+        let sample_img_pdf = |idx: usize, pdf_x: f64, pdf_y: f64, label: &str| -> [u8; 4] {
+            let SlideElement::Image {
+                x_emu,
+                y_emu,
+                image_data,
+                ..
+            } = &slide.elements[idx]
+            else {
+                panic!(
+                    "{label}: expected SlideElement::Image, got {:?}",
+                    slide.elements[idx]
+                );
+            };
+            let rgba = image::load_from_memory(image_data)
+                .expect("decode PNG")
+                .to_rgba8();
+            let x_pt = *x_emu as f64 / 12700.0;
+            let y_pt = *y_emu as f64 / 12700.0;
+            let ppt_y = 140.0 - pdf_y;
+            rgba.get_pixel(
+                ((pdf_x - x_pt) * 2.0).round() as u32,
+                ((ppt_y - y_pt) * 2.0).round() as u32,
+            )
+            .0
+        };
+
+        // 1. Page-level overprint FillPath: [60..84] over cyan -> green, [90..115] over white -> yellow.
+        assert!(
+            is_green(sample_img_pdf(3, 72.0, 62.0, "page fill")),
+            "page overprint fill over cyan Type 3 glyph must be green"
+        );
+        assert!(
+            is_yellow(sample_img_pdf(3, 102.0, 62.0, "page fill")),
+            "page overprint fill over white backdrop must stay yellow"
+        );
+
+        // 2. Page-level overprint StrokePath: [180..204] over cyan -> green, [210..230] over white -> yellow.
+        assert!(
+            is_green(sample_img_pdf(4, 192.0, 62.0, "page stroke")),
+            "page overprint stroke over cyan Type 3 glyph must be green"
+        );
+        assert!(
+            is_yellow(sample_img_pdf(4, 220.0, 62.0, "page stroke")),
+            "page overprint stroke over white backdrop must stay yellow"
+        );
+
+        // 3. Page-level overprint DrawGlyphRun: "(MM)" overlaps cyan (C) [250..314] and extends onto white.
+        let SlideElement::Image { image_data, .. } = &slide.elements[5] else {
+            panic!(
+                "page overprint text must export as SlideElement::Image, got {:?}",
+                slide.elements[5]
+            );
+        };
+        let text_rgba = image::load_from_memory(image_data)
+            .expect("decode overprint text PNG")
+            .to_rgba8();
+        assert!(
+            text_rgba.pixels().any(|p| is_green(p.0)),
+            "page overprint text overlapping cyan Type 3 glyph must contain green pixels"
+        );
+        assert!(
+            text_rgba.pixels().any(|p| is_yellow(p.0)),
+            "page overprint text extending over white paper must contain yellow pixels"
+        );
+    }
+
+    #[test]
+    fn mixed_type3_run_with_local_overprint_keeps_unaffected_letter_editable() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Single `(AB) Tj` under caller black (`0 0 0 rg`, no overprint):
+        // - /A enables black overprint locally (`/GSop gs 0 0 0 1 k`) -> same RGB black,
+        //   different overprint state -> splits out of the verified run and renders as artwork.
+        // - /B inherits caller's normal black -> stays an editable TextBox("B")!
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 120] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream(
+                "",
+                b"0 1 1 rg 0 0 240 120 re f 0 0 0 rg BT /F1 60 Tf 20 30 Td (AB) Tj ET",
+            ), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 66 /Widths [1000 1000] \
+              /Resources << /ExtGState << /GSop 10 0 R >> >> >>"
+                .to_vec(), // 5
+            b"<< /A 8 0 R /B 9 0 R >>".to_vec(),           // 6
+            b"<< /Type /Encoding /Differences [65 /A /B] >>".to_vec(), // 7
+            stream("", b"1000 0 d0 /GSop gs 0 0 0 1 k 0 0 800 800 re f"), // 8
+            stream("", b"1000 0 d0 0 0 800 800 re f"),     // 9
+            b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 10
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let mut spans = Vec::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .with_text_sink(&mut spans)
+            .interpret_with_stats(&content_bytes);
+
+        let extracted: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(extracted, "AB");
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("mixed overprint run export");
+        let texts: Vec<&str> = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e.base() {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["B"],
+            "unaffected letter B in (AB) Tj must remain an editable TextBox while overprinting A stays artwork: {:?}",
+            slide.elements
+        );
+        assert!(
+            slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::Image { .. })),
+            "overprinting letter A must export as a backdrop-composited Image: {:?}",
+            slide.elements
         );
     }
 }
