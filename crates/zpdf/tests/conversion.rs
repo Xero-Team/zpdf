@@ -334,3 +334,114 @@ fn rich_conversion_bounds_dense_tiling_when_cell_image_is_clipped_out() {
         "exhausting tile visit budget on clipped dense pattern must set resource_limit_reached"
     );
 }
+
+#[test]
+fn text_only_conversion_skips_type3_inline_bitmaps_under_zero_image_budget() {
+    // Type 3 glyph `/A` paints an inline `/ImageMask true` bitmap stencil.
+    // In `ConversionMode::TextOnly` (the default), `convert_pdf` must skip
+    // bitmap decoding entirely so a zero image budget still extracts "A"
+    // completely without raising `resource_limit_reached`.
+    let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
+        800 0 0 800 0 0 cm\n\
+        BI /IM true /W 4 /H 4 /BPC 1 ID "
+        .to_vec();
+    glyph_bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    glyph_bytes.extend_from_slice(b"\nEI");
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 10 40 Td (A) Tj ET"),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(),
+        b"<< /A 8 0 R >>".to_vec(),
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(),
+        stream("", &glyph_bytes),
+    ]);
+
+    let limits = zpdf::ParseLimits {
+        max_image_cache_bytes: 0,
+        ..zpdf::ParseLimits::default()
+    };
+    let doc = PdfDocument::open_with_limits(pdf, limits).expect("open pdf");
+    let converted = convert_pdf(&doc, &[0], ConversionOptions::default()).expect("convert");
+
+    assert_eq!(converted.pages[0].text, "A");
+    assert!(converted.pages[0].images.is_empty());
+    assert!(
+        !converted.pages[0].diagnostics.resource_limit_reached,
+        "text-only conversion must skip Type 3 inline bitmaps without triggering image budget diagnostics"
+    );
+    assert!(
+        converted.is_complete(),
+        "text-only conversion with bitmap Type 3 glyph must stay complete under max_image_cache_bytes=0"
+    );
+}
+
+#[test]
+fn text_only_conversion_skips_type3_charproc_operators_under_small_operator_limit() {
+    // Build a vector-heavy Type 3 CharProc (~80 operators per glyph) so showing
+    // four Type 3 glyphs would easily exceed a small operator budget if replayed.
+    let mut heavy_glyph = b"600 0 d0\n".to_vec();
+    for i in 0..40 {
+        heavy_glyph.extend_from_slice(format!("{i} 0 10 10 re f\n").as_bytes());
+    }
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R /F2 9 0 R >> >> >>"
+            .to_vec(), // 3
+        stream(
+            "",
+            b"BT /F1 18 Tf 20 140 Td (AAAA) Tj /F2 18 Tf 0 -30 Td (LATER) Tj ET",
+        ), // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [600] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                    // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        stream("", &heavy_glyph),                      // 8
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 9
+    ]);
+
+    let limits = zpdf::ParseLimits {
+        max_page_operators: 40,
+        ..zpdf::ParseLimits::default()
+    };
+    let doc = PdfDocument::open_with_limits(pdf, limits).expect("open pdf");
+
+    let text_only = convert_pdf(&doc, &[0], ConversionOptions::default()).expect("text-only");
+    assert!(
+        text_only.pages[0].text.contains("AAAA") && text_only.pages[0].text.contains("LATER"),
+        "text-only conversion must preserve Type 3 text and later words under a small operator limit, got {:?}",
+        text_only.pages[0].text
+    );
+    assert!(
+        !text_only.pages[0].diagnostics.resource_limit_reached && text_only.is_complete(),
+        "text-only conversion must not spend operator budget on visual Type 3 CharProc replay: {:?}",
+        text_only.pages[0].diagnostics
+    );
+
+    // Rich mode still replays CharProcs visually and hits the tight operator limit.
+    let rich = convert_pdf(
+        &doc,
+        &[0],
+        ConversionOptions {
+            mode: ConversionMode::Rich,
+            use_structure: false,
+        },
+    )
+    .expect("rich");
+    assert!(
+        rich.pages[0].diagnostics.resource_limit_reached,
+        "rich mode should hit the tight operator limit when replaying vector-heavy CharProcs"
+    );
+}

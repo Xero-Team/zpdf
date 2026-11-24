@@ -4,10 +4,14 @@ PowerPoint (PPTX) export functionality for zpdf - converts PDF pages to editable
 
 Text and image placement applies the display-list transform, including
 translation, scaling, rotation and reflection. Rotated/reflected objects use
-the new `SlideElement::Transformed` wrapper; exhaustive enum matches must
-handle it, while existing TextBox/Image construction is unchanged. Arbitrary
-shear and PDF clipping/blending still have no complete editable DrawingML
-equivalent in this exporter.
+the `SlideElement::Transformed` wrapper and translucent native paints (solid
+fills, strokes, and text) use the `SlideElement::Opacity` wrapper (serialized
+as DrawingML `<a:alpha val="..."/>`); exhaustive enum matches must handle both
+wrappers (e.g. recursively unwrapping `element` while combining transform/alpha
+modifiers), while existing opaque/untransformed `TextBox`/`Rectangle`/`Ellipse`/
+`Line`/`FreeformPath`/`Image` construction is unchanged. Sheared bitmaps,
+masks, clips, knockout groups, and non-Normal blends flatten to cropped PNGs
+when no exact editable DrawingML equivalent exists.
 
 ## Overview
 

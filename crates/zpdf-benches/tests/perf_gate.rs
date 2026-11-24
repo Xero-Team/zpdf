@@ -42,7 +42,7 @@ const EXPECTED: &[(&str, u64, u64, u64, u64, u64, u64)] = &[
     ("pattern_tiling_uncolored", 2, 2, 0, 0, 0, 0),
     ("rect_fills", 4, 4, 0, 0, 0, 0),
     ("strokes", 3, 0, 3, 0, 0, 0),
-    ("text_type3", 1, 0, 0, 3, 0, 0),
+    ("text_type3", 3, 3, 0, 0, 0, 0),
 ];
 
 /// Generous: ~100x the real cost of these tiny fixtures. Catches a hang, not a

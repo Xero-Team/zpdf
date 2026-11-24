@@ -3081,10 +3081,18 @@ fn pdf_type3_bitmap_glyph_with_tiling_pattern_interprets_and_renders_cpu_and_gpu
     assert!(
         dl.commands.iter().any(|cmd| matches!(
             cmd,
-            zpdf::display_list::RenderCommand::DrawGlyphRun(run)
-                if matches!(run.paint, zpdf::display_list::Paint::Tiling(_))
+            zpdf::display_list::RenderCommand::FillPath {
+                paint: zpdf::display_list::Paint::Tiling(_),
+                ..
+            } | zpdf::display_list::RenderCommand::StrokePath {
+                paint: zpdf::display_list::Paint::Tiling(_),
+                ..
+            } | zpdf::display_list::RenderCommand::DrawGlyphRun(zpdf::display_list::GlyphRun {
+                paint: zpdf::display_list::Paint::Tiling(_),
+                ..
+            })
         )),
-        "interpreted PDF display list must carry Paint::Tiling on the Type 3 glyph run"
+        "interpreted PDF display list must carry Paint::Tiling for the Type 3 bitmap glyph"
     );
 
     let cpu = zpdf_render_cpu::CpuRenderer::new()

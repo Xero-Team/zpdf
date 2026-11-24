@@ -485,7 +485,7 @@ fn stroke_overshoot(width: f32, miter_limit: f32) -> f32 {
 /// Default [`CpuRenderer::render_budget`]. Generous enough that no realistic page
 /// approaches it (complex pages render in well under a second) while bounding
 /// pathological inputs to a few seconds.
-const DEFAULT_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+pub const DEFAULT_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Outline commands [`CpuRenderer`] keeps per page for reuse (about 28 MiB);
 /// glyphs past it are extracted from the font program on every draw.
@@ -689,6 +689,44 @@ impl<'a> CpuRenderer<'a> {
         self
     }
 
+    /// Borrow the in-progress root page surface `(width, height, premultiplied_rgba)`
+    /// while a page is open (between `begin_page` and `end_page`) and no
+    /// non-passthrough blend group is currently parked on `blend_stack`.
+    pub fn current_surface(&self) -> Option<(u32, u32, &[u8])> {
+        if self.blend_stack.iter().any(|entry| !entry.passthrough) {
+            return None;
+        }
+        let pixmap = self.pixmap.as_ref()?;
+        Some((pixmap.width(), pixmap.height(), pixmap.data()))
+    }
+
+    /// Effective device pixel scale currently installed by `begin_page`.
+    pub fn current_scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Whether the current page exceeded its configured wall-clock
+    /// `render_budget` and skipped subsequent paint commands.
+    pub fn is_over_budget(&self) -> bool {
+        self.over_budget
+    }
+
+    /// Update the active page's wall-clock deadline (or `None` to pause
+    /// budget tracking while the caller performs unrelated work between
+    /// command batches on a long-lived page surface).
+    pub fn set_deadline(&mut self, deadline: Option<zpdf_core::time::Instant>) {
+        self.deadline = deadline;
+    }
+
+    /// Drop all cached soft-mask coverage planes on the current page. Callers
+    /// that pass temporary rebased `Arc<DisplayList>` masks to a long-lived
+    /// renderer should clear this cache before dropping those temporary `Arc`s
+    /// so subsequent allocations cannot reuse an old `Arc::as_ptr` key.
+    pub fn clear_soft_mask_cache(&mut self) {
+        self.soft_mask_planes.clear();
+        self.soft_mask_cache_bytes = 0;
+    }
+
     /// Start a stopwatch, or `None` when not collecting. Pair with [`Self::tock`].
     fn tick(&self) -> Option<zpdf_core::time::Instant> {
         self.stage_stats
@@ -739,11 +777,6 @@ impl<'a> CpuRenderer<'a> {
     pub fn with_images(mut self, cache: &'a ImageCache) -> Self {
         self.image_cache = Some(cache);
         self
-    }
-
-    /// Whether the active page exceeded its configured wall-clock render budget.
-    pub fn is_over_budget(&self) -> bool {
-        self.over_budget
     }
 
     /// Pixel dimensions of the active page raster (`None` before `begin_page`
@@ -3515,6 +3548,124 @@ impl<'a> CpuRenderer<'a> {
         tiny_skia::StrokeDash::new(array, dash.phase * scale)
     }
 
+    fn path_to_skia_user_space(path: &Path) -> Option<tiny_skia::Path> {
+        let mut pb = tiny_skia::PathBuilder::new();
+        for elem in path {
+            match elem {
+                PathElement::MoveTo(p) => pb.move_to(p.x as f32, p.y as f32),
+                PathElement::LineTo(p) => pb.line_to(p.x as f32, p.y as f32),
+                PathElement::CurveTo(c1, c2, end) => pb.cubic_to(
+                    c1.x as f32,
+                    c1.y as f32,
+                    c2.x as f32,
+                    c2.y as f32,
+                    end.x as f32,
+                    end.y as f32,
+                ),
+                PathElement::Close => pb.close(),
+            }
+        }
+        pb.finish()
+    }
+
+    fn skia_path_to_display_list(skia_path: &tiny_skia::Path) -> Path {
+        let mut out = Path::new();
+        let mut cur = zpdf_core::Point::new(0.0, 0.0);
+        let mut subpath_start = cur;
+        for seg in skia_path.segments() {
+            match seg {
+                tiny_skia::PathSegment::MoveTo(p) => {
+                    let pt = zpdf_core::Point::new(p.x as f64, p.y as f64);
+                    out.move_to(pt);
+                    cur = pt;
+                    subpath_start = pt;
+                }
+                tiny_skia::PathSegment::LineTo(p) => {
+                    let pt = zpdf_core::Point::new(p.x as f64, p.y as f64);
+                    out.line_to(pt);
+                    cur = pt;
+                }
+                tiny_skia::PathSegment::QuadTo(c, end) => {
+                    let q = zpdf_core::Point::new(c.x as f64, c.y as f64);
+                    let p2 = zpdf_core::Point::new(end.x as f64, end.y as f64);
+                    let c1 = zpdf_core::Point::new(
+                        cur.x + (2.0 / 3.0) * (q.x - cur.x),
+                        cur.y + (2.0 / 3.0) * (q.y - cur.y),
+                    );
+                    let c2 = zpdf_core::Point::new(
+                        p2.x + (2.0 / 3.0) * (q.x - p2.x),
+                        p2.y + (2.0 / 3.0) * (q.y - p2.y),
+                    );
+                    out.curve_to(c1, c2, p2);
+                    cur = p2;
+                }
+                tiny_skia::PathSegment::CubicTo(c1, c2, end) => {
+                    let p2 = zpdf_core::Point::new(end.x as f64, end.y as f64);
+                    out.curve_to(
+                        zpdf_core::Point::new(c1.x as f64, c1.y as f64),
+                        zpdf_core::Point::new(c2.x as f64, c2.y as f64),
+                        p2,
+                    );
+                    cur = p2;
+                }
+                tiny_skia::PathSegment::Close => {
+                    out.close();
+                    cur = subpath_start;
+                }
+            }
+        }
+        out
+    }
+
+    /// Apply `style`'s dash pattern to `path` in its own user coordinate space.
+    ///
+    /// Returns a clone of `path` unchanged when `style` has no active dash
+    /// pattern, or an empty [`Path`] if dashing yields no visible segments.
+    #[doc(hidden)]
+    pub fn dash_path(path: &Path, style: &StrokeStyle, resolution_scale: f32) -> Path {
+        let Some(dash) = Self::stroke_dash(style, 1.0) else {
+            return path.clone();
+        };
+        let Some(skia_path) = Self::path_to_skia_user_space(path) else {
+            return Path::new();
+        };
+        let res = resolution_scale.max(0.25);
+        let Some(dashed) = skia_path.dash(&dash, res) else {
+            return Path::new();
+        };
+        Self::skia_path_to_display_list(&dashed)
+    }
+
+    /// Expand a display-list path stroke (including caps, joins, miter limit,
+    /// and dashes) into a filled outline in the path's own user coordinate
+    /// space.
+    ///
+    /// `min_width` specifies the minimum user-space stroke width independently
+    /// of `resolution_scale` (which only controls curve flattening).
+    #[doc(hidden)]
+    pub fn stroke_path_to_outline(
+        path: &Path,
+        style: &StrokeStyle,
+        min_width: f32,
+        resolution_scale: f32,
+    ) -> Option<Path> {
+        let skia_path = Self::path_to_skia_user_space(path)?;
+        let res = resolution_scale.max(0.25);
+        let skia_stroke = Self::skia_stroke(style, 1.0, min_width.max(0.0));
+        // `tiny_skia::Path::stroke` does not apply `stroke.dash`; dash first
+        // identically to `Pixmap::stroke_path`.
+        let dashed_path;
+        let path_to_stroke = if let Some(ref dash) = skia_stroke.dash {
+            dashed_path = skia_path.dash(dash, res)?;
+            &dashed_path
+        } else {
+            &skia_path
+        };
+        let outlined = path_to_stroke.stroke(&skia_stroke, res)?;
+        let out = Self::skia_path_to_display_list(&outlined);
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Render a glyph run with a specific alpha override (used by knockout groups).
     fn render_glyph_run_with_alpha(&mut self, run: &GlyphRun, alpha_override: f32) {
         let font_cache = match self.font_cache {
@@ -4186,6 +4337,34 @@ impl<'a> CpuRenderer<'a> {
                     }
                 }
                 RenderCommand::DrawImage(draw) => {
+                    let t = &draw.transform;
+                    let corners = [
+                        (t.e, t.f),
+                        (t.a + t.e, t.b + t.f),
+                        (t.c + t.e, t.d + t.f),
+                        (t.a + t.c + t.e, t.b + t.d + t.f),
+                    ];
+                    let (mut x0, mut y0) = (f32::INFINITY, f32::INFINITY);
+                    let (mut x1, mut y1) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                    for (px, py) in corners {
+                        let dx = self.to_pixel_x(px as f32);
+                        let dy = self.flip_y(py as f32);
+                        x0 = x0.min(dx);
+                        y0 = y0.min(dy);
+                        x1 = x1.max(dx);
+                        y1 = y1.max(dy);
+                    }
+                    if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() {
+                        if let Some(rect) =
+                            tiny_skia::Rect::from_ltrb(x0, y0, x1.max(x0 + 1e-4), y1.max(y0 + 1e-4))
+                        {
+                            extend(Self::drawn_extent(rect, 1.0, w, h));
+                        }
+                    } else {
+                        extend(PaintedBounds::whole(w, h));
+                    }
+                }
+                RenderCommand::DrawInlineImage(draw) => {
                     let t = &draw.transform;
                     let corners = [
                         (t.e, t.f),
@@ -5162,6 +5341,7 @@ impl<'a> CpuRenderer<'a> {
             } => self.render_stroke(path, style, paint, *alpha),
             RenderCommand::DrawGlyphRun(run) => self.render_glyph_run(run),
             RenderCommand::DrawImage(draw) => self.render_image(draw),
+            RenderCommand::DrawInlineImage(draw) => self.render_inline_image(draw),
             _ => {}
         }
     }
@@ -5205,6 +5385,7 @@ impl<'a> CpuRenderer<'a> {
                 self.render_glyph_run_with_alpha(run, 1.0);
             }
             RenderCommand::DrawImage(draw) => self.render_image_with_alpha(draw, 1.0),
+            RenderCommand::DrawInlineImage(draw) => self.render_inline_image_with_alpha(draw, 1.0),
             _ => {}
         }
     }
@@ -5637,6 +5818,57 @@ impl<'a> CpuRenderer<'a> {
         self.render_image_from_cache(image_cache, draw, alpha_override, true);
     }
 
+    fn render_inline_image(&mut self, draw: &InlineImageDraw) {
+        self.render_inline_image_with_alpha(draw, draw.alpha);
+    }
+
+    fn render_inline_image_with_alpha(&mut self, draw: &InlineImageDraw, alpha_override: f32) {
+        if !draw.image.premultiplied
+            && draw
+                .image
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] < 255)
+        {
+            let mut premul = draw.image.data.clone();
+            Self::premultiply_rgba(&mut premul);
+            self.render_rgba_image(
+                draw.image.width,
+                draw.image.height,
+                &premul,
+                &draw.transform,
+                alpha_override,
+                None,
+            );
+            return;
+        }
+        self.render_rgba_image(
+            draw.image.width,
+            draw.image.height,
+            &draw.image.data,
+            &draw.transform,
+            alpha_override,
+            None,
+        );
+    }
+
+    fn premultiply_rgba(data: &mut [u8]) {
+        for px in data.as_chunks_mut::<4>().0 {
+            let a = px[3] as u32;
+            if a == 0 {
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+            } else if a < 255 {
+                for c in &mut px[..3] {
+                    *c = ((*c as u32 * a + 127) / 255) as u8;
+                }
+            }
+        }
+    }
+
     fn render_image_from_cache(
         &mut self,
         image_cache: &ImageCache,
@@ -5648,22 +5880,41 @@ impl<'a> CpuRenderer<'a> {
             Some(img) => img,
             None => return,
         };
-        let Some(expected_len) = (image.width as usize)
-            .checked_mul(image.height as usize)
+        self.render_rgba_image(
+            image.width,
+            image.height,
+            &image.data,
+            &draw.transform,
+            alpha_override,
+            cache_downscaled.then_some(draw.image_id),
+        );
+    }
+
+    fn render_rgba_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        draw_transform: &zpdf_core::Matrix,
+        alpha_override: f32,
+        downscale_cache_id: Option<ImageId>,
+    ) {
+        let Some(expected_len) = (width as usize)
+            .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
         else {
             tracing::warn!(
-                image_id = draw.image_id,
+                image_id = ?downscale_cache_id,
                 "skipping overflowing image dimensions"
             );
             return;
         };
-        if image.width == 0 || image.height == 0 || image.data.len() != expected_len {
+        if width == 0 || height == 0 || data.len() != expected_len {
             tracing::warn!(
-                image_id = draw.image_id,
-                width = image.width,
-                height = image.height,
-                bytes = image.data.len(),
+                image_id = ?downscale_cache_id,
+                width,
+                height,
+                bytes = data.len(),
                 "skipping malformed decoded image"
             );
             return;
@@ -5692,7 +5943,7 @@ impl<'a> CpuRenderer<'a> {
         // Composed into a single affine in image-pixel coordinates:
         //   screen_x = (a*s/iw)*ix + (-c*s/ih)*iy + (c + e - x0)*s
         //   screen_y = (-b*s/iw)*ix + (d*s/ih)*iy + (y1 - d - f)*s
-        let tm = &draw.transform;
+        let tm = draw_transform;
         let sx = self.scale;
         let sy = self.scale_y;
         let (a, b, c, d, e, f) = (
@@ -5711,43 +5962,33 @@ impl<'a> CpuRenderer<'a> {
         // applied the same rule, so its images arrive at their target size.
         let mut downscaled: Option<(Arc<[u8]>, u32, u32)> = None;
         if let Some((tw, th)) =
-            zpdf_image::box_filter_size(&draw.transform, sx.max(sy), image.width, image.height)
+            zpdf_image::box_filter_size(draw_transform, sx.max(sy), width, height)
         {
-            let key = (draw.image_id, tw, th);
-            let data = if cache_downscaled {
-                if let Some(data) = self.downscaled_images.get(&key) {
-                    Arc::clone(data)
+            let scaled = if let Some(image_id) = downscale_cache_id {
+                let key = (image_id, tw, th);
+                if let Some(cached) = self.downscaled_images.get(&key) {
+                    Arc::clone(cached)
                 } else {
-                    let data: Arc<[u8]> = Arc::from(zpdf_image::box_downscale_rgba(
-                        &image.data,
-                        image.width,
-                        image.height,
-                        tw,
-                        th,
-                    ));
+                    let scaled: Arc<[u8]> =
+                        Arc::from(zpdf_image::box_downscale_rgba(data, width, height, tw, th));
                     let retained: usize = self.downscaled_images.values().map(|d| d.len()).sum();
-                    if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
-                        if retained.saturating_add(data.len()) > MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                    if scaled.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                        if retained.saturating_add(scaled.len()) > MAX_DOWNSCALED_IMAGE_CACHE_BYTES
+                        {
                             self.downscaled_images.clear();
                         }
-                        self.downscaled_images.insert(key, Arc::clone(&data));
+                        self.downscaled_images.insert(key, Arc::clone(&scaled));
                     }
-                    data
+                    scaled
                 }
             } else {
-                Arc::from(zpdf_image::box_downscale_rgba(
-                    &image.data,
-                    image.width,
-                    image.height,
-                    tw,
-                    th,
-                ))
+                Arc::from(zpdf_image::box_downscale_rgba(data, width, height, tw, th))
             };
-            downscaled = Some((data, tw, th));
+            downscaled = Some((scaled, tw, th));
         }
         let (data, w, h) = match &downscaled {
-            Some((data, w, h)) => (data.as_ref(), *w, *h),
-            None => (image.data.as_slice(), image.width, image.height),
+            Some((scaled, w, h)) => (scaled.as_ref(), *w, *h),
+            None => (data, width, height),
         };
         let src = match tiny_skia::PixmapRef::from_bytes(data, w, h) {
             Some(p) => p,
@@ -7265,6 +7506,11 @@ fn transform_display_list_for_cpu(
                 cloned.transform = ctm.concat(&cloned.transform);
                 RenderCommand::DrawImage(cloned)
             }
+            RenderCommand::DrawInlineImage(draw) => {
+                let mut cloned = draw.clone();
+                cloned.transform = ctm.concat(&cloned.transform);
+                RenderCommand::DrawInlineImage(cloned)
+            }
             RenderCommand::PushClip { path, rule } => RenderCommand::PushClip {
                 path: path.map_points(|p| p.transform(ctm)),
                 rule: *rule,
@@ -7702,6 +7948,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
                     | RenderCommand::StrokePath { .. }
                     | RenderCommand::DrawGlyphRun(_)
                     | RenderCommand::DrawImage(_)
+                    | RenderCommand::DrawInlineImage(_)
             )
         {
             self.knockout_paint(cmd);
@@ -7720,7 +7967,8 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             RenderCommand::FillPath { .. }
             | RenderCommand::StrokePath { .. }
             | RenderCommand::DrawGlyphRun(_)
-            | RenderCommand::DrawImage(_) => {
+            | RenderCommand::DrawImage(_)
+            | RenderCommand::DrawInlineImage(_) => {
                 self.render_paint_cmd(cmd);
             }
             RenderCommand::PushClip { path, rule } => {
@@ -11173,6 +11421,46 @@ mod tests {
             px(84, 20)[2] > 240 && px(84, 20)[0] < 15,
             "{:?}",
             px(84, 20)
+        );
+    }
+
+    #[test]
+    fn inline_image_straight_alpha_matches_premultiplied_on_white() {
+        let render_inline = |data: Vec<u8>, premultiplied: bool| -> [u8; 4] {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+            dl.push(RenderCommand::DrawInlineImage(
+                zpdf_display_list::InlineImageDraw {
+                    image: Arc::new(zpdf_display_list::InlineImage {
+                        width: 1,
+                        height: 1,
+                        data,
+                        has_alpha: true,
+                        is_image_mask: false,
+                        premultiplied,
+                    }),
+                    transform: zpdf_core::Matrix::new(8.0, 0.0, 0.0, 8.0, 0.0, 0.0),
+                    alpha: 1.0,
+                },
+            ));
+            let page = CpuRenderer::new()
+                .render_display_list(&dl, 1.0)
+                .expect("render");
+            let idx = ((4 * page.width + 4) * 4) as usize;
+            page.data[idx..idx + 4].try_into().unwrap()
+        };
+
+        let straight = render_inline(vec![128, 0, 0, 128], false);
+        let premul = render_inline(vec![64, 0, 0, 128], true);
+        assert_eq!(
+            straight, premul,
+            "straight-alpha [128,0,0,128] must composite identically to premultiplied [64,0,0,128]"
+        );
+        assert!(
+            (187..=195).contains(&straight[0])
+                && (123..=131).contains(&straight[1])
+                && (123..=131).contains(&straight[2])
+                && straight[3] == 255,
+            "expected ~[191, 127, 127, 255] on white, got {straight:?}"
         );
     }
 }

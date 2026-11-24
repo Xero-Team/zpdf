@@ -22,8 +22,8 @@ use std::rc::Rc;
 
 use image::ImageEncoder;
 use zpdf_display_list::{
-    BlendMode, Color, DisplayList, FillRule, GlyphRun, ImageDraw, LineCap, LineJoin, Paint, Path,
-    PathElement, RenderCommand, SoftMask, SoftMaskKind, StrokeStyle,
+    BlendMode, Color, DisplayList, FillRule, GlyphRun, ImageDraw, InlineImageDraw, LineCap,
+    LineJoin, Paint, Path, PathElement, RenderCommand, SoftMask, SoftMaskKind, StrokeStyle,
 };
 use zpdf_font::{FontCache, FontId, GlyphOutline, LoadedFont, OutlineCommand};
 use zpdf_image::{DecodedImage, ImageCache, ImageId};
@@ -283,6 +283,7 @@ struct SvgWriter<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ImageDefKey {
     Page(ImageId),
+    Inline(usize),
     Type3Stencil {
         font: FontId,
         glyph: u16,
@@ -688,6 +689,9 @@ impl<'a> SvgWriter<'a> {
                 }
                 RenderCommand::DrawImage(draw) => {
                     self.emit_image(draw);
+                }
+                RenderCommand::DrawInlineImage(draw) => {
+                    self.emit_inline_image(draw);
                 }
                 RenderCommand::PushClip { path, rule } => {
                     let frame = Frame::Clip {
@@ -6130,6 +6134,28 @@ impl<'a> SvgWriter<'a> {
         );
     }
 
+    fn emit_inline_image(&mut self, draw: &InlineImageDraw) {
+        let alpha = if draw.alpha.is_finite() {
+            draw.alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if alpha <= 0.0 {
+            return;
+        }
+        let key = ImageDefKey::Inline(std::sync::Arc::as_ptr(&draw.image) as usize);
+        self.place_rgba_image(
+            key,
+            draw.image.width,
+            draw.image.height,
+            &draw.image.data,
+            draw.image.premultiplied,
+            None,
+            &draw.transform,
+            alpha,
+        );
+    }
+
     /// Draw `image` (the def `key`, written on first use) over the unit square
     /// mapped by the page-space `transform`. A `tint` recolours a stencil's
     /// opaque samples.
@@ -6137,6 +6163,30 @@ impl<'a> SvgWriter<'a> {
         &mut self,
         key: ImageDefKey,
         image: &DecodedImage,
+        tint: Option<&Color>,
+        transform: &zpdf_core::Matrix,
+        alpha: f32,
+    ) {
+        self.place_rgba_image(
+            key,
+            image.width,
+            image.height,
+            &image.data,
+            image.premultiplied,
+            tint,
+            transform,
+            alpha,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_rgba_image(
+        &mut self,
+        key: ImageDefKey,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        premultiplied: bool,
         tint: Option<&Color>,
         transform: &zpdf_core::Matrix,
         alpha: f32,
@@ -6151,8 +6201,8 @@ impl<'a> SvgWriter<'a> {
         //   svg_y = (-b/iw)·ix + (d/ih)·iy + (y1 - d - f)
         // — the same affine as the CPU backend's `render_image`.
         let tm = transform;
-        let iw = image.width as f64;
-        let ih = image.height as f64;
+        let iw = width as f64;
+        let ih = height as f64;
         let s = self.scale;
         let m = [
             tm.a * s / iw,
@@ -6171,16 +6221,18 @@ impl<'a> SvgWriter<'a> {
             Some(id) => *id,
             None => {
                 let png = match tint {
-                    Some(color) => encode_png(&tinted(image, color)),
-                    None => encode_png(image),
+                    Some(color) => {
+                        let tinted_bytes = tinted_rgba(data, premultiplied, color);
+                        encode_png_rgba(width, height, &tinted_bytes, premultiplied)
+                    }
+                    None => encode_png_rgba(width, height, data, premultiplied),
                 };
                 let id = png.map(|png| {
                     let id = self.fresh_id();
                     let _ = write!(
                         self.defs,
-                        "<image id=\"i{id}\" width=\"{}\" height=\"{}\" \
-                         preserveAspectRatio=\"none\" href=\"data:image/png;base64,",
-                        image.width, image.height
+                        "<image id=\"i{id}\" width=\"{width}\" height=\"{height}\" \
+                         preserveAspectRatio=\"none\" href=\"data:image/png;base64,"
                     );
                     push_base64(&mut self.defs, &png);
                     self.defs.push_str("\"/>\n");
@@ -6438,12 +6490,12 @@ fn push_stroke_attrs(out: &mut String, style: &StrokeStyle, scale: f64) {
 /// mask or stencil has been folded in).
 /// A stencil image recoloured with `color`: its coverage (alpha) is kept and
 /// its colour replaced, as the CPU backend paints Type 3 stencil glyphs.
-fn tinted(image: &DecodedImage, color: &Color) -> DecodedImage {
-    let mut out = image.clone();
+fn tinted_rgba(data: &[u8], premultiplied: bool, color: &Color) -> Vec<u8> {
+    let mut out = data.to_vec();
     let rgb = [color.r, color.g, color.b].map(|c| c.clamp(0.0, 1.0));
-    for px in out.data.as_chunks_mut::<4>().0 {
+    for px in out.as_chunks_mut::<4>().0 {
         let a = px[3] as f32 / 255.0;
-        let scale = if out.premultiplied { a } else { 1.0 };
+        let scale = if premultiplied { a } else { 1.0 };
         for (dst, c) in px[..3].iter_mut().zip(rgb) {
             *dst = (c * scale * 255.0).round() as u8;
         }
@@ -6610,27 +6662,26 @@ fn svg_compute_incremental_overlay(before_premul: &[u8], after_premul: &[u8]) ->
 }
 
 fn encode_png(image: &DecodedImage) -> Option<Vec<u8>> {
-    let expected = (image.width as usize)
-        .checked_mul(image.height as usize)?
+    encode_png_rgba(image.width, image.height, &image.data, image.premultiplied)
+}
+
+fn encode_png_rgba(width: u32, height: u32, data: &[u8], premultiplied: bool) -> Option<Vec<u8>> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
         .checked_mul(4)?;
-    if image.width == 0 || image.height == 0 || image.data.len() != expected {
+    if width == 0 || height == 0 || data.len() != expected {
         return None;
     }
-    let data: Cow<'_, [u8]> = if image.premultiplied {
-        let mut d = image.data.clone();
+    let data: Cow<'_, [u8]> = if premultiplied {
+        let mut d = data.to_vec();
         unpremultiply(&mut d);
         Cow::Owned(d)
     } else {
-        Cow::Borrowed(&image.data)
+        Cow::Borrowed(data)
     };
     let mut png = Vec::new();
     image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(
-            &data,
-            image.width,
-            image.height,
-            image::ExtendedColorType::Rgba8,
-        )
+        .write_image(&data, width, height, image::ExtendedColorType::Rgba8)
         .ok()?;
     Some(png)
 }
@@ -7265,6 +7316,40 @@ mod tests {
         // paints land before truncation — and the document still closes.
         assert!(svg.matches("<path").count() < 100, "{svg}");
         assert!(svg.ends_with("</svg>\n"), "{svg}");
+    }
+
+    #[test]
+    fn inline_image_command_embeds_and_deduplicates_png() {
+        let mut dl = page();
+        let img = std::sync::Arc::new(zpdf_display_list::InlineImage {
+            width: 1,
+            height: 1,
+            data: vec![255, 0, 0, 255],
+            has_alpha: false,
+            is_image_mask: true,
+            premultiplied: true,
+        });
+        dl.push(RenderCommand::DrawInlineImage(InlineImageDraw {
+            image: std::sync::Arc::clone(&img),
+            transform: Matrix::scale(20.0, 20.0),
+            alpha: 1.0,
+        }));
+        dl.push(RenderCommand::DrawInlineImage(InlineImageDraw {
+            image: img,
+            transform: Matrix::translate(30.0, 0.0).concat(&Matrix::scale(20.0, 20.0)),
+            alpha: 1.0,
+        }));
+        let svg = to_svg(&dl);
+        assert_eq!(
+            svg.matches("<image ").count(),
+            1,
+            "shared Arc emits one def: {svg}"
+        );
+        assert_eq!(
+            svg.matches("<use ").count(),
+            2,
+            "both draws emit <use>: {svg}"
+        );
     }
 
     #[test]

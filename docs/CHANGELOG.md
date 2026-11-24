@@ -9,6 +9,16 @@
   carrying a single pre-interpreted cell `DisplayList`, `/BBox`, `/XStep`,
   `/YStep`, pattern-to-page matrix, and `/TilingType`. Downstream exhaustive
   matches on `Paint` must handle `Paint::Tiling`. (#155)
+- **Breaking:** `zpdf_display_list::DisplayList` now stores expanded semantic
+  glyph runs in a private field accessed via `DisplayList::expanded_glyph_runs`
+  and `DisplayList::push_expanded_glyph_run`; construct display lists with
+  `DisplayList::new` rather than struct literals. (#156)
+- **Breaking:** `zpdf_pptx_export::SlideElement` adds the `Opacity { element, alpha }`
+  wrapper variant (alongside `Transformed`) to preserve paint opacity on native
+  editable shapes and text via DrawingML `<a:alpha val="..."/>`. Exhaustive
+  matches on `SlideElement` must handle `SlideElement::Opacity` (unwrapping
+  `element` and multiplying its `alpha` onto inner paints); existing opaque
+  variant constructors are unchanged. (#156)
 
 ### Rendering and performance
 
@@ -25,6 +35,22 @@
   rasterizes clipped pattern fills/strokes into slide images, and rich
   conversion extracts tiling-cell images with bounded transformed placements.
   (#155)
+
+### Rendering and Type 3 fonts (`zpdf-content`, `zpdf-display-list`, `zpdf-pptx-export`, `zpdf-font`, `zpdf-document`)
+
+- Interpret Type 3 CharProc content streams directly in `ContentInterpreter`
+  with full resource resolution ordered glyph → font → parent (checking both
+  direct and indirect entries within each scope before advancing to parents,
+  preserving explicit inner font rebindings back to page fonts, and resolving
+  Form/Image XObjects, ExtGState, shadings, patterns, colour spaces,
+  properties, and nested fonts), honour `d0` (coloured glyph) vs `d1`
+  (uncoloured glyph locking colours to the enclosing text paint per ISO 32000-1
+  §9.6.5.4), emit the complete command set (including clips, blend groups,
+  shadings, and nested text) across all backends, deduplicate repeated Type 3
+  inline images keyed by colour/resource/intent/footprint, suspend table rule
+  capture during CharProcs, preserve semantic Type 3 runs on `DisplayList` so
+  `zpdf-pptx-export` keeps editable text without double-painting, and support
+  `/BaseEncoding` / named `/Encoding` on Type 3 fonts. (#156)
 
 ### Fonts (`zpdf-font`)
 

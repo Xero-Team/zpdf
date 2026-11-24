@@ -98,7 +98,7 @@ fn estimate_page_target_bytes(width: u32, height: u32, sample_count: u32) -> u64
 /// Unique image textures referenced by a page, including images nested in any
 /// soft-mask op list or rasterized dense tiling cell. Preserve first-use order
 /// for deterministic upload traces.
-fn referenced_image_ids(ops: &[PageOp], tiles: &[record::SyntheticTile]) -> Vec<u32> {
+fn referenced_image_ids(ops: &[PageOp], tiles: &[record::SyntheticTile]) -> Vec<record::ImageKey> {
     let mut ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![ops];
@@ -604,6 +604,31 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                     }
                 }
             }
+            RenderCommand::DrawInlineImage(draw) => {
+                let img = &draw.image;
+                if !image::is_valid_rgba_image(img.width, img.height, img.data.len()) {
+                    tracing::warn!(
+                        width = img.width,
+                        height = img.height,
+                        bytes = img.data.len(),
+                        "skipping malformed inline image"
+                    );
+                    return Ok(());
+                }
+                let quad = image::image_quad(
+                    img.width as f32,
+                    img.height as f32,
+                    &draw.transform,
+                    &page.map,
+                    draw.alpha,
+                );
+                if image::is_safe_quad(&quad) {
+                    page.recorder
+                        .add_inline_image(quad, std::sync::Arc::clone(img));
+                } else {
+                    tracing::warn!("skipping out-of-range inline image transform");
+                }
+            }
             RenderCommand::PushBlendGroup {
                 blend_mode,
                 isolated,
@@ -736,24 +761,27 @@ impl<'a> WgpuRenderer<'a> {
         };
         let mut uploadable_images = Vec::new();
         let mut image_texture_bytes = 0u64;
-        for image_id in referenced_images {
-            let Some(img) = lookup_image(image_id) else {
+        for image_key in referenced_images {
+            let dims = match image_key {
+                record::ImageKey::Cache(image_id) => lookup_image(image_id)
+                    .filter(|img| image::is_valid_decoded_image(img))
+                    .map(|img| (img.width, img.height)),
+                record::ImageKey::Inline(idx) => rec
+                    .inline_images
+                    .get(idx as usize)
+                    .filter(|img| image::is_valid_rgba_image(img.width, img.height, img.data.len()))
+                    .map(|img| (img.width, img.height)),
+            };
+            let Some((width, height)) = dims else {
                 continue;
             };
-            if !image::is_valid_decoded_image(img)
-                || img.width > ctx.max_texture_dim
-                || img.height > ctx.max_texture_dim
-            {
-                tracing::warn!(
-                    "image {image_id} {}x{} skipped (exceeds limits)",
-                    img.width,
-                    img.height
-                );
+            if width > ctx.max_texture_dim || height > ctx.max_texture_dim {
+                tracing::warn!("image {image_key:?} {width}x{height} skipped (exceeds limits)");
                 continue;
             }
             image_texture_bytes =
-                image_texture_bytes.saturating_add(img.width as u64 * img.height as u64 * 4);
-            uploadable_images.push(image_id);
+                image_texture_bytes.saturating_add(width as u64 * height as u64 * 4);
+            uploadable_images.push(image_key);
         }
         let mut tile_texture_bytes = 0u64;
         for tile in &synthetic_tiles {
@@ -878,11 +906,25 @@ impl<'a> WgpuRenderer<'a> {
             Some(glyph_atlas::upload_atlas_bind_group(ctx, &rec.glyph_atlas))
         };
 
-        let mut tex_bgs: std::collections::HashMap<u32, wgpu::BindGroup> =
+        let mut tex_bgs: std::collections::HashMap<record::ImageKey, wgpu::BindGroup> =
             std::collections::HashMap::new();
-        for image_id in uploadable_images {
-            if let Some(img) = lookup_image(image_id) {
-                tex_bgs.insert(image_id, image::upload_image_bind_group(ctx, img));
+        for image_key in uploadable_images {
+            match image_key {
+                record::ImageKey::Cache(image_id) => {
+                    if let Some(img) = lookup_image(image_id) {
+                        tex_bgs.insert(image_key, image::upload_image_bind_group(ctx, img));
+                    }
+                }
+                record::ImageKey::Inline(idx) => {
+                    if let Some(img) = rec.inline_images.get(idx as usize) {
+                        let pixels =
+                            image::premultiply_rgba_if_needed(&img.data, img.premultiplied);
+                        tex_bgs.insert(
+                            image_key,
+                            image::upload_rgba_bind_group(ctx, img.width, img.height, &pixels),
+                        );
+                    }
+                }
             }
         }
 
@@ -1141,7 +1183,7 @@ struct ReplayRes<'a> {
     bind_group: &'a wgpu::BindGroup,
     solid: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     tex: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
-    tex_bgs: &'a std::collections::HashMap<u32, wgpu::BindGroup>,
+    tex_bgs: &'a std::collections::HashMap<record::ImageKey, wgpu::BindGroup>,
     tile_bgs: &'a std::collections::HashMap<u32, wgpu::BindGroup>,
     tile_outputs: &'a [TileOutput],
     /// Glyph-atlas quad buffers, present iff any glyph took the atlas path.
@@ -1363,6 +1405,26 @@ fn record_dl_commands_at(
                     );
                     if image::is_safe_quad(&quad) {
                         rec.add_image(quad, draw.image_id);
+                    }
+                }
+            }
+            RenderCommand::DrawInlineImage(draw) => {
+                let img = &draw.image;
+                if image::is_valid_rgba_image(img.width, img.height, img.data.len()) {
+                    let transform = if *ctm == zpdf_core::Matrix::identity() {
+                        draw.transform
+                    } else {
+                        ctm.concat(&draw.transform)
+                    };
+                    let quad = image::image_quad(
+                        img.width as f32,
+                        img.height as f32,
+                        &transform,
+                        map,
+                        draw.alpha,
+                    );
+                    if image::is_safe_quad(&quad) {
+                        rec.add_inline_image(quad, std::sync::Arc::clone(img));
                     }
                 }
             }
@@ -4773,7 +4835,7 @@ mod resource_tests {
         assert_eq!(&img.data[img.data.len() - 4..], &[0, 0, 0, 0]);
         let ref_ids = referenced_image_ids(&rec.ops, &rec.synthetic_tiles);
         assert!(
-            ref_ids.contains(&record::TYPE3_IMAGE_ID_BASE),
+            ref_ids.contains(&record::ImageKey::Cache(record::TYPE3_IMAGE_ID_BASE)),
             "mask ops must reference the recorded Type 3 stencil image id, got {ref_ids:?}"
         );
     }
@@ -4845,7 +4907,7 @@ mod resource_tests {
             1,
             "all 9 occurrences must share a single Type 3 texture entry"
         );
-        let image_ops: Vec<u32> = rec
+        let image_ops: Vec<record::ImageKey> = rec
             .ops
             .iter()
             .filter_map(|op| match op {
@@ -4857,7 +4919,7 @@ mod resource_tests {
         assert!(
             image_ops
                 .iter()
-                .all(|&id| id == record::TYPE3_IMAGE_ID_BASE),
+                .all(|&id| id == record::ImageKey::Cache(record::TYPE3_IMAGE_ID_BASE)),
             "all 9 quads must reference the same cached texture ID"
         );
         // Verify distinct quad X positions and preserved per-quad opacity (128/255 ≈ 0.5).
@@ -4977,10 +5039,71 @@ mod resource_tests {
             "pure d0 colored image must draw directly without masking through tiling pattern"
         );
         assert!(
-            rec.ops
-                .iter()
-                .any(|op| matches!(op, record::PageOp::Image { image_id, .. } if *image_id == record::TYPE3_IMAGE_ID_BASE)),
+            rec.ops.iter().any(|op| matches!(
+                op,
+                record::PageOp::Image { image_id, .. }
+                    if *image_id == record::ImageKey::Cache(record::TYPE3_IMAGE_ID_BASE)
+            )),
             "d0 colored image must emit a direct PageOp::Image"
+        );
+    }
+
+    #[test]
+    fn inline_image_straight_alpha_matches_premultiplied_on_gpu() {
+        let straight = [128u8, 0, 0, 128];
+        let premul = [64u8, 0, 0, 128];
+        assert_eq!(
+            image::premultiply_rgba_if_needed(&straight, false).as_ref(),
+            &premul
+        );
+        assert_eq!(
+            image::premultiply_rgba_if_needed(&premul, true).as_ref(),
+            &premul
+        );
+
+        let make_dl = |data: Vec<u8>, premultiplied: bool| {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+            dl.push(RenderCommand::DrawInlineImage(
+                zpdf_display_list::InlineImageDraw {
+                    image: std::sync::Arc::new(zpdf_display_list::InlineImage {
+                        width: 1,
+                        height: 1,
+                        data,
+                        has_alpha: true,
+                        is_image_mask: false,
+                        premultiplied,
+                    }),
+                    transform: zpdf_core::Matrix::new(8.0, 0.0, 0.0, 8.0, 0.0, 0.0),
+                    alpha: 1.0,
+                },
+            ));
+            dl
+        };
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(WgpuRenderError::NoAdapter) => {
+                // Headless environment without a compatible GPU adapter: helper assertion above still ran.
+                return;
+            }
+            Err(err) => panic!("unexpected GPU adapter initialization error: {err}"),
+        };
+        let mut renderer = WgpuRenderer::new().with_context(ctx);
+        let straight_page = renderer
+            .render_display_list(&make_dl(straight.to_vec(), false), 1.0)
+            .expect("render straight-alpha inline image");
+        let premul_page = renderer
+            .render_display_list(&make_dl(premul.to_vec(), true), 1.0)
+            .expect("render premultiplied inline image");
+        let px_idx = ((4 * straight_page.width + 4) * 4) as usize;
+        assert_eq!(
+            &straight_page.data[px_idx..px_idx + 4],
+            &premul_page.data[px_idx..px_idx + 4],
+            "straight-alpha and premultiplied inline images must composite identically on white"
+        );
+        assert!(
+            straight_page.data[px_idx] <= 195 && straight_page.data[px_idx] >= 187,
+            "straight [128,0,0,128] on white should composite near [191,127,127], got {:?}",
+            &straight_page.data[px_idx..px_idx + 4]
         );
     }
 }
