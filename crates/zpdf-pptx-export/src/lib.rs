@@ -4873,7 +4873,7 @@ impl NonNormalBlendIndex {
                 RenderCommand::PushBlendGroup {
                     blend_mode,
                     isolated,
-                    knockout,
+                    knockout: _,
                     alpha,
                     mask,
                     bounds,
@@ -4976,7 +4976,12 @@ impl NonNormalBlendIndex {
                                     index.insert(idx, clip_rect);
                                 }
                             }
-                        } else if *isolated || *knockout || group_alpha < 1.0 || mask.is_some() {
+                        } else if *isolated
+                            || group_alpha <= 0.0
+                            || soft_mask_cache
+                                .analyze(mask.as_ref(), font_cache, stats)
+                                .is_proven_empty()
+                        {
                             isolated_normal_depth = 1;
                         }
                     } else {
@@ -6117,7 +6122,7 @@ fn command_uses_tiling_backdrop_depth(
     depth: u8,
 ) -> bool {
     if depth >= 16 {
-        return false;
+        return true;
     }
     match cmd {
         RenderCommand::FillPath {
@@ -6169,9 +6174,7 @@ fn group_uses_page_backdrop_depth(
             RenderCommand::PushBlendGroup {
                 blend_mode,
                 isolated,
-                knockout,
                 alpha,
-                mask,
                 ..
             } => {
                 if isolated_normal_depth == 0 {
@@ -6184,7 +6187,11 @@ fn group_uses_page_backdrop_depth(
                         isolated_normal_depth = 1;
                     } else if *blend_mode != zpdf_display_list::BlendMode::Normal {
                         return true;
-                    } else if *isolated || *knockout || group_alpha < 1.0 || mask.is_some() {
+                    } else if *isolated {
+                        // Only an isolated Normal group shields its children from
+                        // the enclosing backdrop; non-isolated translucent, masked,
+                        // or knockout Normal groups still composite inner blends
+                        // against the live backdrop (ISO 32000-1 §11.4.4).
                         isolated_normal_depth = 1;
                     }
                 } else {
@@ -22208,6 +22215,206 @@ mod export_tests {
             )
             .is_err(),
             "backdrop tiling pattern overlapping outline-less native text must return an error"
+        );
+    }
+
+    #[test]
+    fn tiling_with_translucent_non_isolated_multiply_group_preserves_blue_slide_backdrop() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, SoftMask, SoftMaskKind, TilingPattern};
+
+        // 1) Tile containing a 50%-opacity NON-ISOLATED Normal group with a white Multiply mark:
+        //    over opaque blue, Multiply(white, blue) == blue, so compositing at 50% opacity
+        //    must keep the slide pure blue (NOT lighten it toward [128, 128, 255]).
+        let mut cell_alpha = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell_alpha.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        cell_alpha.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut tile_rect = Path::new();
+        tile_rect.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell_alpha.push(RenderCommand::FillPath {
+            path: tile_rect.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell_alpha.push(RenderCommand::PopBlendGroup);
+        cell_alpha.push(RenderCommand::PopBlendGroup);
+
+        // 2) Tile containing a masked NON-ISOLATED Normal group with a white Multiply mark.
+        let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        mask_dl.push(RenderCommand::FillPath {
+            path: tile_rect.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut cell_mask = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell_mask.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: Some(SoftMask {
+                kind: SoftMaskKind::Alpha,
+                commands: Arc::new(mask_dl),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: None,
+            }),
+        });
+        cell_mask.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell_mask.push(RenderCommand::FillPath {
+            path: tile_rect,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell_mask.push(RenderCommand::PopBlendGroup);
+        cell_mask.push(RenderCommand::PopBlendGroup);
+
+        for (label, cell) in [("alpha_0_5", cell_alpha), ("soft_mask", cell_mask)] {
+            let tiling = Arc::new(TilingPattern {
+                commands: Arc::new(cell),
+                bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+                x_step: 20.0,
+                y_step: 20.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            });
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+            let mut bg = Path::new();
+            bg.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(RenderCommand::FillPath {
+                path: bg,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            let mut target = Path::new();
+            target.rect(Rect::new(20.0, 20.0, 80.0, 80.0));
+            dl.push(RenderCommand::FillPath {
+                path: target,
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(tiling),
+                alpha: 1.0,
+                overprint: None,
+            });
+
+            let slide = display_list_to_slide(
+                &dl,
+                0,
+                &FontCache::new(),
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+            .expect("slide export");
+            let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+            let center = comp.get_pixel(100, 100);
+            assert!(
+                center[0] < 10 && center[1] < 10 && center[2] > 245,
+                "PPTX tile with non-isolated {label} Normal group wrapping white Multiply over blue must stay pure blue, got {center:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_image_mask_with_white_multiply_tiling_preserves_blue_backdrop_on_slide() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let mask_bits: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff];
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /XObject << /MaskImg 5 0 R >> /Pattern << /P1 6 0 R >> >> >>"
+                .to_vec(),
+            stream(
+                "",
+                b"0 0 1 rg 0 0 100 100 re f /Pattern cs /P1 scn q 60 0 0 60 20 20 cm /MaskImg Do Q",
+            ),
+            stream(
+                "/Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 1 /ImageMask true",
+                &mask_bits,
+            ),
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+                 /Resources << /ExtGState << /GSM << /Type /ExtGState /BM /Multiply >> >> >>",
+                b"/GSM gs 1 1 1 rg 0 0 10 10 re f",
+            ),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let mut images = ImageCache::new();
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+        // Inside top painted half of stencil (page x=50, y=65 -> canvas x=100, y=70).
+        let px = comp.get_pixel(100, 70);
+        assert!(
+            px[0] < 10 && px[1] < 10 && px[2] > 245,
+            "PPTX slide image mask with white Multiply tiling over blue must stay blue, got {px:?}"
         );
     }
 }

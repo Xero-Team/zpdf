@@ -1122,8 +1122,9 @@ enum CachedFontBinding {
     CacheSlot(String, String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CachedType3ResourceScope {
+    scope_id: ResourceScopeId,
     parsed_resources: Option<std::sync::Arc<ResourceDict>>,
     font_bindings: Vec<CachedFontBinding>,
 }
@@ -5716,13 +5717,31 @@ impl<'a> ContentInterpreter<'a> {
             transfer: None,
         };
 
+        let mut tiling_paint: Option<std::sync::Arc<TilingPattern>> = None;
+        let non_isolated = match pat {
+            PatternPaint::Tiling { def, base_ctm } => {
+                let Some(tiling) =
+                    self.build_tiling_pattern_paint(def, *base_ctm, self.current.fill_color)
+                else {
+                    return false;
+                };
+                let dep = tiling.is_backdrop_dependent();
+                tiling_paint = Some(tiling);
+                dep
+            }
+            PatternPaint::Shading(_) => false,
+        };
+
         let cmd_mark = self.display_list.commands.len();
         let has_outer_group =
             self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some();
         if has_outer_group {
             self.display_list.push(RenderCommand::PushBlendGroup {
                 blend_mode: self.current.blend_mode,
-                isolated: true,
+                // Keep the live page backdrop available through the outer
+                // group when the tiling pattern depends on the backdrop
+                // (ISO 32000-1 §11.6.7).
+                isolated: !non_isolated,
                 knockout: false,
                 bounds: self.display_list.page_rect,
                 alpha: 1.0,
@@ -5731,22 +5750,45 @@ impl<'a> ContentInterpreter<'a> {
         }
         self.display_list.push(RenderCommand::PushBlendGroup {
             blend_mode: BlendMode::Normal,
-            isolated: true,
+            // A backdrop-dependent tiling pattern painted through an
+            // `/ImageMask true` stencil must evaluate against the live page
+            // backdrop rather than transparent black, applying stencil
+            // coverage and `fill_alpha` once on `PopBlendGroup`.
+            isolated: !non_isolated,
             knockout: false,
             bounds: self.display_list.page_rect,
             alpha: self.current.fill_alpha,
             mask: Some(stencil_mask),
         });
 
-        let saved_blend = std::mem::replace(&mut self.current.blend_mode, BlendMode::Normal);
-        let saved_soft_mask = self.current.soft_mask.take();
-        let saved_fill_alpha = std::mem::replace(&mut self.current.fill_alpha, 1.0);
-        let saved_stroke_alpha = std::mem::replace(&mut self.current.stroke_alpha, 1.0);
-        let painted = self.paint_pattern_in_region(pat, bounds);
-        self.current.blend_mode = saved_blend;
-        self.current.soft_mask = saved_soft_mask;
-        self.current.fill_alpha = saved_fill_alpha;
-        self.current.stroke_alpha = saved_stroke_alpha;
+        let painted = if let Some(tiling) = tiling_paint {
+            let mut rect_path = Path::new();
+            rect_path.rect(Rect::new(
+                bounds.x0.floor() - 1.0,
+                bounds.y0.floor() - 1.0,
+                bounds.x1.ceil() + 1.0,
+                bounds.y1.ceil() + 1.0,
+            ));
+            self.display_list.push(RenderCommand::FillPath {
+                path: rect_path,
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(tiling),
+                alpha: 1.0,
+                overprint: None,
+            });
+            true
+        } else {
+            let saved_blend = std::mem::replace(&mut self.current.blend_mode, BlendMode::Normal);
+            let saved_soft_mask = self.current.soft_mask.take();
+            let saved_fill_alpha = std::mem::replace(&mut self.current.fill_alpha, 1.0);
+            let saved_stroke_alpha = std::mem::replace(&mut self.current.stroke_alpha, 1.0);
+            let painted = self.paint_pattern_in_region(pat, bounds);
+            self.current.blend_mode = saved_blend;
+            self.current.soft_mask = saved_soft_mask;
+            self.current.fill_alpha = saved_fill_alpha;
+            self.current.stroke_alpha = saved_stroke_alpha;
+            painted
+        };
 
         if painted {
             self.display_list.push(RenderCommand::PopBlendGroup);
@@ -8257,6 +8299,7 @@ impl<'a> ContentInterpreter<'a> {
                 file,
             );
             let scope = std::sync::Arc::new(CachedType3ResourceScope {
+                scope_id: ResourceScopeId::ResourcesObject(*res_id),
                 parsed_resources,
                 font_bindings,
             });
@@ -8280,7 +8323,15 @@ impl<'a> ContentInterpreter<'a> {
             container_owner_id.map(InlineFontOwner::Container),
             file,
         );
+        let scope_id = match container_owner_id {
+            Some(owner_id) => ResourceScopeId::OwnerObject(owner_id),
+            None => {
+                self.next_resource_scope_id = self.next_resource_scope_id.wrapping_add(1);
+                ResourceScopeId::Unique(self.next_resource_scope_id)
+            }
+        };
         let scope = std::sync::Arc::new(CachedType3ResourceScope {
+            scope_id,
             parsed_resources,
             font_bindings,
         });
@@ -8456,9 +8507,7 @@ impl<'a> ContentInterpreter<'a> {
                 font_res_idx = Some(self.form_resources.len());
                 self.form_resources
                     .push((std::sync::Arc::clone(res), self.base_ctm));
-                self.next_resource_scope_id = self.next_resource_scope_id.wrapping_add(1);
-                self.form_resource_scopes
-                    .push(ResourceScopeId::Unique(self.next_resource_scope_id));
+                self.form_resource_scopes.push(scope.scope_id);
                 pushed_font_res = true;
             }
             if !scope.font_bindings.is_empty() {
@@ -8573,9 +8622,7 @@ impl<'a> ContentInterpreter<'a> {
                     if let Some(res) = glyph_meta.parsed_resources.as_ref() {
                         self.form_resources
                             .push((std::sync::Arc::clone(res), glyph_ctm));
-                        self.next_resource_scope_id = self.next_resource_scope_id.wrapping_add(1);
-                        self.form_resource_scopes
-                            .push(ResourceScopeId::Unique(self.next_resource_scope_id));
+                        self.form_resource_scopes.push(glyph_meta.scope_id);
                         pushed_glyph_res = true;
                     }
                     if !glyph_meta.font_bindings.is_empty() {
@@ -14858,5 +14905,121 @@ mod tests {
             subpath_count, 2,
             "12-unit segment with [4 4] dash must produce 2 separate dash contours"
         );
+    }
+
+    #[test]
+    fn repeated_type3_glyph_with_own_resources_reuses_cached_tiling_cell() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Type 3 font with:
+        // - Font-level inline /Resources << /Pattern << /PF 11 0 R >> >>
+        // - Glyph /A with its own inline /Resources << /Pattern << /PA 11 0 R >> >>
+        // - Glyph /B with an indirect /Resources 12 0 R
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"BT /F1 10 Tf 10 20 Td (AAAAAAAAAA) Tj 0 20 Td (BBBBBBBBBB) Tj 0 20 Td (CCCCCCCCCC) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] \
+              /FontMatrix [0.1 0 0 0.1 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 67 /Widths [10 10 10] \
+              /Resources << /Pattern << /PF 11 0 R >> >> >>"
+                .to_vec(), // 5
+            b"<< /A 8 0 R /B 9 0 R /C 10 0 R >>".to_vec(), // 6
+            b"<< /Type /Encoding /Differences [65 /A /B /C] >>".to_vec(), // 7
+            stream(
+                "/Resources << /Pattern << /PA 11 0 R >> >>",
+                b"10 0 d0 /Pattern cs /PA scn 0 0 10 10 re f",
+            ), // 8
+            stream(
+                "/Resources 12 0 R",
+                b"10 0 d0 /Pattern cs /PB scn 0 0 10 10 re f",
+            ), // 9
+            stream("", b"10 0 d0 /Pattern cs /PF scn 0 0 10 10 re f"), // 10
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 4 4] /XStep 4 /YStep 4 /Resources << >>",
+                b"1 0 0 rg 0 0 2 4 re f",
+            ), // 11
+            b"<< /Pattern << /PB 11 0 R >> >>".to_vec(), // 12
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let mut images = ImageCache::new();
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let (dl, _) = ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content);
+
+        let cells: Vec<std::sync::Arc<DisplayList>> = dl
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCommand::FillPath {
+                    paint: Paint::Tiling(t),
+                    ..
+                } => Some(std::sync::Arc::clone(&t.commands)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cells.len(), 30, "expected 10 each of A, B, and C");
+
+        // All 10 occurrences of A (glyph inline /Resources) must share one cell Arc.
+        for cell in &cells[1..10] {
+            assert!(
+                std::sync::Arc::ptr_eq(&cells[0], cell),
+                "repeated glyph A with inline /Resources must share cached tiling cell DisplayList"
+            );
+        }
+        // All 10 occurrences of B (glyph indirect /Resources) must share one cell Arc.
+        for cell in &cells[11..20] {
+            assert!(
+                std::sync::Arc::ptr_eq(&cells[10], cell),
+                "repeated glyph B with indirect /Resources must share cached tiling cell DisplayList"
+            );
+        }
+        // All 10 occurrences of C (font-level /Resources) must share one cell Arc.
+        for cell in &cells[21..30] {
+            assert!(
+                std::sync::Arc::ptr_eq(&cells[20], cell),
+                "repeated glyph C with font-level /Resources must share cached tiling cell DisplayList"
+            );
+        }
     }
 }

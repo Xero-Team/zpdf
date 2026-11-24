@@ -1530,21 +1530,41 @@ fn resolve_type3_image(
             return None;
         }
     };
-    *remaining = remaining.checked_sub(data.len() as u64)?;
+    let after_data = remaining.checked_sub(data.len() as u64)?;
     let dict = resolve_type3_image_metadata(file, &stream.dict);
+    let struct_bytes = std::mem::size_of::<zpdf_font::Type3ImageXObject>() as u64;
+    let dict_bytes = zpdf_font::estimated_pdf_dict_bytes_within(&dict, after_data)?;
+    *remaining = after_data.checked_sub(dict_bytes.checked_add(struct_bytes)?)?;
+
+    let box_sub_image = |sub_id: ObjectId,
+                         sub_stream: &zpdf_core::PdfStream,
+                         remaining: &mut u64,
+                         seen_images: &mut std::collections::HashMap<
+        ObjectId,
+        Arc<zpdf_font::Type3ImageXObject>,
+    >|
+     -> Option<Box<zpdf_font::Type3ImageXObject>> {
+        let was_cached = seen_images.contains_key(&sub_id);
+        let img = resolve_type3_image(file, sub_id, sub_stream, remaining, seen_images, depth + 1)?;
+        if was_cached {
+            // Boxing a previously cached image clones its owned dictionary.
+            let extra = zpdf_font::estimated_pdf_dict_bytes_within(&img.dict, *remaining)?
+                .checked_add(std::mem::size_of::<zpdf_font::Type3ImageXObject>() as u64)?;
+            *remaining = remaining.checked_sub(extra)?;
+        }
+        Some(Box::new((*img).clone()))
+    };
 
     let smask = stream.dict.get_ref("SMask").ok().and_then(|sm_id| {
         let sm_obj = file.resolve_shared(sm_id).ok()?;
         let sm_stream = sm_obj.as_stream().ok()?;
-        resolve_type3_image(file, sm_id, sm_stream, remaining, seen_images, depth + 1)
-            .map(|img| Box::new((*img).clone()))
+        box_sub_image(sm_id, sm_stream, remaining, seen_images)
     });
     let mask_stream = if smask.is_none() {
         stream.dict.get_ref("Mask").ok().and_then(|m_id| {
             let m_obj = file.resolve_shared(m_id).ok()?;
             let m_stream = m_obj.as_stream().ok()?;
-            resolve_type3_image(file, m_id, m_stream, remaining, seen_images, depth + 1)
-                .map(|img| Box::new((*img).clone()))
+            box_sub_image(m_id, m_stream, remaining, seen_images)
         })
     } else {
         None
@@ -1558,6 +1578,12 @@ fn resolve_type3_image(
     });
     seen_images.insert(obj_id, Arc::clone(&resolved));
     Some(resolved)
+}
+
+fn type3_map_entry_bytes<V>(name: &str) -> u64 {
+    (name.len() as u64).saturating_add(
+        ((std::mem::size_of::<(String, V)>() as u64).saturating_add(1)).saturating_mul(2),
+    )
 }
 
 fn resolve_type3_resources(
@@ -1576,13 +1602,17 @@ fn resolve_type3_resources(
     depth: u8,
 ) -> zpdf_font::Type3Resources {
     use std::sync::Arc;
-    if depth > 8 {
+    if depth > 8 || *remaining == 0 {
         return zpdf_font::Type3Resources::default();
     }
     let mut out = zpdf_font::Type3Resources::default();
 
     if let Some(xobj_dict) = resolve_dict(file, res_dict, "XObject") {
         for (name, obj) in &xobj_dict.0 {
+            let entry_cost = type3_map_entry_bytes::<zpdf_font::Type3XObject>(&name.0);
+            if *remaining < entry_cost {
+                continue;
+            }
             let PdfObject::Ref(id) = obj else {
                 continue;
             };
@@ -1594,15 +1624,20 @@ fn resolve_type3_resources(
             };
             match stream.dict.get_name("Subtype").unwrap_or_default() {
                 "Image" => {
+                    let saved_rem = *remaining;
+                    *remaining -= entry_cost;
                     if let Some(img) =
                         resolve_type3_image(file, *id, stream, remaining, seen_images, 0)
                     {
                         out.xobjects
                             .insert(name.0.clone(), zpdf_font::Type3XObject::Image(img));
+                    } else {
+                        *remaining = saved_rem;
                     }
                 }
                 "Form" => {
                     if let Some(cached) = seen_forms.get(id) {
+                        *remaining -= entry_cost;
                         out.xobjects.insert(
                             name.0.clone(),
                             zpdf_font::Type3XObject::Form(Arc::clone(cached)),
@@ -1612,19 +1647,30 @@ fn resolve_type3_resources(
                     if !active_forms.insert(*id) {
                         continue;
                     }
-                    let decoded = file.resolve_stream_data_with_limit(*id, *remaining);
+                    let saved_rem = *remaining;
+                    let after_entry = *remaining - entry_cost;
+                    let decoded = file.resolve_stream_data_with_limit(*id, after_entry);
                     if let Ok(data) = decoded {
-                        if let Some(next_rem) = remaining.checked_sub(data.len() as u64) {
-                            *remaining = next_rem;
-                            let mut form_dict = zpdf_core::PdfDict::new();
-                            for key in ["BBox", "Matrix", "Group"] {
-                                if let Some(v) = stream.dict.get(key) {
-                                    form_dict.insert(
-                                        zpdf_core::PdfName::new(key),
-                                        resolve_pdf_obj_shallow(file, v, 0),
-                                    );
-                                }
+                        let mut form_dict = zpdf_core::PdfDict::new();
+                        for key in ["BBox", "Matrix", "Group"] {
+                            if let Some(v) = stream.dict.get(key) {
+                                form_dict.insert(
+                                    zpdf_core::PdfName::new(key),
+                                    resolve_pdf_obj_shallow(file, v, 0),
+                                );
                             }
+                        }
+                        let struct_bytes =
+                            std::mem::size_of::<zpdf_font::Type3FormXObject>() as u64;
+                        let form_cost = after_entry
+                            .checked_sub(data.len() as u64)
+                            .and_then(|r| r.checked_sub(struct_bytes))
+                            .and_then(|r| {
+                                zpdf_font::estimated_pdf_dict_bytes_within(&form_dict, r)
+                                    .and_then(|dict_bytes| r.checked_sub(dict_bytes))
+                            });
+                        if let Some(next_rem) = form_cost {
+                            *remaining = next_rem;
                             let form_res =
                                 resolve_dict(file, &stream.dict, "Resources").and_then(|rd| {
                                     let r = resolve_type3_resources(
@@ -1646,6 +1692,8 @@ fn resolve_type3_resources(
                             seen_forms.insert(*id, Arc::clone(&form));
                             out.xobjects
                                 .insert(name.0.clone(), zpdf_font::Type3XObject::Form(form));
+                        } else {
+                            *remaining = saved_rem;
                         }
                     }
                     active_forms.remove(id);
@@ -1657,13 +1705,27 @@ fn resolve_type3_resources(
 
     if let Some(cs_dict) = resolve_dict(file, res_dict, "ColorSpace") {
         for (name, obj) in &cs_dict.0 {
-            out.color_spaces
-                .insert(name.0.clone(), resolve_pdf_obj_shallow(file, obj, 0));
+            let entry_cost = type3_map_entry_bytes::<PdfObject>(&name.0);
+            let Some(after_entry) = remaining.checked_sub(entry_cost) else {
+                continue;
+            };
+            let resolved = resolve_pdf_obj_shallow(file, obj, 0);
+            let Some(val_cost) =
+                zpdf_font::estimated_pdf_object_bytes_within(&resolved, after_entry)
+            else {
+                continue;
+            };
+            *remaining = after_entry - val_cost;
+            out.color_spaces.insert(name.0.clone(), resolved);
         }
     }
 
     if let Some(gs_dict) = resolve_dict(file, res_dict, "ExtGState") {
         for (name, obj) in &gs_dict.0 {
+            let entry_cost = type3_map_entry_bytes::<zpdf_core::PdfDict>(&name.0);
+            let Some(after_entry) = remaining.checked_sub(entry_cost) else {
+                continue;
+            };
             let resolved = match obj {
                 PdfObject::Ref(id) => file.resolve(*id).ok(),
                 other => Some(other.clone()),
@@ -1680,6 +1742,12 @@ fn resolve_type3_resources(
                         );
                     }
                 }
+                let Some(val_cost) =
+                    zpdf_font::estimated_pdf_dict_bytes_within(&inlined, after_entry)
+                else {
+                    continue;
+                };
+                *remaining = after_entry - val_cost;
                 out.ext_g_states.insert(name.0.clone(), inlined);
             }
         }
@@ -2276,5 +2344,63 @@ mod tests {
         let mut decoded = String::new();
         assert!(font.append_verified_type3_unicode(65, 1, &mut decoded));
         assert_eq!(decoded, "A");
+    }
+
+    #[test]
+    fn type3_loader_charges_retained_pdf_metadata_against_budget() {
+        // Type 3 font whose /Resources holds an /Indexed ColorSpace with a 4 KiB
+        // lookup string and an /ExtGState with a 256-entry dash array, but tiny
+        // stream bytes. Under a 1 KiB font cache budget, the loader must reject
+        // the oversized metadata instead of letting it bypass budget checks.
+        let big_lookup = "A".repeat(4096);
+        let big_dash = "1 ".repeat(256);
+        let font_obj = format!(
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] \
+               /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 3 0 R >> \
+               /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [10] \
+               /Resources << /ColorSpace << /CSBig [/Indexed /DeviceRGB 255 ({big_lookup})] >> \
+                             /ExtGState << /GSBig << /D [[{big_dash}] 0] >> >> >> >>"
+        );
+        let pdf = crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            &font_obj,
+            "<< /Length 6 >>\nstream\n1 0 d0\nendstream",
+        ]);
+
+        let small_limits = zpdf_core::ParseLimits {
+            max_font_cache_bytes: 1024,
+            ..Default::default()
+        };
+        let file = PdfFile::parse_with_limits(pdf.clone(), small_limits).expect("parse");
+        let font = load_single_font(&file, ObjectId(2, 0)).expect("load type3");
+        assert!(
+            font.type3_resources().is_none(),
+            "oversized ColorSpace/ExtGState metadata must be omitted under 1 KiB loader budget"
+        );
+        let base_est = font.estimated_cache_bytes();
+
+        // With a generous budget, both ColorSpace and ExtGState metadata load
+        // and are reflected in `estimated_cache_bytes()`.
+        let large_limits = zpdf_core::ParseLimits {
+            max_font_cache_bytes: 64 * 1024,
+            ..Default::default()
+        };
+        let file_big = PdfFile::parse_with_limits(pdf, large_limits).expect("parse");
+        let font_big = load_single_font(&file_big, ObjectId(2, 0)).expect("load type3");
+        let res = font_big
+            .type3_resources()
+            .expect("metadata must load within 64 KiB budget");
+        assert!(res.color_spaces.contains_key("CSBig"));
+        assert!(res.ext_g_states.contains_key("GSBig"));
+        let res_est = res.estimated_cache_bytes();
+        assert!(
+            res_est > 10_000,
+            "loaded metadata must be accounted for in Type3Resources::estimated_cache_bytes(), got {res_est}"
+        );
+        assert!(
+            font_big.estimated_cache_bytes() >= base_est + res_est,
+            "font estimated_cache_bytes ({}) must include Type3Resources metadata ({res_est} over base {base_est})",
+            font_big.estimated_cache_bytes()
+        );
     }
 }

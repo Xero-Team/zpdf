@@ -3869,3 +3869,171 @@ fn pdf_type3_nonuniform_4x1_tiling_stroke_preserves_anisotropic_widths_cpu_and_g
         }
     }
 }
+
+#[test]
+fn pdf_image_mask_with_white_multiply_tiling_preserves_blue_backdrop_cpu_and_gpu() {
+    // Real PDF with an opaque blue page background and an `/ImageMask true`
+    // stencil (both XObject `/MaskImg Do` and inline `BI /IM true ... EI`)
+    // painted with a white Multiply tiling pattern. Because Multiply(white, blue)
+    // == blue, pixels inside the stencil must stay pure blue (NOT white from
+    // isolating against transparent black). Also verifies a 50%-opaque red
+    // Multiply stencil darkens the top half once while leaving the bottom half
+    // untouched pure blue.
+    let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+        let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\nendstream");
+        out
+    };
+    let build_pdf = |page_stream: &[u8], tile_stream: &[u8]| -> Vec<u8> {
+        // 8×8 1-bpc `/ImageMask true`: top 4 rows painted (0x00), bottom 4 transparent (0xff).
+        let mask_bits: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff];
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 4 0 R \
+              /Resources << /XObject << /MaskImg 5 0 R >> /Pattern << /P1 6 0 R >> \
+              /ExtGState << /GS50 << /Type /ExtGState /ca 0.5 >> >> >> >>"
+                .to_vec(), // 3
+            stream("", page_stream),                       // 4
+            stream(
+                "/Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 1 /ImageMask true",
+                &mask_bits,
+            ), // 5
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+                 /Resources << /ExtGState << /GSM << /Type /ExtGState /BM /Multiply >> >> >>",
+                tile_stream,
+            ), // 6
+        ];
+        let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (idx, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        let count = objects.len() + 1;
+        pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    };
+
+    let inline_stencil_page = b"0 0 1 rg 0 0 40 40 re f /Pattern cs /P1 scn q 20 0 0 20 10 10 cm \
+          BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\xff\xff\xff\xff EI Q";
+    let xobj_stencil_page =
+        b"0 0 1 rg 0 0 40 40 re f /Pattern cs /P1 scn q 20 0 0 20 10 10 cm /MaskImg Do Q";
+    let xobj_half_alpha_page =
+        b"0 0 1 rg 0 0 40 40 re f /GS50 gs /Pattern cs /P1 scn q 20 0 0 20 10 10 cm /MaskImg Do Q";
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    // 1) White Multiply tile through both XObject and inline `/ImageMask true`
+    //    over opaque blue -> stencil pixels stay pure blue [0, 0, 255].
+    for (label, page_stream) in [
+        ("xobject_white_multiply", &xobj_stencil_page[..]),
+        ("inline_white_multiply", &inline_stencil_page[..]),
+    ] {
+        let doc =
+            zpdf::PdfDocument::open(build_pdf(page_stream, b"/GSM gs 1 1 1 rg 0 0 10 10 re f"))
+                .expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let mut images = zpdf_image::ImageCache::new();
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content);
+
+        let check = |backend: &str, data: &[u8], w: u32| {
+            // Stencil occupies page [10..30]×[10..30]; top half is pixel y=14, bottom half y=26.
+            let top = px(data, w, 20, 14);
+            let bot = px(data, w, 20, 26);
+            assert!(
+                top[0] < 10 && top[1] < 10 && top[2] > 245,
+                "{backend} ({label}) white Multiply through image stencil over blue must stay blue, got {top:?}"
+            );
+            assert!(
+                bot[0] < 10 && bot[1] < 10 && bot[2] > 245,
+                "{backend} ({label}) transparent half of stencil must stay blue, got {bot:?}"
+            );
+        };
+
+        let cpu = zpdf_render_cpu::CpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_images(&images)
+            .render_display_list(&dl, 1.0)
+            .expect("cpu render");
+        check("CPU", &cpu.data, cpu.width);
+
+        match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+            Ok(gpu) => check("GPU", &gpu.data, gpu.width),
+            Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+                eprintln!("skipping GPU image-mask backdrop test ({label}, no adapter)");
+            }
+            Err(e) => panic!("GPU image-mask backdrop test ({label}) failed: {e}"),
+        }
+    }
+
+    // 2) 50%-opaque red Multiply tile through `/ImageMask true` over opaque blue:
+    //    Multiply(red, blue) = black, blended at 50% opacity once -> [0, 0, ~128]
+    //    in top half, untouched [0, 0, 255] in bottom half.
+    {
+        let doc = zpdf::PdfDocument::open(build_pdf(
+            xobj_half_alpha_page,
+            b"/GSM gs 1 0 0 rg 0 0 10 10 re f",
+        ))
+        .expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let mut images = zpdf_image::ImageCache::new();
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content);
+
+        let check = |backend: &str, data: &[u8], w: u32| {
+            let top = px(data, w, 20, 14);
+            let bot = px(data, w, 20, 26);
+            assert!(
+                top[0] < 10 && top[1] < 10 && (118..=138).contains(&top[2]),
+                "{backend} 50% red Multiply through stencil over blue must yield [0,0,~128], got {top:?}"
+            );
+            assert!(
+                bot[0] < 10 && bot[1] < 10 && bot[2] > 245,
+                "{backend} transparent half of stencil must stay blue [0,0,255], got {bot:?}"
+            );
+        };
+
+        let cpu = zpdf_render_cpu::CpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_images(&images)
+            .render_display_list(&dl, 1.0)
+            .expect("cpu render");
+        check("CPU", &cpu.data, cpu.width);
+
+        match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+            Ok(gpu) => check("GPU", &gpu.data, gpu.width),
+            Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+                eprintln!("skipping GPU 50% red Multiply image-mask test (no adapter)");
+            }
+            Err(e) => panic!("GPU 50% red Multiply image-mask test failed: {e}"),
+        }
+    }
+}
