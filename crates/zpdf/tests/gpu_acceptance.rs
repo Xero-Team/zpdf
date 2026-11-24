@@ -2935,3 +2935,79 @@ fn gpu_type3_bitmap_glyph_tiling_preserves_silhouette() {
         "GPU Type 3 bitmap glyph transparent bottom half must remain white"
     );
 }
+
+#[test]
+fn gpu_type3_colored_inline_image_applies_text_opacity() {
+    use std::sync::Arc;
+    use zpdf::display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
+    use zpdf_core::{Matrix, Rect};
+    use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+    // 2×2 opaque red colored (non-mask, `/CS /RGB /BPC 8`) inline image CharProc.
+    let glyph_stream =
+        b"BI /W 2 /H 2 /CS /RGB /BPC 8 ID \xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00\x00 EI";
+    let font = LoadedFont::new_with_data(
+        PdfFontType::Type3 {
+            font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            char_procs: std::collections::HashMap::from([(
+                "A".into(),
+                Arc::<[u8]>::from(&glyph_stream[..]),
+            )]),
+            encoding: vec!["A".into()],
+            widths: vec![1.0],
+            first_char: 0,
+        },
+        "Type3ColoredInlineOpacityGpu".into(),
+        Vec::new(),
+        CidWidths::new(1.0),
+    );
+    let mut fonts = FontCache::new();
+    let font_id = fonts.insert("F1".into(), font);
+
+    let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+    dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 24.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 0,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 24.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 0.5,
+        overprint: None,
+        transform: Matrix::translate(8.0, 8.0),
+        h_scale: 1.0,
+    }));
+
+    let cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), None, 1.0) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skipping GPU Type 3 colored inline image opacity test (no adapter?): {e}");
+            return;
+        }
+    };
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let cpu_mid = px(&cpu.data, cpu.width, 20, 20);
+    let gpu_mid = px(&gpu.data, gpu.width, 20, 20);
+    // 50%-opacity opaque red over white = [255, ~128, ~128].
+    assert!(
+        cpu_mid[0] > 245 && (118..=138).contains(&cpu_mid[1]) && (118..=138).contains(&cpu_mid[2]),
+        "CPU 50%-opacity colored Type 3 inline image must be pink ~[255,128,128], got {cpu_mid:?}"
+    );
+    assert!(
+        gpu_mid[0] > 245 && (118..=138).contains(&gpu_mid[1]) && (118..=138).contains(&gpu_mid[2]),
+        "GPU 50%-opacity colored Type 3 inline image must apply text opacity (~[255,128,128], not opaque red), got {gpu_mid:?}"
+    );
+}

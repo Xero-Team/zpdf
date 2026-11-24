@@ -718,6 +718,64 @@ impl<'a> CpuRenderer<'a> {
         self
     }
 
+    /// Whether the active page exceeded its configured wall-clock render budget.
+    pub fn is_over_budget(&self) -> bool {
+        self.over_budget
+    }
+
+    /// Pixel dimensions of the active page raster (`None` before `begin_page`
+    /// or after `end_page`).
+    pub fn pixmap_dimensions(&self) -> Option<(u32, u32)> {
+        self.pixmap.as_ref().map(|p| (p.width(), p.height()))
+    }
+
+    /// Actual raster scale chosen by `begin_page` (after any page-pixel clamp).
+    pub fn actual_scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Copy premultiplied RGBA8 pixels from `[x0..x0+width] × [y0..y0+height]`
+    /// of the active page raster without ending the page.
+    pub fn copy_subrect(&self, x0: u32, y0: u32, width: u32, height: u32) -> Option<Vec<u8>> {
+        let pixmap = self.pixmap.as_ref()?;
+        let (pw, ph) = (pixmap.width(), pixmap.height());
+        if width == 0 || height == 0 || x0.checked_add(width)? > pw || y0.checked_add(height)? > ph
+        {
+            return None;
+        }
+        let row_bytes = (width as usize).checked_mul(4)?;
+        let total = row_bytes.checked_mul(height as usize)?;
+        let stride = (pw as usize).checked_mul(4)?;
+        let x_off = (x0 as usize).checked_mul(4)?;
+        let src = pixmap.data();
+        let mut out = vec![0u8; total];
+        for row in 0..height as usize {
+            let src_start = (y0 as usize + row) * stride + x_off;
+            let dst_start = row * row_bytes;
+            out[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&src[src_start..src_start + row_bytes]);
+        }
+        Some(out)
+    }
+
+    /// Replace the active page raster's pixels with `premul_rgba` (exact
+    /// dimensions required) and mark the whole raster dirty so subsequent blend
+    /// groups composite against the seeded backdrop.
+    pub fn seed_pixmap(&mut self, width: u32, height: u32, premul_rgba: &[u8]) -> bool {
+        let Some(pixmap) = self.pixmap.as_mut() else {
+            return false;
+        };
+        if pixmap.width() != width
+            || pixmap.height() != height
+            || premul_rgba.len() != pixmap.data().len()
+        {
+            return false;
+        }
+        pixmap.data_mut().copy_from_slice(premul_rgba);
+        self.dirty = Some(PaintedBounds::whole(width, height));
+        true
+    }
+
     /// The scale [`RenderBackend::render_display_list`] rasterizes a page of
     /// `page_rect` at when asked for `scale`: the request itself, or the
     /// reduced scale that fits this renderer's page-pixel budget. `None` when
@@ -3038,16 +3096,49 @@ impl<'a> CpuRenderer<'a> {
                 }
                 if let Some(b) = Self::page_path_bounds(path) {
                     let reach = match style.join {
-                        LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0),
-                        _ => std::f32::consts::SQRT_2,
+                        LineJoin::Miter => {
+                            if style.miter_limit.is_finite() {
+                                (style.miter_limit as f64).max(std::f64::consts::SQRT_2)
+                            } else {
+                                f64::INFINITY
+                            }
+                        }
+                        _ => std::f64::consts::SQRT_2,
                     };
-                    let pad = (style.width.max(1.0) as f64
-                        * 0.5
-                        * reach.max(std::f32::consts::SQRT_2) as f64)
-                        .max(0.5);
-                    let bounds =
-                        zpdf_core::Rect::new(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad);
-                    if renderer.render_tiling_direct(tiling, bounds) {
+                    let width = if style.width.is_finite() {
+                        style.width.max(1.0) as f64
+                    } else {
+                        f64::INFINITY
+                    };
+                    let pad = (width * 0.5 * reach).max(0.5);
+                    let region_rect = zpdf_core::Rect::new(
+                        renderer.rect_x0 as f64
+                            + (region.x0 as f64 + renderer.dev_origin_x as f64)
+                                / renderer.scale as f64,
+                        renderer.rect_y1 as f64
+                            - (region.y1 as f64 + renderer.dev_origin_y as f64)
+                                / renderer.scale_y as f64,
+                        renderer.rect_x0 as f64
+                            + (region.x1 as f64 + renderer.dev_origin_x as f64)
+                                / renderer.scale as f64,
+                        renderer.rect_y1 as f64
+                            - (region.y0 as f64 + renderer.dev_origin_y as f64)
+                                / renderer.scale_y as f64,
+                    );
+                    let bounds = if pad.is_finite() {
+                        zpdf_core::Rect::new(
+                            (b.x0 - pad).max(region_rect.x0),
+                            (b.y0 - pad).max(region_rect.y0),
+                            (b.x1 + pad).min(region_rect.x1),
+                            (b.y1 + pad).min(region_rect.y1),
+                        )
+                    } else {
+                        region_rect
+                    };
+                    if bounds.x1 > bounds.x0
+                        && bounds.y1 > bounds.y0
+                        && renderer.render_tiling_direct(tiling, bounds)
+                    {
                         return true;
                     }
                 }
@@ -6105,22 +6196,6 @@ impl<'a> CpuRenderer<'a> {
                 if rx1 <= rx0 || ry1 <= ry0 {
                     return;
                 }
-                let rw = rx1 - rx0;
-                let rh = ry1 - ry0;
-                // Bound scratch surface allocation to the blend surface budget.
-                let needed = (rw as u64).saturating_mul(rh as u64).saturating_mul(8);
-                if needed > MAX_BLEND_SURFACE_BYTES {
-                    return;
-                }
-                let (Some(mut mask_pix), Some(mut pat_pix)) = (
-                    tiny_skia::Pixmap::new(rw, rh),
-                    tiny_skia::Pixmap::new(rw, rh),
-                ) else {
-                    return;
-                };
-                // Rasterize stencil coverage into `mask_pix` shifted by (-rx0, -ry0).
-                // Note: `paint.shader` (Pattern) already carries `alpha_override`,
-                // so only `draw.alpha` modulates the stencil here.
                 let stencil_alpha = if draw.alpha.is_finite() {
                     draw.alpha.clamp(0.0, 1.0)
                 } else {
@@ -6129,8 +6204,128 @@ impl<'a> CpuRenderer<'a> {
                 if stencil_alpha <= 0.0 {
                     return;
                 }
-                let shift = tiny_skia::Transform::from_translate(-(rx0 as f32), -(ry0 as f32));
-                mask_pix.draw_pixmap(
+                self.render_type3_pattern_stencil_budgeted(
+                    src_ref,
+                    transform,
+                    footprint,
+                    rx0,
+                    ry0,
+                    rx1,
+                    ry1,
+                    stencil_alpha,
+                    paint,
+                    MAX_COVERAGE_BAND_BYTES,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Rasterize a Type 3 bitmap stencil masked through a `Shader::Pattern`
+    /// in horizontal/vertical bands sized to fit the remaining live surface
+    /// budget (`MAX_BLEND_SURFACE_BYTES - self.blend_surface_bytes`) so a
+    /// page-sized stencil on a large raster (e.g. 7,000 × 7,000) never exceeds
+    /// the 512 MiB ceiling.
+    #[allow(clippy::too_many_arguments)]
+    fn render_type3_pattern_stencil_budgeted(
+        &mut self,
+        src_ref: tiny_skia::PixmapRef<'_>,
+        transform: tiny_skia::Transform,
+        footprint: tiny_skia::Rect,
+        rx0: u32,
+        ry0: u32,
+        rx1: u32,
+        ry1: u32,
+        stencil_alpha: f32,
+        paint: &tiny_skia::Paint<'_>,
+        max_band_bytes: u64,
+    ) {
+        let Some((pw, _ph)) = self.pixmap.as_ref().map(|p| (p.width(), p.height())) else {
+            return;
+        };
+        let rw = rx1 - rx0;
+        let rh = ry1 - ry0;
+        if rw == 0 || rh == 0 {
+            return;
+        }
+        let max_live_avail = MAX_BLEND_SURFACE_BYTES.saturating_sub(self.blend_surface_bytes);
+        if max_live_avail < 8 {
+            tracing::warn!("type3 stencil scratch exceeds live surface memory budget");
+            return;
+        }
+        let band_budget = max_live_avail.min(max_band_bytes.max(8));
+        let max_band_pixels = (band_budget / 8).max(1);
+        let (band_w, band_h) = if (rw as u64) <= max_band_pixels {
+            (rw, (max_band_pixels / rw as u64).clamp(1, rh as u64) as u32)
+        } else {
+            (max_band_pixels.min(rw as u64) as u32, 1)
+        };
+
+        let mut src_paint = paint.clone();
+        src_paint.blend_mode = tiny_skia::BlendMode::Source;
+        src_paint.anti_alias = false;
+        let pw_usize = pw as usize;
+
+        let mut mask_pix: Option<tiny_skia::Pixmap> = None;
+        let mut pat_pix: Option<tiny_skia::Pixmap> = None;
+        let mut live_bytes: u64 = 0;
+        let mut any_painted = false;
+
+        'bands: for by0 in (ry0..ry1).step_by(band_h as usize) {
+            let by1 = (by0 + band_h).min(ry1);
+            let cur_h = by1 - by0;
+            for bx0 in (rx0..rx1).step_by(band_w as usize) {
+                if self.over_budget {
+                    break 'bands;
+                }
+                let bx1 = (bx0 + band_w).min(rx1);
+                let cur_w = bx1 - bx0;
+
+                let dims_match = mask_pix
+                    .as_ref()
+                    .is_some_and(|p| p.width() == cur_w && p.height() == cur_h)
+                    && pat_pix
+                        .as_ref()
+                        .is_some_and(|p| p.width() == cur_w && p.height() == cur_h);
+                if dims_match {
+                    if let Some(ref mut mp) = mask_pix {
+                        mp.data_mut().fill(0);
+                    }
+                    if let Some(ref mut pp) = pat_pix {
+                        pp.data_mut().fill(0);
+                    }
+                } else {
+                    mask_pix = None;
+                    pat_pix = None;
+                    self.blend_surface_bytes = self.blend_surface_bytes.saturating_sub(live_bytes);
+                    live_bytes = 0;
+                    let pair_bytes = cur_w as u64 * cur_h as u64 * 8;
+                    if !self.surface_room(pair_bytes) {
+                        tracing::warn!("type3 stencil band exceeds live surface memory budget");
+                        break 'bands;
+                    }
+                    let Some(mp) = tiny_skia::Pixmap::new(cur_w, cur_h) else {
+                        break 'bands;
+                    };
+                    let Some(pp) = tiny_skia::Pixmap::new(cur_w, cur_h) else {
+                        break 'bands;
+                    };
+                    self.blend_surface_bytes = self.blend_surface_bytes.saturating_add(pair_bytes);
+                    live_bytes = pair_bytes;
+                    mask_pix = Some(mp);
+                    pat_pix = Some(pp);
+                }
+
+                let (Some(ref mut mp), Some(ref mut pp)) = (mask_pix.as_mut(), pat_pix.as_mut())
+                else {
+                    break 'bands;
+                };
+
+                // Rasterize stencil coverage into `mp` shifted by (-bx0, -by0).
+                // Note: `paint.shader` (Pattern) already carries `alpha_override`,
+                // so only `draw.alpha` modulates the stencil here.
+                let shift = tiny_skia::Transform::from_translate(-(bx0 as f32), -(by0 as f32));
+                mp.draw_pixmap(
                     0,
                     0,
                     src_ref,
@@ -6143,27 +6338,23 @@ impl<'a> CpuRenderer<'a> {
                     None,
                 );
 
-                // Sample the pattern shader across [rx0..rx1]×[ry0..ry1].
-                let mut src_paint = paint.clone();
-                src_paint.blend_mode = tiny_skia::BlendMode::Source;
-                src_paint.anti_alias = false;
+                // Sample the pattern shader across [bx0..bx1]×[by0..by1].
                 if let Some(fill_rect) =
-                    tiny_skia::Rect::from_ltrb(rx0 as f32, ry0 as f32, rx1 as f32, ry1 as f32)
+                    tiny_skia::Rect::from_ltrb(bx0 as f32, by0 as f32, bx1 as f32, by1 as f32)
                 {
-                    pat_pix.fill_rect(fill_rect, &src_paint, shift, None);
+                    pp.fill_rect(fill_rect, &src_paint, shift, None);
                 }
 
                 // Modulate premultiplied pattern samples by stencil alpha (and active clip).
                 let clip_ref = self.current_clip.as_ref();
                 let clip_data = clip_ref.map(|m| m.data());
-                let pw_usize = pw as usize;
-                let rw_usize = rw as usize;
-                let (pat_px, _) = pat_pix.data_mut().as_chunks_mut::<4>();
-                let (mask_px, _) = mask_pix.data().as_chunks::<4>();
-                for y in 0..rh as usize {
-                    let row_off = y * rw_usize;
-                    let clip_row = (ry0 as usize + y) * pw_usize + rx0 as usize;
-                    for x in 0..rw_usize {
+                let cw_usize = cur_w as usize;
+                let (pat_px, _) = pp.data_mut().as_chunks_mut::<4>();
+                let (mask_px, _) = mp.data().as_chunks::<4>();
+                for y in 0..cur_h as usize {
+                    let row_off = y * cw_usize;
+                    let clip_row = (by0 as usize + y) * pw_usize + bx0 as usize;
+                    for x in 0..cw_usize {
                         let i = row_off + x;
                         let mut cov = mask_px[i][3];
                         if let Some(cd) = clip_data {
@@ -6182,9 +6373,9 @@ impl<'a> CpuRenderer<'a> {
 
                 if let Some(pixmap) = self.pixmap.as_mut() {
                     pixmap.draw_pixmap(
-                        rx0 as i32,
-                        ry0 as i32,
-                        pat_pix.as_ref(),
+                        bx0 as i32,
+                        by0 as i32,
+                        pp.as_ref(),
                         &tiny_skia::PixmapPaint {
                             opacity: 1.0,
                             blend_mode: paint.blend_mode,
@@ -6193,10 +6384,16 @@ impl<'a> CpuRenderer<'a> {
                         tiny_skia::Transform::identity(),
                         None,
                     );
+                    any_painted = true;
                 }
-                self.mark_painted(footprint, 1.0);
             }
-            _ => {}
+        }
+
+        drop(mask_pix);
+        drop(pat_pix);
+        self.blend_surface_bytes = self.blend_surface_bytes.saturating_sub(live_bytes);
+        if any_painted {
+            self.mark_painted(footprint, 1.0);
         }
     }
 
@@ -10026,5 +10223,117 @@ mod tests {
                 "{label}: interior must fully knock out prior blue sibling"
             );
         }
+    }
+
+    #[test]
+    fn type3_bitmap_pattern_stencil_bands_within_live_surface_budget() {
+        // 8×8 stencil: top half opaque, bottom half transparent.
+        let mut stencil = tiny_skia::Pixmap::new(8, 8).unwrap();
+        for y in 0..4 {
+            for x in 0..8 {
+                let off = ((y * 8 + x) * 4) as usize;
+                stencil.data_mut()[off..off + 4].copy_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+        // Two-color 4×4 repeating tile: left red, right blue.
+        let mut tile = tiny_skia::Pixmap::new(4, 4).unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                let off = ((y * 4 + x) * 4) as usize;
+                let px = if x < 2 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
+                tile.data_mut()[off..off + 4].copy_from_slice(&px);
+            }
+        }
+        let paint = tiny_skia::Paint {
+            shader: tiny_skia::Pattern::new(
+                tile.as_ref(),
+                tiny_skia::SpreadMode::Repeat,
+                tiny_skia::FilterQuality::Nearest,
+                1.0,
+                tiny_skia::Transform::identity(),
+            ),
+            ..Default::default()
+        };
+        let page_rect = Rect::new(0.0, 0.0, 32.0, 32.0);
+        let footprint = tiny_skia::Rect::from_ltrb(4.0, 4.0, 28.0, 28.0).unwrap();
+        let transform = tiny_skia::Transform::from_scale(3.0, 3.0).post_translate(4.0, 4.0);
+
+        let run = |extra_live_bytes: u64, max_band_bytes: u64| -> (Vec<u8>, u64) {
+            let mut r = CpuRenderer::new();
+            r.begin_page(&PageRenderInfo {
+                page_rect,
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+            // Active clip to exercise clip indexing across vertical and horizontal bands.
+            let mut clip = Path::new();
+            clip.rect(Rect::new(6.0, 6.0, 26.0, 26.0));
+            r.execute(&RenderCommand::PushClip {
+                path: clip,
+                rule: FillRule::NonZero,
+            })
+            .unwrap();
+            let base_bytes = r.blend_surface_bytes;
+            r.blend_surface_bytes = base_bytes.saturating_add(extra_live_bytes);
+            let before = r.blend_surface_bytes;
+            r.render_type3_pattern_stencil_budgeted(
+                stencil.as_ref(),
+                transform,
+                footprint,
+                4,
+                4,
+                28,
+                28,
+                0.75,
+                &paint,
+                max_band_bytes,
+            );
+            let after = r.blend_surface_bytes;
+            assert_eq!(
+                after, before,
+                "live blend_surface_bytes must be released after stencil banding"
+            );
+            r.blend_surface_bytes = base_bytes;
+            (r.end_page().unwrap().data, after)
+        };
+
+        let (full, _) = run(0, MAX_COVERAGE_BAND_BYTES);
+        // Tight vertical + horizontal banding via `max_band_bytes = 64` (8 px/band).
+        let (tight_band, _) = run(0, 64);
+        assert_eq!(
+            tight_band, full,
+            "banded Type 3 pattern stencil must match unbanded output pixel-for-pixel"
+        );
+
+        // Simulate a 7000×7000 page where remaining live surface budget is only
+        // 512 bytes (< full 24×24×8 = 4608 bytes): must still band and match!
+        let remaining = 512u64;
+        let page_bytes = 32u64 * 32 * 4;
+        let extra = MAX_BLEND_SURFACE_BYTES - page_bytes - remaining;
+        let (tight_live, _) = run(extra, MAX_COVERAGE_BAND_BYTES);
+        assert_eq!(
+            tight_live, full,
+            "stencil near MAX_BLEND_SURFACE_BYTES must band against remaining live room and match pixel-for-pixel"
+        );
+
+        // Sanity-check that the stencil actually painted the clipped top half and left
+        // the bottom half white.
+        let top_red = &full[((8 * 32 + 8) * 4) as usize..((8 * 32 + 8) * 4 + 4) as usize];
+        let top_blue = &full[((8 * 32 + 10) * 4) as usize..((8 * 32 + 10) * 4 + 4) as usize];
+        let bot_white = &full[((20 * 32 + 8) * 4) as usize..((20 * 32 + 8) * 4 + 4) as usize];
+        assert!(
+            top_red[0] > 240 && top_red[1] < 80 && top_red[2] < 80,
+            "{top_red:?}"
+        );
+        assert!(
+            top_blue[0] < 80 && top_blue[1] < 80 && top_blue[2] > 240,
+            "{top_blue:?}"
+        );
+        assert_eq!(bot_white, &[255, 255, 255, 255]);
     }
 }

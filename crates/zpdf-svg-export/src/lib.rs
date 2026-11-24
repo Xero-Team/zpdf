@@ -273,6 +273,13 @@ struct PatternDefKey {
     depth: u8,
 }
 
+/// Geometry target for [`SvgEmitter::emit_live_backdrop_direct_tiling_ops`].
+enum DirectTilingTarget<'a> {
+    Fill { d: &'a str, rule: &'a FillRule },
+    Stroke { d: &'a str, style: &'a StrokeStyle },
+    Type3Mask { shape_mask_id: u32 },
+}
+
 /// Cap on separate `(overlap_copy × blend_segment)` SVG passes for one
 /// overlapping affine backdrop-dependent tiling fill or stroke before
 /// collapsing into the order-preserving 3-seed affine filter fallback.
@@ -1501,6 +1508,18 @@ impl<'a> SvgWriter<'a> {
         })
     }
 
+    fn ops_has_normal(ops: &[TilingPlanOp]) -> bool {
+        ops.iter().any(|op| {
+            matches!(
+                op,
+                TilingPlanOp::Pattern {
+                    blend_mode: BlendMode::Normal,
+                    ..
+                }
+            )
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn collect_tiling_step_ops(
         &mut self,
@@ -2608,6 +2627,153 @@ impl<'a> SvgWriter<'a> {
         }
     }
 
+    /// Backdrop-aware O(1)-memory fallback used when `MAX_BACKDROP_FANOUT` or
+    /// the filter/snapshot budget is exhausted on a page with a live backdrop:
+    /// flushes any pending/disjoint backdrop and emits direct sibling leaf
+    /// elements with `mix-blend-mode` directly into `self.out` (no
+    /// `isolation:isolate`, no new `<use>` fan-out, and no `<filter>` buffers),
+    /// so every pass continues reading the live page backdrop.
+    fn emit_live_backdrop_direct_tiling_ops(
+        &mut self,
+        ops: &[TilingPlanOp],
+        target: DirectTilingTarget<'_>,
+        opacity: f32,
+    ) {
+        self.flush_pending_backdrop();
+        self.flush_disjoint_backdrop();
+
+        // Pre-match each `PushOpacityGroup` to its `PopOpacityGroup` so leaf
+        // elements inherit the enclosing group's alpha and soft mask without
+        // wrapping in an isolating `<g>`.
+        let mut push_info: HashMap<usize, (f32, Option<u32>)> = HashMap::new();
+        let mut open_pushes: Vec<usize> = Vec::new();
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                TilingPlanOp::PushOpacityGroup => open_pushes.push(i),
+                TilingPlanOp::PopOpacityGroup { alpha, mask_pat_id } => {
+                    if let Some(p) = open_pushes.pop() {
+                        push_info.insert(p, (*alpha, *mask_pat_id));
+                    }
+                }
+                TilingPlanOp::Pattern { .. } => {}
+            }
+        }
+
+        let base_mask = match target {
+            DirectTilingTarget::Fill { .. } | DirectTilingTarget::Stroke { .. } => self.stroke_mask,
+            DirectTilingTarget::Type3Mask { shape_mask_id } => Some(shape_mask_id),
+        };
+        let mut group_stack: Vec<(f32, Option<u32>)> = Vec::new();
+        let mut combined_masks: HashMap<Vec<u32>, u32> = HashMap::new();
+
+        for (idx, op) in ops.iter().enumerate() {
+            match op {
+                TilingPlanOp::PushOpacityGroup => {
+                    let info = push_info.get(&idx).copied().unwrap_or((1.0, None));
+                    group_stack.push(info);
+                }
+                TilingPlanOp::PopOpacityGroup { .. } => {
+                    group_stack.pop();
+                }
+                TilingPlanOp::Pattern { pat_id, blend_mode } => {
+                    let eff_alpha = group_stack
+                        .iter()
+                        .fold(opacity, |acc, (a, _)| acc * a.clamp(0.0, 1.0));
+                    if eff_alpha <= 0.0 {
+                        continue;
+                    }
+                    let pat_masks: Vec<u32> = group_stack.iter().filter_map(|(_, m)| *m).collect();
+                    let leaf_mask = if pat_masks.is_empty() {
+                        base_mask
+                    } else if let Some(&cached) = combined_masks.get(&pat_masks) {
+                        Some(cached)
+                    } else {
+                        // Chain each pattern alpha mask (starting from any base
+                        // luminance mask) so the leaf element carries one `<mask>`.
+                        let mut cur_mask = base_mask;
+                        for &m_pat_id in &pat_masks {
+                            let mid = self.fresh_id();
+                            let _ = write!(
+                                self.defs,
+                                "<mask id=\"m{mid}\" maskUnits=\"userSpaceOnUse\" style=\"mask-type:alpha\">"
+                            );
+                            if let Some(prev) = cur_mask {
+                                let _ = write!(self.defs, "<g mask=\"url(#m{prev})\">");
+                            }
+                            self.defs.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                            push_num(&mut self.defs, self.page_width);
+                            self.defs.push_str("\" height=\"");
+                            push_num(&mut self.defs, self.page_height);
+                            let _ = write!(self.defs, "\" fill=\"url(#p{m_pat_id})\"/>");
+                            if cur_mask.is_some() {
+                                self.defs.push_str("</g>");
+                            }
+                            self.defs.push_str("</mask>\n");
+                            cur_mask = Some(mid);
+                        }
+                        if let Some(mid) = cur_mask {
+                            combined_masks.insert(pat_masks, mid);
+                        }
+                        cur_mask
+                    };
+
+                    match target {
+                        DirectTilingTarget::Fill { d, rule } => {
+                            let _ = write!(self.out, "<path d=\"{d}\" fill=\"url(#p{pat_id})\"");
+                            if *rule == FillRule::EvenOdd {
+                                self.out.push_str(" fill-rule=\"evenodd\"");
+                            }
+                            push_opacity(&mut self.out, "fill-opacity", eff_alpha);
+                            if let Some(name) = blend_css(*blend_mode) {
+                                let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                            }
+                            if let Some(c) = self.clip {
+                                let _ = write!(self.out, " clip-path=\"url(#c{c})\"");
+                            }
+                            if let Some(m) = leaf_mask {
+                                let _ = write!(self.out, " mask=\"url(#m{m})\"");
+                            }
+                            self.out.push_str("/>\n");
+                        }
+                        DirectTilingTarget::Stroke { d, style } => {
+                            let _ = write!(
+                                self.out,
+                                "<path d=\"{d}\" fill=\"none\" stroke=\"url(#p{pat_id})\""
+                            );
+                            push_opacity(&mut self.out, "stroke-opacity", eff_alpha);
+                            if let Some(name) = blend_css(*blend_mode) {
+                                let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                            }
+                            push_stroke_attrs(&mut self.out, style, self.scale);
+                            if let Some(c) = self.clip {
+                                let _ = write!(self.out, " clip-path=\"url(#c{c})\"");
+                            }
+                            if let Some(m) = leaf_mask {
+                                let _ = write!(self.out, " mask=\"url(#m{m})\"");
+                            }
+                            self.out.push_str("/>\n");
+                        }
+                        DirectTilingTarget::Type3Mask { .. } => {
+                            self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                            push_num(&mut self.out, self.page_width);
+                            self.out.push_str("\" height=\"");
+                            push_num(&mut self.out, self.page_height);
+                            let _ = write!(self.out, "\" fill=\"url(#p{pat_id})\"");
+                            if let Some(m) = leaf_mask {
+                                let _ = write!(self.out, " mask=\"url(#m{m})\"");
+                            }
+                            push_opacity(&mut self.out, "fill-opacity", eff_alpha);
+                            if let Some(name) = blend_css(*blend_mode) {
+                                let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                            }
+                            self.out.push_str("/>\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Flush any open batch of backdrop-dependent filter steps into `self.out`
     /// (preserving any trailing elements already accumulated in `self.out` in
     /// exact painter's order). References `#b{bg_id}` only ONCE (zero
@@ -3328,6 +3494,17 @@ impl<'a> SvgWriter<'a> {
                         ) {
                             return;
                         }
+                        if self.non_isolated_filter_depth == 0
+                            && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                            && (opacity >= 1.0 || !Self::ops_has_normal(&ops))
+                        {
+                            self.emit_live_backdrop_direct_tiling_ops(
+                                &ops,
+                                DirectTilingTarget::Fill { d, rule },
+                                opacity,
+                            );
+                            return;
+                        }
                     }
 
                     // Bounded isolated single-opacity fallback (when there is no
@@ -3570,6 +3747,17 @@ impl<'a> SvgWriter<'a> {
                                     affected,
                                     affected,
                                 ) {
+                                    return;
+                                }
+                                if self.non_isolated_filter_depth == 0
+                                    && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                    && (opacity >= 1.0 || !Self::ops_has_normal(&ops))
+                                {
+                                    self.emit_live_backdrop_direct_tiling_ops(
+                                        &ops,
+                                        DirectTilingTarget::Stroke { d: &d, style },
+                                        opacity,
+                                    );
                                     return;
                                 }
                             }
@@ -4209,6 +4397,25 @@ impl<'a> SvgWriter<'a> {
                         affected,
                         affected,
                     ) {
+                        return;
+                    }
+                    if single_pattern.is_none()
+                        && self.non_isolated_filter_depth == 0
+                        && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                        && (opacity >= 1.0 || !Self::ops_has_normal(&ops))
+                    {
+                        let mask_id = self.fresh_id();
+                        let _ = write!(
+                            self.defs,
+                            "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
+                        );
+                        self.emit_live_backdrop_direct_tiling_ops(
+                            &ops,
+                            DirectTilingTarget::Type3Mask {
+                                shape_mask_id: mask_id,
+                            },
+                            opacity,
+                        );
                         return;
                     }
                     self.flush_pending_backdrop();
@@ -8198,6 +8405,138 @@ mod tests {
             outside.red() > 245 && outside.green() > 245 && outside.blue() > 245,
             "pixel inside triangle bbox but outside triangle must stay masked white, got {:?}",
             [outside.red(), outside.green(), outside.blue()]
+        );
+    }
+
+    #[test]
+    fn six_overlapping_dense_full_page_fills_preserve_live_backdrop_past_fanout_cap() {
+        // On an opaque Letter page (612×792), 5 overlapping dense (>64-pass)
+        // full-page fills exhaust `MAX_BACKDROP_FANOUT = 32` (`1 -> 2 -> 4 -> 8 -> 16 -> 32`).
+        // The 6th overlapping full-page fill (> full-page filter primitive budget)
+        // must keep the resource cap AND preserve the live backdrop instead of
+        // falling back to an isolated group (which would blend Darken(0.6)
+        // against transparent -> 0.6 and jump from 0.4 (~102) to 0.6 (~153)).
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 12.0, 12.0));
+        // 36 alternating Darken(0.6) + Lighten(0.4) pairs = 72 passes (> 64 flat
+        // threshold and > full-page Letter filter primitive budget of 138 prims).
+        for _ in 0..36 {
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Darken,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 12.0, 12.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 12.0, 12.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.6, 0.6, 0.6)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Lighten,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 12.0, 12.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 12.0, 12.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.4, 0.4, 0.4)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        // Finish with one extra Darken(0.6) so isolated evaluation against
+        // transparent would produce 0.6 (~153), whereas live-backdrop evaluation
+        // against 0.4 produces min(0.4, 0.6) = 0.4 (~102)!
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Darken,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 12.0, 12.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 12.0, 12.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.6, 0.6, 0.6)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 12.0, 12.0),
+            x_step: 12.0,
+            y_step: 12.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        // Dark gray (0.25) opaque backdrop over the whole Letter page.
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 612.0, 792.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.25, 0.25, 0.25)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        // 6 overlapping dense full-page fills!
+        for _ in 0..6 {
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 612.0, 792.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+                alpha: 1.0,
+                overprint: None,
+            });
+        }
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        // Fan-out cap must still limit `<g id="b...">` snapshots to <= 5 (2^5 = 32).
+        let bg_snapshots = svg.matches("<g id=\"b").count();
+        assert!(
+            bg_snapshots <= 5,
+            "backdrop snapshots must stay capped at MAX_BACKDROP_FANOUT (<= 5), got {bg_snapshots}"
+        );
+        // The 6th fill must NOT wrap in an isolated group.
+        assert!(
+            !svg.contains("isolation:isolate"),
+            "6th overlapping dense fill must use live-backdrop direct fallback, not isolation:isolate"
+        );
+
+        // Render downscaled (61×79) with resvg to verify live-backdrop result (~0.4 = 102).
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(61, 79).expect("pixmap");
+        let sx = 61.0 / tree.size().width();
+        let sy = 79.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let mid = pixmap.pixel(30, 40).expect("in bounds");
+        let rgb = [mid.red(), mid.green(), mid.blue()];
+        assert!(
+            rgb.iter().all(|&c| (96..=108).contains(&c)),
+            "6th overlapping dense full-page fill must stay at ~0.4 (~102), NOT jump to isolated 0.6 (~153), got {rgb:?}"
         );
     }
 }

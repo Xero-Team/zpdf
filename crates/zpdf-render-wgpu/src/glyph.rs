@@ -75,7 +75,7 @@ pub fn render_glyph_run_mask_and_bounds_transformed(
     } else {
         ctm.concat(&run.transform)
     };
-    render_glyph_run_colored(rec, fonts, map, run, &tm, [1.0, 1.0, 1.0, 1.0], true)
+    render_glyph_run_colored(rec, fonts, map, run, &tm, [1.0, 1.0, 1.0, 1.0], 1.0, true)
 }
 
 fn render_glyph_run_with_tm(
@@ -92,9 +92,15 @@ fn render_glyph_run_with_tm(
     if color[3] == 0.0 {
         return; // fully transparent — contributes nothing (CPU draws invisibly)
     }
-    let _ = render_glyph_run_colored(rec, fonts, map, run, tm, color, false);
+    let image_alpha = if run.alpha.is_finite() {
+        run.alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let _ = render_glyph_run_colored(rec, fonts, map, run, tm, color, image_alpha, false);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_glyph_run_colored(
     rec: &mut PageRecorder,
     fonts: &FontCache,
@@ -102,6 +108,7 @@ fn render_glyph_run_colored(
     run: &GlyphRun,
     tm: &Matrix,
     color: [f32; 4],
+    image_alpha: f32,
     track_bounds: bool,
 ) -> Option<zpdf_core::Rect> {
     let font = fonts.get(run.font_id)?;
@@ -110,7 +117,7 @@ fn render_glyph_run_colored(
     }
 
     if font.is_type3() {
-        render_type3(rec, font, run, tm, color, map, run.h_scale);
+        render_type3(rec, font, run, tm, color, image_alpha, map, run.h_scale);
         return None;
     }
 
@@ -342,12 +349,14 @@ fn build_outline_path(
 /// sub-display-list (same glyph_rect as the CPU), routing fills, strokes, and
 /// inline image masks (bitmap Type 3 stencils) transformed by FontMatrix.
 /// Mirrors `CpuRenderer::render_type3_glyphs`.
+#[allow(clippy::too_many_arguments)]
 fn render_type3(
     rec: &mut PageRecorder,
     font: &LoadedFont,
     run: &GlyphRun,
     tm: &Matrix,
     color: [f32; 4],
+    image_alpha: f32,
     map: &PageMap,
     h_scale: f32,
 ) {
@@ -452,7 +461,11 @@ fn render_type3(
                         }
                         (tinted, draw.alpha * a_scale)
                     } else {
-                        (src_img.clone(), draw.alpha)
+                        let eff_alpha = draw.alpha * image_alpha;
+                        if eff_alpha <= 0.0 {
+                            continue;
+                        }
+                        (src_img.clone(), eff_alpha)
                     };
                     let quad = crate::image::image_quad(
                         upload_img.width as f32,
@@ -827,5 +840,86 @@ mod tests {
     #[test]
     fn px_per_em_none_for_vanishing_size() {
         assert!(axis_aligned_px_per_em(&identity_tm(), 1.0, 0.0, 2.0).is_none());
+    }
+
+    #[test]
+    fn type3_colored_inline_image_applies_run_alpha_for_solid_and_keeps_full_alpha_for_mask() {
+        use std::sync::Arc;
+        use zpdf_display_list::{Color, PositionedGlyph};
+        use zpdf_font::{CidWidths, PdfFontType};
+
+        // 2×2 opaque red colored (`/CS /RGB /BPC 8`, non-mask) inline Type 3 image.
+        let glyph_stream =
+            b"BI /W 2 /H 2 /CS /RGB /BPC 8 ID \xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00\x00 EI";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    Arc::<[u8]>::from(&glyph_stream[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3ColoredUnit".into(),
+            Vec::new(),
+            CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+        let map = PageMap::new(zpdf_core::Rect::new(0.0, 0.0, 40.0, 40.0), 1.0);
+
+        let run = GlyphRun {
+            font_id,
+            font_size: 20.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 20.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 0.5,
+            overprint: None,
+            transform: Matrix::translate(10.0, 10.0),
+            h_scale: 1.0,
+        };
+
+        // 1) Solid text draw must multiply non-mask Type 3 image alpha by `run.alpha` (0.5).
+        let mut solid_rec = PageRecorder::default();
+        render_glyph_run(&mut solid_rec, &fonts, &map, &run);
+        assert!(
+            !solid_rec.tex_vertices.is_empty(),
+            "colored Type 3 inline image must emit textured quad vertices"
+        );
+        for v in &solid_rec.tex_vertices {
+            assert!(
+                (v.color[3] - 0.5).abs() < 1e-5,
+                "colored Type 3 inline image must carry run.alpha=0.5, got {}",
+                v.color[3]
+            );
+        }
+
+        // 2) Tiling coverage mask pass must keep image alpha at 1.0 so `run.alpha`
+        //    is not applied twice when compositing the mask.
+        let mut mask_rec = PageRecorder::default();
+        let _ = render_glyph_run_mask_and_bounds_transformed(
+            &mut mask_rec,
+            &fonts,
+            &map,
+            &run,
+            &Matrix::identity(),
+        );
+        assert!(!mask_rec.tex_vertices.is_empty());
+        for v in &mask_rec.tex_vertices {
+            assert!(
+                (v.color[3] - 1.0).abs() < 1e-5,
+                "mask pass must keep image alpha at 1.0, got {}",
+                v.color[3]
+            );
+        }
     }
 }
