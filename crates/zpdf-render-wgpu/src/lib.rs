@@ -1500,53 +1500,18 @@ fn record_tiling_pattern(
     if opacity <= 0.0 {
         return;
     }
-    let non_overlapping =
-        bbox.width() <= tiling.x_step.abs() + 1e-9 && bbox.height() <= tiling.y_step.abs() + 1e-9;
-    // When a translucent pattern fill (`alpha < 1`) contains top-level blend
-    // modes, wrapping all tiles in an isolated Normal group would hide the live
-    // page backdrop from those blend modes. Composite each non-overlapping
-    // segment directly onto the live destination with its own BlendMode instead.
-    if opacity < 1.0 && non_overlapping && tiling.is_backdrop_dependent() {
-        if let Some(segments) = tiling.blend_segments() {
-            for seg in &segments {
-                if !rec.can_record() {
-                    return;
-                }
-                let pushed = rec.can_push_blend();
-                if pushed {
-                    rec.push_blend(seg.blend_mode, opacity, None);
-                }
-                'seg_tiles: for j in j0..=j1 {
-                    for i in i0..=i1 {
-                        if !rec.can_record() {
-                            break 'seg_tiles;
-                        }
-                        let tile_ctm = pat_to_page.concat(&zpdf_core::Matrix::translate(
-                            i as f64 * tiling.x_step,
-                            j as f64 * tiling.y_step,
-                        ));
-                        record_dl_commands_at(
-                            rec,
-                            &seg.commands,
-                            &tile_ctm,
-                            fonts,
-                            images,
-                            map,
-                            depth + 1,
-                        );
-                    }
-                }
-                if pushed {
-                    rec.pop_blend();
-                }
-            }
-            return;
-        }
-    }
-
+    // When `opacity < 1`, apply the object's constant opacity ONCE to the
+    // finished pattern. Backdrop-dependent cells (ISO 32000-1 §11.6.7) must
+    // preserve the live destination backdrop while evaluating every mark at
+    // full outer opacity (`push_non_isolated_opacity`), whereas
+    // backdrop-independent cells can render into a clean transparent group.
     let wrap_alpha = opacity < 1.0 && rec.can_push_blend();
     if wrap_alpha {
-        rec.push_blend(zpdf_display_list::BlendMode::Normal, opacity, None);
+        if tiling.is_backdrop_dependent() {
+            rec.push_non_isolated_opacity(opacity);
+        } else {
+            rec.push_blend(zpdf_display_list::BlendMode::Normal, opacity, None);
+        }
     }
     'tiles: for j in j0..=j1 {
         for i in i0..=i1 {
@@ -1787,22 +1752,34 @@ fn record_tiling_pattern_rasterized(
 
     if tiling.is_backdrop_dependent() {
         if let Some(segments) = tiling.blend_segments() {
+            // Preserve the live backdrop across all segments while evaluating
+            // at opacity 1.0, then apply the object's constant opacity ONCE
+            // (ISO 32000-1 §11.6.7).
+            let wrap_alpha = opacity < 1.0 && rec.can_push_blend();
+            if wrap_alpha {
+                rec.push_non_isolated_opacity(opacity);
+            }
+            let seg_quad = if wrap_alpha { quad_opaque } else { quad_alpha };
+            let seg_alpha = if wrap_alpha { 1.0 } else { opacity };
             for (seg_idx, seg) in segments.iter().enumerate() {
                 if !rec.can_record() {
-                    return;
+                    break;
                 }
                 let Some(tile_id) = get_or_record_tile(rec, &seg.commands, seg_idx + 1) else {
                     continue;
                 };
                 if seg.blend_mode == zpdf_display_list::BlendMode::Normal {
-                    rec.add_tile(quad_alpha, tile_id);
+                    rec.add_tile(seg_quad, tile_id);
                 } else if rec.can_push_blend() {
-                    rec.push_blend(seg.blend_mode, opacity, None);
+                    rec.push_blend(seg.blend_mode, seg_alpha, None);
                     rec.add_tile(quad_opaque, tile_id);
                     rec.pop_blend();
                 } else {
-                    rec.add_tile(quad_alpha, tile_id);
+                    rec.add_tile(seg_quad, tile_id);
                 }
+            }
+            if wrap_alpha {
+                rec.pop_blend();
             }
             return;
         }
@@ -1989,6 +1966,80 @@ fn init_layer(
     stamp_clips(&mut pass, clips, res);
 }
 
+/// Initialize a non-isolated layer by copying `parent`'s current resolved
+/// pixels into `layer`, clearing stencil to 0, and re-stamping any active clips.
+#[allow(clippy::too_many_arguments)]
+fn init_layer_from_base(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    layer: &blend::RenderLayer,
+    parent: &blend::RenderLayer,
+    clips: &[record::ClipStamp],
+    res: &ReplayRes,
+    keep_bgs: &mut Vec<wgpu::BindGroup>,
+    keep_bufs: &mut Vec<wgpu::Buffer>,
+) {
+    use wgpu::util::DeviceExt;
+    const COPY_BASE_MODE: u32 = 101;
+    let device = &ctx.device;
+    let mode_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("zpdf-copy-base-mode"),
+        contents: bytemuck::cast_slice(&[
+            COPY_BASE_MODE,
+            1.0f32.to_bits(),
+            0u32,
+            0u32,
+            0u32,
+            0u32,
+            0u32,
+            0u32,
+        ]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let copy_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zpdf-copy-base-bg"),
+        layout: &ctx.pipelines.composite_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(parent.sampleable_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(parent.sampleable_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: mode_buf.as_entire_binding(),
+            },
+        ],
+    });
+    {
+        let mut pass = begin_layer_pass(
+            encoder,
+            layer,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            wgpu::LoadOp::Clear(0),
+        );
+        pass.set_bind_group(0, Some(res.bind_group), &[]);
+        if let (Some(fs), Some((svb, sib))) = (res.fs_range, res.solid) {
+            pass.set_pipeline(&ctx.pipelines.composite);
+            pass.set_bind_group(1, Some(&copy_bg), &[]);
+            pass.set_vertex_buffer(0, svb.slice(..));
+            pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_stencil_reference(0);
+            pass.draw_indexed(
+                fs.first_index..fs.first_index + fs.index_count,
+                fs.base_vertex,
+                0..1,
+            );
+        }
+        stamp_clips(&mut pass, clips, res);
+    }
+    keep_bgs.push(copy_bg);
+    keep_bufs.push(mode_buf);
+}
+
 /// Composite an op list (which may contain `PushBlend`/`PopBlend`) onto `base`,
 /// returning the layer index holding the final result. `base` must already be
 /// acquired and initialized (cleared, clips stamped); it is never recycled here.
@@ -1999,14 +2050,15 @@ fn init_layer(
 /// for sub-masks; `pool`, `encoder`, and the `keep_*` lifetimes are threaded
 /// through so every layer/bind-group outlives the single submit.
 /// One open transparency/overprint group on the composite stack: its blend
-/// mode, group alpha, optional soft mask, inherited clips, and optional
-/// overprint descriptor (mutually exclusive with a real blend/mask in practice).
+/// mode, group alpha, optional soft mask, inherited clips, optional overprint
+/// descriptor, and non-isolated opacity flag.
 type BlendFrame<'a> = (
     zpdf_display_list::BlendMode,
     f32,
     Option<&'a record::MaskOps>,
     Vec<record::ClipStamp>,
     Option<zpdf_display_list::Overprint>,
+    bool,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -2052,21 +2104,45 @@ fn composite_into(
                 clips,
                 mask,
                 overprint,
+                non_isolated,
             } => {
                 let g = pool.acquire(device)?;
-                init_layer(encoder, pool.get(g), wgpu::Color::TRANSPARENT, clips, res);
+                if *non_isolated {
+                    let parent = *active.last().unwrap_or(&base);
+                    init_layer_from_base(
+                        ctx,
+                        encoder,
+                        pool.get(g),
+                        pool.get(parent),
+                        clips,
+                        res,
+                        keep_bgs,
+                        keep_bufs,
+                    );
+                } else {
+                    init_layer(encoder, pool.get(g), wgpu::Color::TRANSPARENT, clips, res);
+                }
                 active.push(g);
-                blend_info.push((*mode, *alpha, mask.as_ref(), clips.clone(), *overprint));
+                blend_info.push((
+                    *mode,
+                    *alpha,
+                    mask.as_ref(),
+                    clips.clone(),
+                    *overprint,
+                    *non_isolated,
+                ));
             }
             PageOp::PopBlend => {
                 let group = active.pop().unwrap_or(base);
-                let (mode, alpha, mask, clips, overprint) = blend_info.pop().unwrap_or((
-                    zpdf_display_list::BlendMode::Normal,
-                    1.0,
-                    None,
-                    Vec::new(),
-                    None,
-                ));
+                let (mode, alpha, mask, clips, overprint, non_isolated) =
+                    blend_info.pop().unwrap_or((
+                        zpdf_display_list::BlendMode::Normal,
+                        1.0,
+                        None,
+                        Vec::new(),
+                        None,
+                        false,
+                    ));
                 let parent = *active.last().unwrap_or(&base);
 
                 // A soft mask pre-multiplies the group layer by per-pixel
@@ -2082,17 +2158,19 @@ fn composite_into(
 
                 let scratch = pool.acquire(device)?;
 
-                // Composite uniform (ModeU, 32 bytes): blend id + group alpha, or
-                // the overprint sentinel + source colorants/mask when overprinting.
+                // Composite uniform (ModeU, 32 bytes): blend id + group alpha,
+                // overprint sentinel + colorants, or non-isolated opacity lerp.
                 const OVERPRINT_MODE: u32 = 100;
-                let (id, alpha_bits, op_active, cmyk) = match overprint {
-                    Some(op) => (
+                const LERP_ALPHA_MODE: u32 = 102;
+                let (id, alpha_bits, op_active, cmyk) = match (overprint, non_isolated) {
+                    (Some(op), _) => (
                         OVERPRINT_MODE,
                         1.0f32.to_bits(),
                         op.active as u32,
                         op.cmyk.map(unit),
                     ),
-                    None => (
+                    (None, true) => (LERP_ALPHA_MODE, unit(alpha).to_bits(), 0u32, [0.0; 4]),
+                    (None, false) => (
                         blend::blend_index(mode),
                         unit(alpha).to_bits(),
                         0u32,
@@ -2894,6 +2972,77 @@ mod resource_tests {
             .iter()
             .any(|op| matches!(op, PageOp::Tile { tile_id: 0, .. })));
         assert!(rec.ops.iter().any(|op| matches!(op, PageOp::PopBlend)));
+    }
+
+    #[test]
+    fn translucent_dense_overlapping_multiply_wraps_once_in_non_isolated_opacity() {
+        let mut cell = zpdf_display_list::DisplayList::new(Rect::new(0.0, 0.0, 2.0, 2.0));
+        for _ in 0..2 {
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 2.0, 2.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            let mut sq = zpdf_display_list::Path::new();
+            sq.rect(Rect::new(0.0, 0.0, 2.0, 2.0));
+            cell.push(RenderCommand::FillPath {
+                path: sq,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        let tiling = zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 2.0, 2.0),
+            x_step: 2.0,
+            y_step: 2.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        };
+        let mut rec = PageRecorder::default();
+        let map = PageMap::new(Rect::new(0.0, 0.0, 130.0, 130.0), 1.0);
+        let id = zpdf_core::Matrix::identity();
+        record_tiling_pattern(
+            &mut rec,
+            &tiling,
+            &id,
+            Rect::new(0.0, 0.0, 130.0, 130.0),
+            0.5,
+            None,
+            None,
+            &map,
+            0,
+        );
+        // Outer wrapper applies 0.5 opacity ONCE non-isolated; both inner Multiply
+        // segments composite at full opacity 1.0 against the preserved backdrop.
+        assert!(matches!(
+            rec.ops.first(),
+            Some(PageOp::PushBlend {
+                non_isolated: true,
+                alpha,
+                ..
+            }) if (*alpha - 0.5).abs() < 1e-6
+        ));
+        let mul_alphas: Vec<f32> = rec
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                PageOp::PushBlend {
+                    mode: zpdf_display_list::BlendMode::Multiply,
+                    alpha,
+                    non_isolated: false,
+                    ..
+                } => Some(*alpha),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mul_alphas, vec![1.0, 1.0]);
     }
 }
 

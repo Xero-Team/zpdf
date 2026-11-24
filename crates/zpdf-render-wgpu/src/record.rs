@@ -92,6 +92,12 @@ pub enum PageOp {
         /// then merged per-colorant against the backdrop. `mode`/`alpha` are
         /// unused (Normal / 1.0).
         overprint: Option<Overprint>,
+        /// When true, the group is non-isolated: its layer starts as a copy of
+        /// the parent's current pixels (so blend modes / overprint inside read
+        /// the live backdrop), and `PopBlend` applies `alpha` ONCE to the
+        /// finished result via `mix(base, group, alpha)` (ISO 32000-1 §11.4.5
+        /// / §11.6.7 for `Normal` blend mode).
+        non_isolated: bool,
     },
     /// End the current group: composite it onto the parent with `mode` (carried by
     /// the matching PushBlend), then re-stamp `clips` into the resulting layer.
@@ -731,6 +737,35 @@ impl PageRecorder {
             clips,
             mask,
             overprint: None,
+            non_isolated: false,
+        });
+        self.blend_depth += 1;
+    }
+
+    /// Begin a non-isolated constant-opacity group (ISO 32000-1 §11.4.5 /
+    /// §11.6.7): the group layer is initialized with a copy of the live parent
+    /// backdrop so blend modes / overprint inside evaluate against the real
+    /// destination, and `PopBlend` applies `alpha` ONCE to the finished group
+    /// result via `mix(base, group, alpha)`.
+    pub fn push_non_isolated_opacity(&mut self, alpha: f32) {
+        if !self.can_push_blend() {
+            if self.skipped_blend_depth == 0 {
+                tracing::warn!(
+                    limit = self.max_blend_depth.unwrap_or(usize::MAX),
+                    "GPU blend-group nesting exceeds configured limit; using passthrough"
+                );
+            }
+            self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            return;
+        }
+        let clips = self.active_clips();
+        self.ops.push(PageOp::PushBlend {
+            mode: BlendMode::Normal,
+            alpha,
+            clips,
+            mask: None,
+            overprint: None,
+            non_isolated: true,
         });
         self.blend_depth += 1;
     }
@@ -756,6 +791,7 @@ impl PageRecorder {
             clips,
             mask: None,
             overprint: Some(op),
+            non_isolated: false,
         });
         self.blend_depth += 1;
     }

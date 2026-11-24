@@ -927,3 +927,146 @@ fn gpu_dense_tiling_multiply_preserves_backdrop_across_backgrounds() {
         "dense Multiply tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
     );
 }
+
+/// Regression (ISO 32000-1 §11.6.7): painting a tiling pattern at 50% object
+/// opacity (`/ca 0.5`) whose cell contains two overlapping opaque black
+/// `/BM /Multiply` fills must preserve the live backdrop while evaluating the
+/// cell and apply the 50% opacity ONCE (~128 over white, NOT ~64), across BOTH
+/// GPU replay paths (<= 4,096 vector tiles on the left; > 4,096 dense
+/// synthetic-tile segments on the right) and matching CPU.
+#[test]
+fn gpu_translucent_overlapping_multiply_tiling_applies_outer_opacity_once() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_half = b"<< /Type /ExtGState /ca 0.5 >>".to_vec();
+    // Vector path (left half 130×260 with 20×20 cell -> ~7×13 = 91 tiles <= 4,096).
+    let pat_vec = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs\n\
+          0 0 0 rg 0 0 10 20 re f\n\
+          0 0 0 rg 0 0 10 20 re f\n\
+          1 1 1 rg 10 0 10 20 re f",
+    );
+    // Dense synthetic-tile path (right half 130×260 with 2×2 cell -> 65×130 = 8,450 tiles > 4,096).
+    let pat_dense = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 2 2] /XStep 2 /YStep 2 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs\n\
+          0 0 0 rg 0 0 1 2 re f\n\
+          0 0 0 rg 0 0 1 2 re f\n\
+          1 1 1 rg 1 0 1 2 re f",
+    );
+    // Bottom half [0..130]: blue background; top half [130..260]: white background.
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 260 130 re f\n\
+          q /GH gs /Pattern cs /PV scn 0 0 130 260 re f Q\n\
+          q /GH gs /Pattern cs /PD scn 130 0 130 260 re f Q",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 260 260] /Contents 4 0 R \
+          /Resources << /Pattern << /PV 5 0 R /PD 6 0 R >> /ExtGState << /GH 8 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        pat_vec,                                       // 5
+        pat_dense,                                     // 6
+        gs_mul,                                        // 7
+        gs_half,                                       // 8
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU translucent overlapping Multiply test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+
+    assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+    let px = |data: &[u8], x: f64, y: f64| -> [u8; 3] {
+        let ix = (x * SCALE as f64) as u32;
+        let iy = ((260.0 - y) * SCALE as f64) as u32;
+        let off = ((iy * gpu.width + ix) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    // Left (GPU vector replay): overlapping black Multiply over white at 50% -> ~[128, 128, 128].
+    let vec_white = px(&gpu.data, 25.0, 200.0);
+    assert!(
+        vec_white.iter().all(|&c| (122..=134).contains(&c)),
+        "GPU vector overlapping Multiply over white at 50% should be ~128, got {vec_white:?}"
+    );
+    // Left (GPU vector replay): white Multiply over blue at 50% -> stays blue.
+    let vec_blue_id = px(&gpu.data, 35.0, 60.0);
+    assert!(
+        vec_blue_id[0] < 10 && vec_blue_id[1] < 10 && vec_blue_id[2] > 245,
+        "GPU vector white Multiply over blue at 50% must stay blue, got {vec_blue_id:?}"
+    );
+    // Left (GPU vector replay): overlapping black Multiply over blue at 50% -> ~[0, 0, 128].
+    let vec_blue = px(&gpu.data, 25.0, 60.0);
+    assert!(
+        vec_blue[0] < 10 && vec_blue[1] < 10 && (122..=134).contains(&vec_blue[2]),
+        "GPU vector overlapping Multiply over blue at 50% should be ~[0, 0, 128], got {vec_blue:?}"
+    );
+
+    // Right (GPU dense synthetic-tile segments): overlapping black Multiply over white at 50% -> ~[128, 128, 128].
+    let dense_white = px(&gpu.data, 140.5, 200.0);
+    assert!(
+        dense_white.iter().all(|&c| (122..=134).contains(&c)),
+        "GPU dense overlapping Multiply over white at 50% should be ~128, got {dense_white:?}"
+    );
+    // Right (GPU dense synthetic-tile segments): white Multiply over blue at 50% -> stays blue.
+    let dense_blue_id = px(&gpu.data, 141.5, 60.0);
+    assert!(
+        dense_blue_id[0] < 10 && dense_blue_id[1] < 10 && dense_blue_id[2] > 245,
+        "GPU dense white Multiply over blue at 50% must stay blue, got {dense_blue_id:?}"
+    );
+    // Right (GPU dense synthetic-tile segments): overlapping black Multiply over blue at 50% -> ~[0, 0, 128].
+    let dense_blue = px(&gpu.data, 140.5, 60.0);
+    assert!(
+        dense_blue[0] < 10 && dense_blue[1] < 10 && (122..=134).contains(&dense_blue[2]),
+        "GPU dense overlapping Multiply over blue at 50% should be ~[0, 0, 128], got {dense_blue:?}"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  translucent_overlapping_multiply_tiling: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "translucent overlapping Multiply tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}

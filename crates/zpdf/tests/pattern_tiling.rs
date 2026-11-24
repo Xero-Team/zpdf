@@ -1220,3 +1220,96 @@ fn tiling_cell_soft_mask_cache_distinguishes_line_dash_state() {
         "dashed soft mask must NOT reuse solid mask or leak blue ink in off-gap [8..16]",
     );
 }
+
+/// Regression (ISO 32000-1 §11.6.7): a tiling pattern painted with object
+/// opacity `< 1` (`ca = 0.5`) whose cell contains two overlapping opaque black
+/// `/BM /Multiply` fills must evaluate the cell at full opacity against the
+/// live backdrop and apply the object's 50% opacity ONCE (~128 over white, NOT
+/// ~64 from compounding 50% per segment/mark). Covers both the non-overlapping
+/// CPU segmented path and the overlapping CPU direct-replay path.
+#[test]
+fn tiling_cell_overlapping_multiply_applies_outer_opacity_once() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_half = b"<< /Type /ExtGState /ca 0.5 >>".to_vec();
+    // Two overlapping opaque black Multiply fills in [0..10], plus opaque white
+    // Multiply fill in [10..20] (identity on any backdrop).
+    let cell_body: &[u8] = b"/GM gs\n\
+        0 0 0 rg 0 0 10 20 re f\n\
+        0 0 0 rg 0 0 10 20 re f\n\
+        1 1 1 rg 10 0 10 20 re f";
+    // Non-overlapping cell -> CPU segmented tile path.
+    let pat_non_overlap = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        cell_body,
+    );
+    // Overlapping cell (`/BBox` wider than `/XStep`) -> CPU direct per-tile replay path.
+    let pat_overlap = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 24 20] /XStep 20 /YStep 20 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        cell_body,
+    );
+    // Top half (y in [100..200]): white page background.
+    // Bottom half (y in [0..100]): blue background.
+    // Paint non-overlapping pattern at 50% opacity on left [0..100],
+    // overlapping pattern at 50% opacity on right [100..200].
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 200 100 re f\n\
+          q /GH gs /Pattern cs /P1 scn 0 0 100 200 re f Q\n\
+          q /GH gs /Pattern cs /P2 scn 100 0 100 200 re f Q",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P1 5 0 R /P2 6 0 R >> /ExtGState << /GH 8 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        pat_non_overlap,                               // 5
+        pat_overlap,                                   // 6
+        gs_mul,                                        // 7
+        gs_half,                                       // 8
+    ]);
+    let page = render(pdf);
+
+    // Left (segmented path): overlapping black Multiply over white at 50% -> ~[128, 128, 128] (NOT ~64).
+    let seg_white = px(&page, 25.0, 150.0);
+    assert!(
+        seg_white.iter().all(|&c| (122..=134).contains(&c)),
+        "CPU segmented overlapping Multiply over white at 50% should be ~128, got {seg_white:?}"
+    );
+    // Left (segmented path): white Multiply over blue at 50% -> stays blue [0, 0, 255].
+    assert_rgbish(
+        px(&page, 35.0, 50.0),
+        [0, 0, 255],
+        "CPU segmented white Multiply over blue at 50% stays blue",
+    );
+    // Left (segmented path): overlapping black Multiply over blue at 50% -> ~[0, 0, 128].
+    let seg_blue = px(&page, 25.0, 50.0);
+    assert!(
+        seg_blue[0] < 8 && seg_blue[1] < 8 && (122..=134).contains(&seg_blue[2]),
+        "CPU segmented overlapping Multiply over blue at 50% should be ~[0, 0, 128], got {seg_blue:?}"
+    );
+
+    // Right (direct per-tile replay path): overlapping black Multiply over white at 50% -> ~[128, 128, 128].
+    let dir_white = px(&page, 125.0, 150.0);
+    assert!(
+        dir_white.iter().all(|&c| (122..=134).contains(&c)),
+        "CPU direct-replay overlapping Multiply over white at 50% should be ~128, got {dir_white:?}"
+    );
+    // Right (direct per-tile replay path): white Multiply over blue at 50% -> stays blue [0, 0, 255].
+    assert_rgbish(
+        px(&page, 135.0, 50.0),
+        [0, 0, 255],
+        "CPU direct-replay white Multiply over blue at 50% stays blue",
+    );
+    // Right (direct per-tile replay path): overlapping black Multiply over blue at 50% -> ~[0, 0, 128].
+    let dir_blue = px(&page, 125.0, 50.0);
+    assert!(
+        dir_blue[0] < 8 && dir_blue[1] < 8 && (122..=134).contains(&dir_blue[2]),
+        "CPU direct-replay overlapping Multiply over blue at 50% should be ~[0, 0, 128], got {dir_blue:?}"
+    );
+}

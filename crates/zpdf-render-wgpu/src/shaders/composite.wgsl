@@ -17,8 +17,17 @@ struct ModeU {
     op_cmyk: vec4<f32>,    // overprint: source colour as (C,M,Y,K) tints
 };
 
-// Sentinel `id` selecting the overprint composite instead of a blend mode.
+// Sentinel `id` values selecting special composites instead of a 16-mode blend:
+//  - OVERPRINT_MODE: PDF 8.6.7 naïve subtractive CMYK overprint.
+//  - COPY_BASE_MODE: copy `base_tex` verbatim into a fresh layer so a
+//    non-isolated opacity group (e.g. a translucent backdrop-dependent tiling
+//    pattern) starts from the live page backdrop.
+//  - LERP_ALPHA_MODE: apply the object's constant opacity ONCE to the finished
+//    non-isolated group result: `mix(base, group, mode.alpha)` (exact collapse
+//    of ISO 32000-1 §11.4.5 / §11.6.7 for Normal blend mode).
 const OVERPRINT_MODE: u32 = 100u;
+const COPY_BASE_MODE: u32 = 101u;
+const LERP_ALPHA_MODE: u32 = 102u;
 
 // Naïve subtractive CMYK ↔ sRGB, the mutually-inverse pair used for overprint
 // (matches zpdf_core::{rgb_to_cmyk_naive, cmyk_to_rgb_naive} on the CPU oracle).
@@ -146,10 +155,19 @@ fn non_separable(cb: vec3<f32>, cs: vec3<f32>, m: u32) -> vec3<f32> {
 @fragment
 fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(i32(in.clip_pos.x), i32(in.clip_pos.y));
+    let raw_g = textureLoad(group_tex, coord, 0);
+    let d = textureLoad(base_tex, coord, 0);  // backdrop (premultiplied)
+
+    if (mode.id == COPY_BASE_MODE) {
+        return d;
+    }
+    if (mode.id == LERP_ALPHA_MODE) {
+        return mix(d, raw_g, mode.alpha);
+    }
+
     // Source (premultiplied) scaled by the group constant alpha: scaling
     // premultiplied RGBA uniformly is exactly compositing the group at opacity α.
-    let s = textureLoad(group_tex, coord, 0) * mode.alpha;
-    let d = textureLoad(base_tex, coord, 0);  // backdrop (premultiplied)
+    let s = raw_g * mode.alpha;
 
     let as_ = s.a;
     let ab = d.a;
