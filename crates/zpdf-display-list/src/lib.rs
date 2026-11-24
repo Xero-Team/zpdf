@@ -636,7 +636,7 @@ pub struct ImageDraw {
 
 // -- Blend --
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BlendMode {
     #[default]
     Normal,
@@ -655,4 +655,28 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
+}
+
+impl BlendMode {
+    /// Return the standard PDF `/BM` name for this blend mode (ISO 32000-1 §11.3.5).
+    pub const fn pdf_name(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Multiply => "Multiply",
+            Self::Screen => "Screen",
+            Self::Overlay => "Overlay",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+            Self::ColorDodge => "ColorDodge",
+            Self::ColorBurn => "ColorBurn",
+            Self::HardLight => "HardLight",
+            Self::SoftLight => "SoftLight",
+            Self::Difference => "Difference",
+            Self::Exclusion => "Exclusion",
+            Self::Hue => "Hue",
+            Self::Saturation => "Saturation",
+            Self::Color => "Color",
+            Self::Luminosity => "Luminosity",
+        }
+    }
 }

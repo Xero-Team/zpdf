@@ -20,8 +20,30 @@
   remains in the bounded per-page tile cache and paints via
   `tiny_skia::Pattern` with `SpreadMode::Repeat`, handling negative steps,
   overlapping `/BBox > step`, and arbitrary pattern matrices; SVG export emits
-  deduplicated `<pattern>` definitions and wgpu replays tiles as a fallback.
+  deduplicated `<pattern>` definitions, wgpu replays tiles up to 4,096 cells and
+  repeats a GPU-rasterized cell texture above that cap, PowerPoint export
+  rasterizes clipped pattern fills/strokes into slide images, and rich
+  conversion extracts tiling-cell images with bounded transformed placements.
   (#155)
+
+### Fonts (`zpdf-font`)
+
+- Honour CFF 1.0 top-level and per-FD `FontMatrix` entries (including
+  nibble-encoded real operands and `FDSelect` formats 0 and 3) when extracting
+  CFF glyph outlines, transforming coordinates by the effective `FontMatrix`
+  normalized into `units_per_em` space (using the per-FD matrix directly when
+  the Top DICT omits `FontMatrix`, and guarding against extreme floating-point
+  overflow) so non-0.001, anisotropic, and sheared CFF/`CIDFontType0C` fonts
+  render at the correct scale and slant. (#160)
+
+### Authoring (`zpdf-writer`)
+
+- Add `PathPaintOptions`, re-exported `BlendMode`, `DocumentBuilder::add_path_with_options`,
+  and `DocumentBuilder::add_tagged_path_with_options` to support per-path fill
+  opacity (`/ca`), stroke opacity (`/CA`), and standard PDF blend modes (`/BM`,
+  including `BlendMode::Multiply`) via deduplicated `/ExtGState` resources
+  isolated inside per-path `q … Q` scopes, while keeping `PathStyle` and
+  `add_path` fully backward-compatible. (#196)
 
 ## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle
 
