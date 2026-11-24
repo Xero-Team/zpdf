@@ -1566,7 +1566,7 @@ fn record_tiling_pattern(
     depth: u8,
 ) {
     const MAX_GPU_TILES: i64 = 4096;
-    const MAX_TILING_DEPTH: u8 = 8;
+    const MAX_TILING_DEPTH: u8 = 16;
     if depth >= MAX_TILING_DEPTH || tiling.commands.commands.is_empty() || !rec.can_record() {
         return;
     }

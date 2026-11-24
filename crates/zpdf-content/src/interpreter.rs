@@ -130,10 +130,17 @@ pub struct ContentInterpreter<'a> {
     tiling_pattern_cache: HashMap<ObjectId, Option<std::sync::Arc<TilingPatternDef>>>,
     /// Pre-interpreted single-cell display lists for tiling patterns, keyed by
     /// `(pattern object id, uncolored scn tint, effective cell downscale,
-    /// enclosing resource scopes)`. Lets repeated fills in the same resource
-    /// scope share one `Arc<DisplayList>` (and lets backends cache one
-    /// rasterized tile pixmap across every shape).
-    tiling_cell_cache: HashMap<TilingCellKey, CachedTilingCell>,
+    /// enclosing resource scopes)`. Multiple variants per key are stored only
+    /// when the cell resolves an inherited pattern from an enclosing scope whose
+    /// relative transform differs across placements; self-contained cells share
+    /// a single `Arc<DisplayList>` across all placements.
+    tiling_cell_cache: HashMap<TilingCellKey, Vec<CachedTilingCell>>,
+    /// Total cached entries stored across all buckets of `tiling_cell_cache`.
+    tiling_cell_cache_entries: usize,
+    /// Per-active-tiling-cell stack tracking `(outer_form_resources_len, scopes)`
+    /// for inherited pattern lookups so cached cells record which enclosing
+    /// scope transforms they actually depend on.
+    tiling_inherited_pattern_scopes: Vec<(usize, Vec<InheritedPatternScope>)>,
     /// Commands retained in detached display lists (currently active outer
     /// display lists plus unique pre-interpreted tiling cells) that count
     /// against `max_commands` alongside `self.display_list.commands.len()`.
@@ -773,16 +780,30 @@ struct TilingCellKey {
     resource_scopes: Vec<ResourceScopeId>,
 }
 
+/// Which enclosing resource scope supplied a pattern resolved inside a tiling
+/// pattern cell (so `tiling_cell_cache` can verify relative scope transforms
+/// only for scopes the cell actually inherited from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InheritedPatternScope {
+    /// Page-level `/Resources`.
+    Page,
+    /// Index into the outer `form_resources` stack active when entering the cell.
+    EnclosingForm(usize),
+}
+
 /// Cached tiling-pattern cell along with the nesting depth its subtree consumed
-/// (at least 1 for the cell itself) so shallow draws never reuse a depth-capped
-/// fallback and deep draws never bypass `MAX_FORM_DEPTH`.
+/// (at least 1 for the cell itself) and the exact cell-space transforms of any
+/// enclosing scopes whose patterns were inherited by the cell body.
 struct CachedTilingCell {
     commands: std::sync::Arc<DisplayList>,
     subtree_depth: u32,
+    inherited_pattern_transforms: Vec<(InheritedPatternScope, [u64; 6])>,
 }
 
 /// Pre-interpreted tiling-pattern cells [`ContentInterpreter`] keeps per page.
 const MAX_CACHED_TILING_CELLS: usize = 256;
+/// Maximum distinct inherited-transform variants cached under one `TilingCellKey`.
+const MAX_CACHED_TILING_VARIANTS_PER_KEY: usize = 16;
 
 /// Wall-clock budget for interpreting a single page (see `deadline`). Generous
 /// for any real page (which interpret in well under a second); bounds
@@ -1464,6 +1485,8 @@ impl<'a> ContentInterpreter<'a> {
             form_content_cache: HashMap::new(),
             tiling_pattern_cache: HashMap::new(),
             tiling_cell_cache: HashMap::new(),
+            tiling_cell_cache_entries: 0,
+            tiling_inherited_pattern_scopes: Vec::new(),
             retained_detached_commands: 0,
             nesting_limit_hit: false,
             max_depth_reached: 0,
@@ -1781,14 +1804,18 @@ impl<'a> ContentInterpreter<'a> {
 
     /// Look a value up through the form-resources stack (innermost first),
     /// falling back to the page-level resources, and return the defining
-    /// scope's default `base_ctm` alongside the resource.
+    /// scope's default `base_ctm` and scope identity alongside the resource.
     fn lookup_res_with_base_ctm<T>(
         &self,
         get: impl Fn(&ResourceDict) -> Option<T>,
-    ) -> Option<(T, Matrix)> {
-        for (r, scope_base_ctm) in self.form_resources.iter().rev() {
+    ) -> Option<(T, Matrix, InheritedPatternScope)> {
+        for (idx, (r, scope_base_ctm)) in self.form_resources.iter().enumerate().rev() {
             if let Some(v) = get(r.as_ref()) {
-                return Some((v, *scope_base_ctm));
+                return Some((
+                    v,
+                    *scope_base_ctm,
+                    InheritedPatternScope::EnclosingForm(idx),
+                ));
             }
         }
         let page_ctm = if self.form_depth == 0 {
@@ -1796,13 +1823,30 @@ impl<'a> ContentInterpreter<'a> {
         } else {
             self.page_base_ctm
         };
-        self.resources.and_then(get).map(|v| (v, page_ctm))
+        self.resources
+            .and_then(get)
+            .map(|v| (v, page_ctm, InheritedPatternScope::Page))
+    }
+
+    /// Record that a pattern from `scope` was resolved, marking every currently
+    /// executing tiling cell whose enclosing scope contains `scope` so its cache
+    /// entry tracks that scope's relative transform.
+    fn record_tiling_inherited_pattern_scope(&mut self, scope: InheritedPatternScope) {
+        for (outer_scope_len, used) in &mut self.tiling_inherited_pattern_scopes {
+            let is_enclosing = match scope {
+                InheritedPatternScope::Page => true,
+                InheritedPatternScope::EnclosingForm(idx) => idx < *outer_scope_len,
+            };
+            if is_enclosing && !used.contains(&scope) {
+                used.push(scope);
+            }
+        }
     }
 
     /// Look a value up through the form-resources stack (innermost first),
     /// falling back to the page-level resources.
     fn lookup_res<T>(&self, get: impl Fn(&ResourceDict) -> Option<T>) -> Option<T> {
-        self.lookup_res_with_base_ctm(get).map(|(v, _)| v)
+        self.lookup_res_with_base_ctm(get).map(|(v, _, _)| v)
     }
 
     /// Resolve a `/ColorSpace` resource by name, checking both direct (inline)
@@ -3618,12 +3662,13 @@ impl<'a> ContentInterpreter<'a> {
         let Some(file) = self.file else {
             return (None, Color::gray(0.5));
         };
-        let Some((pat_id, scope_base_ctm)) =
+        let Some((pat_id, scope_base_ctm, pat_scope)) =
             self.lookup_res_with_base_ctm(|r| r.patterns.get(name).copied())
         else {
             tracing::debug!("pattern {name} not found in resources");
             return (None, Color::gray(0.5));
         };
+        self.record_tiling_inherited_pattern_scope(pat_scope);
         if let Some(def) = self.tiling_pattern_cache.get(&pat_id) {
             return (
                 def.clone().map(|def| PatternPaint::Tiling {
@@ -7272,73 +7317,6 @@ impl<'a> ContentInterpreter<'a> {
             return AnisotropicStroke::Fallback;
         }
 
-        let to_norm = |p: Point| -> Option<(f32, f32)> {
-            if !p.x.is_finite() || !p.y.is_finite() {
-                return None;
-            }
-            let nx = ((p.x - origin.x) * max_scale) as f32;
-            let ny = ((p.y - origin.y) * max_scale) as f32;
-            if !nx.is_finite()
-                || !ny.is_finite()
-                || nx.abs() > MAX_NORM_COORD
-                || ny.abs() > MAX_NORM_COORD
-            {
-                return None;
-            }
-            Some((nx, ny))
-        };
-
-        let mut pb = tiny_skia_path::PathBuilder::new();
-        let mut total_len = 0.0f64;
-        let mut cur: Option<(f32, f32)> = None;
-        let mut sub_start: Option<(f32, f32)> = None;
-        for elem in user_path {
-            match elem {
-                PathElement::MoveTo(p) => {
-                    let Some((nx, ny)) = to_norm(p) else {
-                        return AnisotropicStroke::Fallback;
-                    };
-                    pb.move_to(nx, ny);
-                    cur = Some((nx, ny));
-                    sub_start = Some((nx, ny));
-                }
-                PathElement::LineTo(p) => {
-                    let Some((nx, ny)) = to_norm(p) else {
-                        return AnisotropicStroke::Fallback;
-                    };
-                    if let Some((cx, cy)) = cur {
-                        total_len += ((nx - cx) as f64).hypot((ny - cy) as f64);
-                    }
-                    pb.line_to(nx, ny);
-                    cur = Some((nx, ny));
-                }
-                PathElement::CurveTo(c1, c2, end) => {
-                    let (Some((x1, y1)), Some((x2, y2)), Some((xe, ye))) =
-                        (to_norm(c1), to_norm(c2), to_norm(end))
-                    else {
-                        return AnisotropicStroke::Fallback;
-                    };
-                    if let Some((cx, cy)) = cur {
-                        total_len += ((x1 - cx) as f64).hypot((y1 - cy) as f64)
-                            + ((x2 - x1) as f64).hypot((y2 - y1) as f64)
-                            + ((xe - x2) as f64).hypot((ye - y2) as f64);
-                    }
-                    pb.cubic_to(x1, y1, x2, y2, xe, ye);
-                    cur = Some((xe, ye));
-                }
-                PathElement::Close => {
-                    if let (Some((cx, cy)), Some((sx, sy))) = (cur, sub_start) {
-                        total_len += ((sx - cx) as f64).hypot((sy - cy) as f64);
-                        cur = Some((sx, sy));
-                    }
-                    pb.close();
-                }
-            }
-        }
-        let Some(norm_path) = pb.finish() else {
-            return AnisotropicStroke::Empty;
-        };
-
         let skia_stroke = tiny_skia_path::Stroke {
             width: width_norm,
             miter_limit: if self.current.miter_limit.is_finite() && self.current.miter_limit >= 1.0
@@ -7360,33 +7338,145 @@ impl<'a> ContentInterpreter<'a> {
             dash: None,
         };
 
-        let dashed_path;
-        let source = if let Some(d) = self.current.dash.as_ref().filter(|d| {
-            !d.array.is_empty()
-                && d.phase.is_finite()
-                && d.array.iter().all(|v| v.is_finite() && *v >= 0.0)
-                && d.array.iter().any(|&v| v > 0.0)
-        }) {
-            let mut array: Vec<f32> = d
-                .array
-                .iter()
-                .map(|&v| (v as f64 * max_scale) as f32)
-                .collect();
-            if array.len() % 2 == 1 {
-                let len = array.len();
-                array.reserve(len);
-                for i in 0..len {
-                    array.push(array[i]);
+        let dash_spec = self
+            .current
+            .dash
+            .as_ref()
+            .filter(|d| {
+                !d.array.is_empty()
+                    && d.phase.is_finite()
+                    && d.array.iter().all(|v| v.is_finite() && *v >= 0.0)
+                    && d.array.iter().any(|&v| v > 0.0)
+            })
+            .map(|d| {
+                let mut user_array: Vec<f64> = d.array.iter().map(|&v| v as f64).collect();
+                if user_array.len() % 2 == 1 {
+                    let len = user_array.len();
+                    user_array.reserve(len);
+                    for i in 0..len {
+                        user_array.push(user_array[i]);
+                    }
+                }
+                let period_user: f64 = user_array.iter().sum();
+                let norm_array: Vec<f32> =
+                    user_array.iter().map(|&v| (v * max_scale) as f32).collect();
+                let period_norm: f64 = norm_array.iter().map(|&v| v as f64).sum();
+                let phase_user = if period_user.is_finite() && period_user > 0.0 {
+                    (d.phase as f64).rem_euclid(period_user)
+                } else {
+                    0.0
+                };
+                (norm_array, period_norm, period_user, phase_user)
+            });
+
+        let to_norm = |p: Point| -> Option<(f32, f32)> {
+            if !p.x.is_finite() || !p.y.is_finite() {
+                return None;
+            }
+            let nx = ((p.x - origin.x) * max_scale) as f32;
+            let ny = ((p.y - origin.y) * max_scale) as f32;
+            if !nx.is_finite()
+                || !ny.is_finite()
+                || nx.abs() > MAX_NORM_COORD
+                || ny.abs() > MAX_NORM_COORD
+            {
+                return None;
+            }
+            Some((nx, ny))
+        };
+
+        let mut pb = tiny_skia_path::PathBuilder::new();
+        let mut total_len = 0.0f64;
+        let mut exceeded_norm_coord = false;
+        let mut cur: Option<(f32, f32)> = None;
+        let mut sub_start: Option<(f32, f32)> = None;
+        for elem in user_path {
+            match elem {
+                PathElement::MoveTo(p) => {
+                    let Some((nx, ny)) = to_norm(p) else {
+                        exceeded_norm_coord = true;
+                        break;
+                    };
+                    pb.move_to(nx, ny);
+                    cur = Some((nx, ny));
+                    sub_start = Some((nx, ny));
+                }
+                PathElement::LineTo(p) => {
+                    let Some((nx, ny)) = to_norm(p) else {
+                        exceeded_norm_coord = true;
+                        break;
+                    };
+                    if let Some((cx, cy)) = cur {
+                        total_len += ((nx - cx) as f64).hypot((ny - cy) as f64);
+                    }
+                    pb.line_to(nx, ny);
+                    cur = Some((nx, ny));
+                }
+                PathElement::CurveTo(c1, c2, end) => {
+                    let (Some((x1, y1)), Some((x2, y2)), Some((xe, ye))) =
+                        (to_norm(c1), to_norm(c2), to_norm(end))
+                    else {
+                        exceeded_norm_coord = true;
+                        break;
+                    };
+                    if let Some((cx, cy)) = cur {
+                        total_len += ((x1 - cx) as f64).hypot((y1 - cy) as f64)
+                            + ((x2 - x1) as f64).hypot((y2 - y1) as f64)
+                            + ((xe - x2) as f64).hypot((ye - y2) as f64);
+                    }
+                    pb.cubic_to(x1, y1, x2, y2, xe, ye);
+                    cur = Some((xe, ye));
+                }
+                PathElement::Close => {
+                    if let (Some((cx, cy)), Some((sx, sy))) = (cur, sub_start) {
+                        total_len += ((sx - cx) as f64).hypot((sy - cy) as f64);
+                        cur = Some((sx, sy));
+                    }
+                    pb.close();
                 }
             }
-            let period: f64 = array.iter().map(|&v| v as f64).sum();
-            if period.is_finite()
-                && period > 1e-4
-                && array.iter().all(|v| v.is_finite())
-                && total_len / period <= MAX_DASH_REPEATS
+        }
+
+        if let Some((ref array, period_norm, period_user, phase_user)) = dash_spec {
+            let valid_macro_dash = period_norm.is_finite()
+                && period_norm > 1e-4
+                && period_user.is_finite()
+                && period_user > 0.0
+                && array.iter().all(|v| v.is_finite());
+            if valid_macro_dash
+                && (exceeded_norm_coord || total_len / period_norm > MAX_DASH_REPEATS)
             {
-                let mut phase = (d.phase as f64 * max_scale).rem_euclid(period) as f32;
-                if !phase.is_finite() || phase >= period as f32 {
+                // Limit expansion to the visible clipped span while advancing
+                // dash phase across skipped off-page prefixes (never silently
+                // turning a long clipped dashed line solid).
+                return self.expand_clipped_anisotropic_dashed_stroke(
+                    user_path,
+                    max_scale,
+                    &skia_stroke,
+                    array,
+                    period_norm,
+                    period_user,
+                    phase_user,
+                    RES_SCALE,
+                    MAX_NORM_COORD,
+                    MAX_DASH_REPEATS,
+                );
+            }
+        }
+
+        if exceeded_norm_coord {
+            return AnisotropicStroke::Fallback;
+        }
+        let Some(norm_path) = pb.finish() else {
+            return AnisotropicStroke::Empty;
+        };
+
+        let dashed_path;
+        let source = if let Some((array, period_norm, _, phase_user)) = dash_spec {
+            if period_norm.is_finite() && period_norm > 1e-4 && array.iter().all(|v| v.is_finite())
+            {
+                let mut phase = (phase_user * max_scale).rem_euclid(period_norm) as f32;
+                if !phase.is_finite() || phase >= period_norm as f32 {
                     phase = 0.0;
                 }
                 if let Some(skia_dash) = tiny_skia_path::StrokeDash::new(array, phase) {
@@ -7419,22 +7509,37 @@ impl<'a> ContentInterpreter<'a> {
             ctm.b * origin.x + ctm.d * origin.y + ctm.f,
         );
         let mut out = Path::new();
+        if !Self::append_transformed_skia_path(&stroked, &ctm_post, &mut out) {
+            return AnisotropicStroke::Fallback;
+        }
+        if out.is_empty() {
+            AnisotropicStroke::Empty
+        } else {
+            AnisotropicStroke::Outline(out)
+        }
+    }
+
+    fn append_transformed_skia_path(
+        stroked: &tiny_skia_path::Path,
+        ctm_post: &Matrix,
+        out: &mut Path,
+    ) -> bool {
         let mut last = Point::zero();
         for seg in stroked.segments() {
             match seg {
                 tiny_skia_path::PathSegment::MoveTo(p) => {
                     last = Point::new(p.x as f64, p.y as f64);
-                    let mapped = last.transform(&ctm_post);
+                    let mapped = last.transform(ctm_post);
                     if !mapped.x.is_finite() || !mapped.y.is_finite() {
-                        return AnisotropicStroke::Fallback;
+                        return false;
                     }
                     out.move_to(mapped);
                 }
                 tiny_skia_path::PathSegment::LineTo(p) => {
                     last = Point::new(p.x as f64, p.y as f64);
-                    let mapped = last.transform(&ctm_post);
+                    let mapped = last.transform(ctm_post);
                     if !mapped.x.is_finite() || !mapped.y.is_finite() {
-                        return AnisotropicStroke::Fallback;
+                        return false;
                     }
                     out.line_to(mapped);
                 }
@@ -7445,37 +7550,306 @@ impl<'a> ContentInterpreter<'a> {
                         last.x + (2.0 / 3.0) * (q1.x - last.x),
                         last.y + (2.0 / 3.0) * (q1.y - last.y),
                     )
-                    .transform(&ctm_post);
+                    .transform(ctm_post);
                     let c2 = Point::new(
                         q2.x + (2.0 / 3.0) * (q1.x - q2.x),
                         q2.y + (2.0 / 3.0) * (q1.y - q2.y),
                     )
-                    .transform(&ctm_post);
-                    let end = q2.transform(&ctm_post);
+                    .transform(ctm_post);
+                    let end = q2.transform(ctm_post);
                     if ![c1.x, c1.y, c2.x, c2.y, end.x, end.y]
                         .iter()
                         .all(|v| v.is_finite())
                     {
-                        return AnisotropicStroke::Fallback;
+                        return false;
                     }
                     out.curve_to(c1, c2, end);
                     last = q2;
                 }
                 tiny_skia_path::PathSegment::CubicTo(p1, p2, p3) => {
-                    let c1 = Point::new(p1.x as f64, p1.y as f64).transform(&ctm_post);
-                    let c2 = Point::new(p2.x as f64, p2.y as f64).transform(&ctm_post);
+                    let c1 = Point::new(p1.x as f64, p1.y as f64).transform(ctm_post);
+                    let c2 = Point::new(p2.x as f64, p2.y as f64).transform(ctm_post);
                     let end_local = Point::new(p3.x as f64, p3.y as f64);
-                    let end = end_local.transform(&ctm_post);
+                    let end = end_local.transform(ctm_post);
                     if ![c1.x, c1.y, c2.x, c2.y, end.x, end.y]
                         .iter()
                         .all(|v| v.is_finite())
                     {
-                        return AnisotropicStroke::Fallback;
+                        return false;
                     }
                     out.curve_to(c1, c2, end);
                     last = end_local;
                 }
                 tiny_skia_path::PathSegment::Close => out.close(),
+            }
+        }
+        true
+    }
+
+    /// Liang-Barsky parametric segment clipping against an axis-aligned rectangle.
+    /// Returns the visible parameter interval `(t0, t1)` in `[0.0, 1.0]`.
+    fn clip_segment_to_rect(a: Point, b: Point, rect: Rect) -> Option<(f64, f64)> {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let mut t0 = 0.0f64;
+        let mut t1 = 1.0f64;
+        for (p, q) in [
+            (-dx, a.x - rect.x0),
+            (dx, rect.x1 - a.x),
+            (-dy, a.y - rect.y0),
+            (dy, rect.y1 - a.y),
+        ] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    return None;
+                }
+            } else {
+                let r = q / p;
+                if p < 0.0 {
+                    if r > t1 {
+                        return None;
+                    }
+                    if r > t0 {
+                        t0 = r;
+                    }
+                } else {
+                    if r < t0 {
+                        return None;
+                    }
+                    if r < t1 {
+                        t1 = r;
+                    }
+                }
+            }
+        }
+        Some((t0, t1))
+    }
+
+    /// Expand a dashed anisotropic polyline clipped to the active page/clip
+    /// bounds while advancing the dash phase accurately across skipped off-page
+    /// prefixes. Falls back to deferred `StrokePath` (preserving the dash array
+    /// and phase) if the path contains curves or if even the visible span
+    /// exceeds the dash repeat limit.
+    #[allow(clippy::too_many_arguments)]
+    fn expand_clipped_anisotropic_dashed_stroke(
+        &self,
+        user_path: &Path,
+        max_scale: f64,
+        skia_stroke: &tiny_skia_path::Stroke,
+        norm_dash_array: &[f32],
+        period_norm: f64,
+        period_user: f64,
+        initial_phase_user: f64,
+        res_scale: f32,
+        max_norm_coord: f32,
+        max_dash_repeats: f64,
+    ) -> AnisotropicStroke {
+        let ctm = &self.current.ctm;
+        let Some(inv_ctm) = ctm.inverse() else {
+            return AnisotropicStroke::Fallback;
+        };
+        let mut vis_page = self.display_list.page_rect.normalize();
+        if let Some(clip) = self.current.clip_bounds {
+            let c = clip.normalize();
+            let ix0 = vis_page.x0.max(c.x0);
+            let iy0 = vis_page.y0.max(c.y0);
+            let ix1 = vis_page.x1.min(c.x1);
+            let iy1 = vis_page.y1.min(c.y1);
+            if ix1 <= ix0 || iy1 <= iy0 {
+                return AnisotropicStroke::Empty;
+            }
+            vis_page = Rect::new(ix0, iy0, ix1, iy1);
+        }
+        let reach = match self.current.line_join {
+            LineJoin::Miter => self.current.miter_limit.clamp(1.0, 100.0) as f64,
+            _ => std::f64::consts::SQRT_2,
+        };
+        let pad = (skia_stroke.width as f64 * 0.5 * reach.max(std::f64::consts::SQRT_2)) + 2.0;
+        let padded_page = Rect::new(
+            vis_page.x0 - pad,
+            vis_page.y0 - pad,
+            vis_page.x1 + pad,
+            vis_page.y1 + pad,
+        );
+        let corners = [
+            Point::new(padded_page.x0, padded_page.y0).transform(&inv_ctm),
+            Point::new(padded_page.x1, padded_page.y0).transform(&inv_ctm),
+            Point::new(padded_page.x0, padded_page.y1).transform(&inv_ctm),
+            Point::new(padded_page.x1, padded_page.y1).transform(&inv_ctm),
+        ];
+        let (mut ux0, mut uy0) = (f64::INFINITY, f64::INFINITY);
+        let (mut ux1, mut uy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for c in &corners {
+            if !c.x.is_finite() || !c.y.is_finite() {
+                return AnisotropicStroke::Fallback;
+            }
+            ux0 = ux0.min(c.x);
+            uy0 = uy0.min(c.y);
+            ux1 = ux1.max(c.x);
+            uy1 = uy1.max(c.y);
+        }
+        let vis_user = Rect::new(ux0, uy0, ux1, uy1);
+
+        let mut visible_runs: Vec<(Vec<Point>, f64)> = Vec::new();
+        let mut active_run: Option<(Vec<Point>, f64)> = None;
+        let mut cur: Option<Point> = None;
+        let mut sub_start: Option<Point> = None;
+        let mut cur_phase = initial_phase_user;
+        let mut total_vis_len = 0.0f64;
+
+        let push_segment = |a: Point,
+                            b: Point,
+                            phase: &mut f64,
+                            total_vis_len: &mut f64,
+                            active_run: &mut Option<(Vec<Point>, f64)>,
+                            visible_runs: &mut Vec<(Vec<Point>, f64)>|
+         -> Result<(), ()> {
+            if !a.x.is_finite() || !a.y.is_finite() || !b.x.is_finite() || !b.y.is_finite() {
+                return Err(());
+            }
+            let seg_len = (b.x - a.x).hypot(b.y - a.y);
+            if !seg_len.is_finite() {
+                return Err(());
+            }
+            if let Some((t0, t1)) = Self::clip_segment_to_rect(a, b, vis_user) {
+                let p0 = Point::new(a.x + t0 * (b.x - a.x), a.y + t0 * (b.y - a.y));
+                let p1 = Point::new(a.x + t1 * (b.x - a.x), a.y + t1 * (b.y - a.y));
+                *total_vis_len += (t1 - t0) * seg_len;
+                if !total_vis_len.is_finite() || *total_vis_len / period_user > max_dash_repeats {
+                    return Err(());
+                }
+                if t0 > 0.0 || active_run.is_none() {
+                    if let Some(prev) = active_run.take() {
+                        visible_runs.push(prev);
+                    }
+                    let start_phase = (*phase + t0 * seg_len).rem_euclid(period_user);
+                    *active_run = Some((vec![p0, p1], start_phase));
+                } else if let Some((ref mut pts, _)) = active_run {
+                    pts.push(p1);
+                }
+                if t1 < 1.0 {
+                    if let Some(prev) = active_run.take() {
+                        visible_runs.push(prev);
+                    }
+                }
+            } else if let Some(prev) = active_run.take() {
+                visible_runs.push(prev);
+            }
+            *phase = (*phase + seg_len).rem_euclid(period_user);
+            Ok(())
+        };
+
+        for elem in user_path {
+            match elem {
+                PathElement::MoveTo(p) => {
+                    if !p.x.is_finite() || !p.y.is_finite() {
+                        return AnisotropicStroke::Fallback;
+                    }
+                    if let Some(prev) = active_run.take() {
+                        visible_runs.push(prev);
+                    }
+                    cur = Some(p);
+                    sub_start = Some(p);
+                    cur_phase = initial_phase_user;
+                }
+                PathElement::LineTo(p) => {
+                    if let Some(prev) = cur {
+                        if push_segment(
+                            prev,
+                            p,
+                            &mut cur_phase,
+                            &mut total_vis_len,
+                            &mut active_run,
+                            &mut visible_runs,
+                        )
+                        .is_err()
+                        {
+                            return AnisotropicStroke::Fallback;
+                        }
+                    }
+                    cur = Some(p);
+                }
+                PathElement::CurveTo(_, _, _) => {
+                    // Preserve curves with their dash pattern on deferred StrokePath.
+                    return AnisotropicStroke::Fallback;
+                }
+                PathElement::Close => {
+                    if let (Some(prev), Some(start)) = (cur, sub_start) {
+                        if push_segment(
+                            prev,
+                            start,
+                            &mut cur_phase,
+                            &mut total_vis_len,
+                            &mut active_run,
+                            &mut visible_runs,
+                        )
+                        .is_err()
+                        {
+                            return AnisotropicStroke::Fallback;
+                        }
+                        cur = Some(start);
+                    }
+                    if let Some(prev) = active_run.take() {
+                        visible_runs.push(prev);
+                    }
+                }
+            }
+        }
+        if let Some(prev) = active_run.take() {
+            visible_runs.push(prev);
+        }
+        if visible_runs.is_empty() {
+            return AnisotropicStroke::Empty;
+        }
+
+        let inv_norm = 1.0 / max_scale;
+        let mut out = Path::new();
+        for (pts, run_phase_user) in visible_runs {
+            let Some(&run_origin) = pts.first() else {
+                continue;
+            };
+            let mut pb = tiny_skia_path::PathBuilder::new();
+            pb.move_to(0.0, 0.0);
+            for &p in &pts[1..] {
+                let nx = ((p.x - run_origin.x) * max_scale) as f32;
+                let ny = ((p.y - run_origin.y) * max_scale) as f32;
+                if !nx.is_finite()
+                    || !ny.is_finite()
+                    || nx.abs() > max_norm_coord
+                    || ny.abs() > max_norm_coord
+                {
+                    return AnisotropicStroke::Fallback;
+                }
+                pb.line_to(nx, ny);
+            }
+            let Some(mini_path) = pb.finish() else {
+                continue;
+            };
+            let mut run_phase = (run_phase_user * max_scale).rem_euclid(period_norm) as f32;
+            if !run_phase.is_finite() || run_phase >= period_norm as f32 {
+                run_phase = 0.0;
+            }
+            let Some(skia_dash) =
+                tiny_skia_path::StrokeDash::new(norm_dash_array.to_vec(), run_phase)
+            else {
+                return AnisotropicStroke::Fallback;
+            };
+            let Some(dashed) = mini_path.dash(&skia_dash, res_scale) else {
+                continue;
+            };
+            let Some(stroked) = dashed.stroke(skia_stroke, res_scale) else {
+                continue;
+            };
+            let ctm_post = Matrix::new(
+                ctm.a * inv_norm,
+                ctm.b * inv_norm,
+                ctm.c * inv_norm,
+                ctm.d * inv_norm,
+                ctm.a * run_origin.x + ctm.c * run_origin.y + ctm.e,
+                ctm.b * run_origin.x + ctm.d * run_origin.y + ctm.f,
+            );
+            if !Self::append_transformed_skia_path(&stroked, &ctm_post, &mut out) {
+                return AnisotropicStroke::Fallback;
             }
         }
         if out.is_empty() {
@@ -7875,6 +8249,27 @@ impl<'a> ContentInterpreter<'a> {
         }
         let cell_font_id = self.base_font_id;
 
+        let outer_page_base_ctm = if self.form_depth == 0 {
+            self.base_ctm
+        } else {
+            self.page_base_ctm
+        };
+        let rebased_page_ctm = from_page.concat(&outer_page_base_ctm);
+        let outer_scope_len = self.form_resources.len();
+        let rebased_form_ctms: Vec<Matrix> = self
+            .form_resources
+            .iter()
+            .map(|(_, scope_ctm)| from_page.concat(scope_ctm))
+            .collect();
+        let rebased_bits_for = |scope: InheritedPatternScope| -> Option<[u64; 6]> {
+            match scope {
+                InheritedPatternScope::Page => Some(matrix_bits(&rebased_page_ctm)),
+                InheritedPatternScope::EnclosingForm(idx) => {
+                    rebased_form_ctms.get(idx).map(matrix_bits)
+                }
+            }
+        };
+
         let cache_key =
             InheritedGraphicsStateKey::from_state(&cell_state, cell_font_id).map(|inherited| {
                 TilingCellKey {
@@ -7894,30 +8289,57 @@ impl<'a> ContentInterpreter<'a> {
                     resource_scopes: self.form_resource_scopes.clone(),
                 }
             });
-        if let Some(cached) = cache_key
-            .as_ref()
-            .and_then(|key| self.tiling_cell_cache.get(key))
-        {
-            if self.form_depth.saturating_add(cached.subtree_depth) <= MAX_FORM_DEPTH {
-                self.max_depth_reached = self
-                    .max_depth_reached
-                    .max(self.form_depth.saturating_add(cached.subtree_depth));
-                let pattern = TilingPattern {
-                    commands: std::sync::Arc::clone(&cached.commands),
-                    bbox: def.bbox,
-                    x_step: def.x_step,
-                    y_step: def.y_step,
-                    matrix: to_page,
-                    tiling_type: def.tiling_type,
-                };
-                if pattern.overlap_copy_ranges().truncated {
-                    self.stats.diagnostics.resource_limit_reached = true;
-                }
-                return Some(std::sync::Arc::new(pattern));
+        if let Some(hit) = cache_key.as_ref().and_then(|key| {
+            self.tiling_cell_cache.get(key).and_then(|entries| {
+                entries.iter().find_map(|cached| {
+                    if self.form_depth.saturating_add(cached.subtree_depth) <= MAX_FORM_DEPTH
+                        && cached
+                            .inherited_pattern_transforms
+                            .iter()
+                            .all(|&(scope, bits)| rebased_bits_for(scope) == Some(bits))
+                    {
+                        Some((
+                            std::sync::Arc::clone(&cached.commands),
+                            cached.subtree_depth,
+                            cached.inherited_pattern_transforms.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            })
+        }) {
+            let (commands, subtree_depth, inherited_transforms) = hit;
+            for (scope, _) in inherited_transforms {
+                self.record_tiling_inherited_pattern_scope(scope);
             }
+            self.max_depth_reached = self
+                .max_depth_reached
+                .max(self.form_depth.saturating_add(subtree_depth));
+            let pattern = TilingPattern {
+                commands,
+                bbox: def.bbox,
+                x_step: def.x_step,
+                y_step: def.y_step,
+                matrix: to_page,
+                tiling_type: def.tiling_type,
+            };
+            if pattern.overlap_copy_ranges().truncated {
+                self.stats.diagnostics.resource_limit_reached = true;
+            }
+            return Some(std::sync::Arc::new(pattern));
         }
 
         let file = self.file?;
+
+        // Express every enclosing Form/Type 3/Pattern resource scope's default
+        // CTM in this cell's coordinate system so nested patterns inherited from
+        // an enclosing scaled/translated Form are anchored once (not scaled twice).
+        let mut saved_form_ctms = Vec::with_capacity(outer_scope_len);
+        for (entry, rebased) in self.form_resources.iter_mut().zip(rebased_form_ctms.iter()) {
+            saved_form_ctms.push(entry.1);
+            entry.1 = *rebased;
+        }
 
         // Pattern /Resources and fonts shadow the page's for the cell body,
         // exactly like a form XObject's.
@@ -7973,11 +8395,6 @@ impl<'a> ContentInterpreter<'a> {
         let saved_type3_inline_ctx = self.type3_inline_ctx.take();
         let saved_base_ctm = self.base_ctm;
         let saved_page_base_ctm = self.page_base_ctm;
-        let outer_page_base_ctm = if self.form_depth == 0 {
-            self.base_ctm
-        } else {
-            self.page_base_ctm
-        };
         let saved_base_state = self.base_state.clone();
         let saved_base_font_id = self.base_font_id;
         let saved_shading_space_to_page =
@@ -7999,7 +8416,7 @@ impl<'a> ContentInterpreter<'a> {
         self.text_matrix = Matrix::identity();
         self.text_line_matrix = Matrix::identity();
         self.base_ctm = Matrix::identity();
-        self.page_base_ctm = from_page.concat(&outer_page_base_ctm);
+        self.page_base_ctm = rebased_page_ctm;
         self.suppress_color_ops = uncolored;
 
         // Clip the cell to its /BBox.
@@ -8013,6 +8430,8 @@ impl<'a> ContentInterpreter<'a> {
         self.form_depth += 1;
         self.max_depth_reached = self.max_depth_reached.max(self.form_depth);
         self.active_tiling_patterns.push(def.pat_id);
+        self.tiling_inherited_pattern_scopes
+            .push((outer_scope_len, Vec::new()));
         let mut truncated = false;
         let mut tokenizer = ContentTokenizer::new(&def.content);
         while let Some(token) = tokenizer.next_borrowed_recovering() {
@@ -8039,6 +8458,11 @@ impl<'a> ContentInterpreter<'a> {
         }
         self.stats.diagnostics.merge(tokenizer.diagnostics());
         self.close_marked_content();
+        let used_inherited_scopes = self
+            .tiling_inherited_pattern_scopes
+            .pop()
+            .map(|(_, s)| s)
+            .unwrap_or_default();
         self.active_tiling_patterns.pop();
         self.form_depth -= 1;
 
@@ -8110,20 +8534,30 @@ impl<'a> ContentInterpreter<'a> {
             self.form_resources.pop();
             self.form_resource_scopes.pop();
         }
+        for (entry, saved) in self.form_resources.iter_mut().zip(saved_form_ctms) {
+            entry.1 = saved;
+        }
 
         let commands = std::sync::Arc::new(cell_dl);
         if let Some(cache_key) = cache_key {
             if !truncated
                 && !descendant_nesting_hit
-                && self.tiling_cell_cache.len() < MAX_CACHED_TILING_CELLS
+                && self.tiling_cell_cache_entries < MAX_CACHED_TILING_CELLS
             {
-                self.tiling_cell_cache.insert(
-                    cache_key,
-                    CachedTilingCell {
+                let inherited_pattern_transforms: Vec<(InheritedPatternScope, [u64; 6])> =
+                    used_inherited_scopes
+                        .into_iter()
+                        .filter_map(|scope| rebased_bits_for(scope).map(|bits| (scope, bits)))
+                        .collect();
+                let bucket = self.tiling_cell_cache.entry(cache_key).or_default();
+                if bucket.len() < MAX_CACHED_TILING_VARIANTS_PER_KEY {
+                    bucket.push(CachedTilingCell {
                         commands: std::sync::Arc::clone(&commands),
                         subtree_depth,
-                    },
-                );
+                        inherited_pattern_transforms,
+                    });
+                    self.tiling_cell_cache_entries += 1;
+                }
             }
         }
         let pattern = TilingPattern {
@@ -10604,7 +11038,14 @@ type ShadingPatternKey = (ObjectId, [u64; 6]);
 type ShadingPatternPaint = (std::sync::Arc<crate::shading::ShadingDef>, Color);
 
 fn matrix_bits(m: &Matrix) -> [u64; 6] {
-    [m.a, m.b, m.c, m.d, m.e, m.f].map(f64::to_bits)
+    let norm = |v: f64| {
+        if v == 0.0 {
+            0.0f64.to_bits()
+        } else {
+            v.to_bits()
+        }
+    };
+    [m.a, m.b, m.c, m.d, m.e, m.f].map(norm)
 }
 
 /// `resolve_pattern`'s result for a (possibly unusable) shading pattern.
@@ -15021,5 +15462,312 @@ mod tests {
                 "repeated glyph C with font-level /Resources must share cached tiling cell DisplayList"
             );
         }
+    }
+
+    #[test]
+    fn anisotropic_long_offpage_dashed_line_preserves_dashes_and_phase() {
+        // 4×1 anisotropic CTM on page [0..100]×[0..60], 2-unit pen, [5 5] 0 d
+        // (period_user = 10 -> period_page_x = 40: 20pt on, 20pt off).
+        // Line spans user x = -1_000_000 .. +1_000_000 (total_len / period = 200_000
+        // > MAX_DASH_REPEATS = 100_000), triggering the dash-repeat guard.
+        let run = |start_x: i64| -> DisplayList {
+            let stream = format!("q 4 0 0 1 0 0 cm 2 w [5 5] 0 d {start_x} 30 m 1000000 30 l S Q");
+            let (dl, _) = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 60.0))
+                .interpret_with_stats(stream.as_bytes());
+            dl
+        };
+
+        // Start at -1_000_000 (exact multiple of period_user=10):
+        // x_user in [0..5] (page [0..20]) is ON, [5..10] (page [20..40]) is OFF,
+        // [10..15] (page [40..60]) is ON, [15..20] (page [60..80]) is OFF,
+        // [20..25] (page [80..100]) is ON.
+        let dl_a = run(-1_000_000);
+        let path_a = dl_a
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath { path, .. } => Some(path),
+                _ => None,
+            })
+            .expect("long clipped dashed anisotropic line must expand to FillPath dashes");
+
+        let collect_dash_x_intervals = |path: &Path| -> Vec<(f64, f64, f64)> {
+            let mut intervals = Vec::new();
+            let mut x0 = f64::INFINITY;
+            let mut x1 = f64::NEG_INFINITY;
+            let mut y0 = f64::INFINITY;
+            let mut y1 = f64::NEG_INFINITY;
+            let flush = |intervals: &mut Vec<(f64, f64, f64)>,
+                         x0: &mut f64,
+                         x1: &mut f64,
+                         y0: &mut f64,
+                         y1: &mut f64| {
+                if x0.is_finite() && x1.is_finite() {
+                    intervals.push((*x0, *x1, *y1 - *y0));
+                }
+                *x0 = f64::INFINITY;
+                *x1 = f64::NEG_INFINITY;
+                *y0 = f64::INFINITY;
+                *y1 = f64::NEG_INFINITY;
+            };
+            for elem in path {
+                match elem {
+                    PathElement::MoveTo(p) => {
+                        flush(&mut intervals, &mut x0, &mut x1, &mut y0, &mut y1);
+                        x0 = p.x;
+                        x1 = p.x;
+                        y0 = p.y;
+                        y1 = p.y;
+                    }
+                    PathElement::LineTo(p) => {
+                        x0 = x0.min(p.x);
+                        x1 = x1.max(p.x);
+                        y0 = y0.min(p.y);
+                        y1 = y1.max(p.y);
+                    }
+                    PathElement::CurveTo(c1, c2, end) => {
+                        for p in [c1, c2, end] {
+                            x0 = x0.min(p.x);
+                            x1 = x1.max(p.x);
+                            y0 = y0.min(p.y);
+                            y1 = y1.max(p.y);
+                        }
+                    }
+                    PathElement::Close => {}
+                }
+            }
+            flush(&mut intervals, &mut x0, &mut x1, &mut y0, &mut y1);
+            intervals
+        };
+
+        let dashes_a = collect_dash_x_intervals(path_a);
+        assert!(
+            dashes_a.len() >= 3,
+            "expected multiple distinct visible dashes (not a solid line), got {dashes_a:?}"
+        );
+        // Every horizontal dash must preserve 2pt height (NOT averaged 5pt).
+        for &(_, _, h) in &dashes_a {
+            assert!(
+                (h - 2.0).abs() < 0.05,
+                "4x1 horizontal dash must be 2pt tall, got {h}"
+            );
+        }
+        // Page x=10, 50, 90 must be covered; gaps x=30, 70 must be empty.
+        let covers = |dashes: &[(f64, f64, f64)], x: f64| {
+            dashes.iter().any(|&(a, b, _)| x >= a - 0.1 && x <= b + 0.1)
+        };
+        assert!(covers(&dashes_a, 10.0) && covers(&dashes_a, 50.0) && covers(&dashes_a, 90.0));
+        assert!(
+            !covers(&dashes_a, 30.0) && !covers(&dashes_a, 70.0),
+            "dash gaps at x=30 and x=70 must stay empty, got {dashes_a:?}"
+        );
+
+        // Shift start by half a period (-1_000_005): phase flips so [0..20] and
+        // [40..60] become OFF while [20..40] and [60..80] become ON.
+        let dl_b = run(-1_000_005);
+        let path_b = dl_b
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath { path, .. } => Some(path),
+                _ => None,
+            })
+            .expect("phase-shifted clipped dashed line must expand to FillPath");
+        let dashes_b = collect_dash_x_intervals(path_b);
+        assert!(
+            covers(&dashes_b, 30.0) && covers(&dashes_b, 70.0),
+            "half-period shifted start must place dashes at x=30 and x=70, got {dashes_b:?}"
+        );
+        assert!(
+            !covers(&dashes_b, 10.0) && !covers(&dashes_b, 50.0),
+            "half-period shifted start must leave gaps at x=10 and x=50, got {dashes_b:?}"
+        );
+    }
+
+    #[test]
+    fn nested_tiling_in_scaled_form_and_translated_page_hatch_stay_aligned() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // 1) A 2× Form defining both outer tile /POut and inner hatch /PHatch:
+        //    /POut inherits /PHatch from the Form's /Resources. Inside /POut's
+        //    cell, /PHatch's matrix must be identity (NOT 2×), so rendering
+        //    /POut at 2× draws /PHatch at 2× (NOT 4×).
+        // 2) Two translated placements of /FormPageRef (at dx=0 and dx=5, half of
+        //    the 10pt page hatch period):
+        //    - /PInherit looks up /PageHatch from page /Resources -> must NOT
+        //      reuse Placement 1's cell with stale translate(0, 0); Placement 2's
+        //      inner pattern matrix must carry translate(-5, 0) so page hatch
+        //      stays anchored at page x=0.
+        //    - /PSelf is self-contained inside the same Form -> MUST reuse the
+        //      exact same `Arc<DisplayList>` across both translated placements!
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 80] /Contents 4 0 R \
+              /Resources << /XObject << /FormScaled 5 0 R /FormTrans 8 0 R >> \
+                            /Pattern << /PageHatch 11 0 R >> >> >>"
+                .to_vec(), // 3
+            stream(
+                "",
+                b"q 2 0 0 2 0 0 cm /FormScaled Do Q \
+                  q 1 0 0 1 0 0 cm /FormTrans Do Q \
+                  q 1 0 0 1 5 0 cm /FormTrans Do Q",
+            ), // 4
+            // 5: /FormScaled defines both /POut (6) and /PHatch (7)
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 20 20] \
+                 /Resources << /Pattern << /POut 6 0 R /PHatch 7 0 R >> >>",
+                b"/Pattern cs /POut scn 0 0 20 20 re f",
+            ),
+            // 6: /POut fills its cell with Form-inherited /PHatch
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>",
+                b"/Pattern cs /PHatch scn 0 0 20 20 re f",
+            ),
+            // 7: /PHatch 10×10 stripe pattern
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+                b"1 0 0 rg 0 0 5 10 re f",
+            ),
+            // 8: /FormTrans draws both /PInherit (9, inherits /PageHatch) and /PSelf (10, self-contained)
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 40 20] \
+                 /Resources << /Pattern << /PInherit 9 0 R /PSelf 10 0 R >> >>",
+                b"/Pattern cs /PInherit scn 0 0 20 20 re f /Pattern cs /PSelf scn 20 0 20 20 re f",
+            ),
+            // 9: /PInherit inherits /PageHatch from page /Resources
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>",
+                b"/Pattern cs /PageHatch scn 0 0 20 20 re f",
+            ),
+            // 10: /PSelf is completely self-contained
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+                b"0 1 0 rg 0 0 5 10 re f",
+            ),
+            // 11: /PageHatch 10×10 stripe pattern anchored in page coordinates
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+                b"0 0 1 rg 0 0 5 10 re f",
+            ),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let mut images = ImageCache::new();
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let (dl, _) = ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content);
+
+        let outer_tilings: Vec<&std::sync::Arc<TilingPattern>> = dl
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCommand::FillPath {
+                    paint: Paint::Tiling(t),
+                    ..
+                } => Some(t),
+                _ => None,
+            })
+            .collect();
+        // Order: [0] = /POut (2× Form), [1] = /PInherit@0, [2] = /PSelf@0, [3] = /PInherit@5, [4] = /PSelf@5
+        assert_eq!(outer_tilings.len(), 5);
+
+        let inner_tiling_matrix = |outer: &TilingPattern| -> Matrix {
+            outer
+                .commands
+                .commands
+                .iter()
+                .find_map(|c| match c {
+                    RenderCommand::FillPath {
+                        paint: Paint::Tiling(inner),
+                        ..
+                    } => Some(inner.matrix),
+                    _ => None,
+                })
+                .expect("expected nested Paint::Tiling inside outer cell")
+        };
+
+        // 1) Scaled 2× Form: outer matrix is 2×, inner matrix in cell space MUST be 1× (identity)
+        //    so composed effective scale is 2× (not 4×).
+        let pout = outer_tilings[0];
+        assert!((pout.matrix.a - 2.0).abs() < 1e-6 && (pout.matrix.d - 2.0).abs() < 1e-6);
+        let phatch_mat = inner_tiling_matrix(pout);
+        assert!(
+            (phatch_mat.a - 1.0).abs() < 1e-6 && (phatch_mat.d - 1.0).abs() < 1e-6,
+            "inner Form-local hatch must be rebased to 1x in outer cell space, got {phatch_mat:?}"
+        );
+
+        // 2) Translated Form with page-anchored hatch:
+        //    Placement 1 (dx=0): outer.e = 0, inner.e = 0 -> composed page origin = 0.
+        //    Placement 2 (dx=5): outer.e = 5, inner.e = -5 -> composed page origin = 0!
+        let pinherit_0 = outer_tilings[1];
+        let pinherit_5 = outer_tilings[3];
+        assert!(!std::sync::Arc::ptr_eq(
+            &pinherit_0.commands,
+            &pinherit_5.commands
+        ));
+        let inner_0 = inner_tiling_matrix(pinherit_0);
+        let inner_5 = inner_tiling_matrix(pinherit_5);
+        assert!(
+            (inner_0.e - 0.0).abs() < 1e-6,
+            "dx=0 placement inner page hatch offset must be 0, got {inner_0:?}"
+        );
+        assert!(
+            (inner_5.e - (-5.0)).abs() < 1e-6,
+            "dx=5 placement inner page hatch offset must be -5 so page anchor stays at 0, got {inner_5:?}"
+        );
+        let composed_5 = pinherit_5.matrix.concat(&inner_5);
+        assert!(
+            composed_5.e.abs() < 1e-6 && composed_5.f.abs() < 1e-6,
+            "composed page-anchored hatch transform must stay anchored at page origin, got {composed_5:?}"
+        );
+
+        // 3) Self-contained /PSelf in the exact same two translated Forms MUST still hit cache!
+        let pself_0 = outer_tilings[2];
+        let pself_5 = outer_tilings[4];
+        assert!(
+            std::sync::Arc::ptr_eq(&pself_0.commands, &pself_5.commands),
+            "self-contained Form-local tile must still share cached cell DisplayList across translations"
+        );
     }
 }

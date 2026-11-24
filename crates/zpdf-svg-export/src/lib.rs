@@ -63,6 +63,8 @@ const MAX_COORD: f64 = 1.0e8;
 /// Soft masks nest through their own display lists; bound the recursion the
 /// same way the renderers bound blend-group depth.
 const MAX_MASK_DEPTH: u8 = 8;
+/// Tiling patterns nest up to the interpreter's `MAX_FORM_DEPTH` (16).
+const MAX_TILING_DEPTH: u8 = 16;
 /// Outline commands kept by the per-export glyph outline cache. Past it,
 /// further glyphs are extracted on every use, as without the cache.
 const MAX_CACHED_OUTLINE_COMMANDS: usize = 512 * 1024;
@@ -1171,7 +1173,7 @@ impl<'a> SvgWriter<'a> {
         seg_bounds: Option<zpdf_core::Rect>,
         depth: u8,
     ) -> Option<u32> {
-        if depth >= MAX_MASK_DEPTH || commands.commands.is_empty() {
+        if depth >= MAX_TILING_DEPTH || commands.commands.is_empty() {
             return None;
         }
         let g = self.compute_tiling_pattern_geometry(tiling)?;
@@ -1376,7 +1378,7 @@ impl<'a> SvgWriter<'a> {
         mode: BlendMode,
         depth: u8,
     ) -> Option<u32> {
-        if depth >= MAX_MASK_DEPTH || steps.is_empty() {
+        if depth >= MAX_TILING_DEPTH || steps.is_empty() {
             return None;
         }
         let identity = match mode {
@@ -1548,7 +1550,7 @@ impl<'a> SvgWriter<'a> {
         steps: &[zpdf_display_list::TilingBlendStep],
         depth: u8,
     ) -> Option<(u32, u32, u32)> {
-        if depth >= MAX_MASK_DEPTH || steps.is_empty() {
+        if depth >= MAX_TILING_DEPTH || steps.is_empty() {
             return None;
         }
         let g = self.compute_tiling_pattern_geometry(tiling)?;

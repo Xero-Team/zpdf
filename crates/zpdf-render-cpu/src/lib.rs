@@ -251,7 +251,7 @@ impl TilingCacheKey {
 }
 
 /// Guard limits for [`TilingPattern`] cell rasterization in the CPU backend.
-const MAX_TILING_DEPTH: usize = 8;
+const MAX_TILING_DEPTH: usize = 16;
 const MAX_TILING_TILE_DIM: u32 = 4096;
 const MAX_TILING_TILE_PIXELS: u64 = 4_194_304; // 2048×2048 = 16 MiB RGBA
 const MAX_TILING_CACHE_BYTES: u64 = 32 * 1024 * 1024;

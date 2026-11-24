@@ -246,7 +246,7 @@ struct Type3BytesVisited {
     image_ptrs: HashSet<usize>,
     /// Deduplicates shared `Arc<Type3FormXObject>` nodes (and their nested graphs).
     form_ptrs: HashSet<usize>,
-    /// Deduplicates shared `Arc<Type3Resources>` maps.
+    /// Deduplicates shared `Type3Resources` maps.
     resource_ptrs: HashSet<usize>,
 }
 
@@ -255,54 +255,56 @@ impl Type3Resources {
         self.xobjects.is_empty() && self.color_spaces.is_empty() && self.ext_g_states.is_empty()
     }
 
+    /// Estimate retained heap bytes across the entire reachable Type 3 resource
+    /// graph using an explicit worklist so every distinct allocation is counted
+    /// exactly once regardless of alias depth or `HashMap` traversal order.
     pub fn estimated_cache_bytes(&self) -> u64 {
         let mut visited = Type3BytesVisited::default();
-        self.estimated_cache_bytes_inner(&mut visited, 0)
-    }
-
-    fn estimated_cache_bytes_inner(&self, visited: &mut Type3BytesVisited, depth: u8) -> u64 {
-        if depth > 8 || !visited.resource_ptrs.insert(self as *const Self as usize) {
-            return 0;
-        }
-        let mut bytes = estimated_map_bytes(&self.xobjects)
-            .saturating_add(estimated_map_bytes(&self.color_spaces))
-            .saturating_add(estimated_map_bytes(&self.ext_g_states));
-        for (name, xobj) in &self.xobjects {
-            bytes = bytes.saturating_add(name.capacity() as u64);
-            match xobj {
-                Type3XObject::Image(img) => {
-                    if visited.image_ptrs.insert(Arc::as_ptr(img) as usize) {
-                        bytes = bytes
-                            .saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64)
-                            .saturating_add(img.estimated_bytes(visited));
-                    }
-                }
-                Type3XObject::Form(form) => {
-                    if visited.form_ptrs.insert(Arc::as_ptr(form) as usize) {
-                        bytes = bytes
-                            .saturating_add(std::mem::size_of::<Type3FormXObject>() as u64)
-                            .saturating_add(estimated_pdf_dict_bytes(&form.dict));
-                        if visited.stream_ptrs.insert(form.data.as_ptr() as usize) {
-                            bytes = bytes.saturating_add(form.data.len() as u64);
+        let mut worklist: Vec<&Self> = vec![self];
+        let mut bytes = 0u64;
+        while let Some(res) = worklist.pop() {
+            if !visited.resource_ptrs.insert(res as *const Self as usize) {
+                continue;
+            }
+            bytes = bytes
+                .saturating_add(estimated_map_bytes(&res.xobjects))
+                .saturating_add(estimated_map_bytes(&res.color_spaces))
+                .saturating_add(estimated_map_bytes(&res.ext_g_states));
+            for (name, xobj) in &res.xobjects {
+                bytes = bytes.saturating_add(name.capacity() as u64);
+                match xobj {
+                    Type3XObject::Image(img) => {
+                        if visited.image_ptrs.insert(Arc::as_ptr(img) as usize) {
+                            bytes = bytes
+                                .saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64)
+                                .saturating_add(img.estimated_bytes(&mut visited));
                         }
-                        if let Some(res) = &form.resources {
-                            bytes = bytes.saturating_add(
-                                res.estimated_cache_bytes_inner(visited, depth + 1),
-                            );
+                    }
+                    Type3XObject::Form(form) => {
+                        if visited.form_ptrs.insert(Arc::as_ptr(form) as usize) {
+                            bytes = bytes
+                                .saturating_add(std::mem::size_of::<Type3FormXObject>() as u64)
+                                .saturating_add(estimated_pdf_dict_bytes(&form.dict));
+                            if visited.stream_ptrs.insert(form.data.as_ptr() as usize) {
+                                bytes = bytes.saturating_add(form.data.len() as u64);
+                            }
+                            if let Some(child_res) = &form.resources {
+                                worklist.push(child_res.as_ref());
+                            }
                         }
                     }
                 }
             }
-        }
-        for (name, cs) in &self.color_spaces {
-            bytes = bytes
-                .saturating_add(name.capacity() as u64)
-                .saturating_add(estimated_pdf_object_bytes(cs));
-        }
-        for (name, gs) in &self.ext_g_states {
-            bytes = bytes
-                .saturating_add(name.capacity() as u64)
-                .saturating_add(estimated_pdf_dict_bytes(gs));
+            for (name, cs) in &res.color_spaces {
+                bytes = bytes
+                    .saturating_add(name.capacity() as u64)
+                    .saturating_add(estimated_pdf_object_bytes(cs));
+            }
+            for (name, gs) in &res.ext_g_states {
+                bytes = bytes
+                    .saturating_add(name.capacity() as u64)
+                    .saturating_add(estimated_pdf_dict_bytes(gs));
+            }
         }
         bytes
     }
@@ -310,19 +312,21 @@ impl Type3Resources {
 
 impl Type3ImageXObject {
     fn estimated_bytes(&self, visited: &mut Type3BytesVisited) -> u64 {
-        let mut bytes = estimated_pdf_dict_bytes(&self.dict);
-        if visited.stream_ptrs.insert(self.data.as_ptr() as usize) {
-            bytes = bytes.saturating_add(self.data.len() as u64);
-        }
-        if let Some(sm) = &self.smask {
-            bytes = bytes
-                .saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64)
-                .saturating_add(sm.estimated_bytes(visited));
-        }
-        if let Some(m) = &self.mask_stream {
-            bytes = bytes
-                .saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64)
-                .saturating_add(m.estimated_bytes(visited));
+        let mut bytes = 0u64;
+        let mut stack: Vec<&Self> = vec![self];
+        while let Some(img) = stack.pop() {
+            bytes = bytes.saturating_add(estimated_pdf_dict_bytes(&img.dict));
+            if visited.stream_ptrs.insert(img.data.as_ptr() as usize) {
+                bytes = bytes.saturating_add(img.data.len() as u64);
+            }
+            if let Some(sm) = &img.smask {
+                bytes = bytes.saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64);
+                stack.push(sm.as_ref());
+            }
+            if let Some(m) = &img.mask_stream {
+                bytes = bytes.saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64);
+                stack.push(m.as_ref());
+            }
         }
         bytes
     }
@@ -7339,6 +7343,113 @@ mod tests {
         assert!(
             budget.try_admit(&font, est),
             "FontCacheBudget matching estimated size ({est}) must admit the font"
+        );
+    }
+
+    #[test]
+    fn type3_form_accounting_is_independent_of_shallow_and_deep_alias_order() {
+        // Leaf Form with a substantial retained image + ColorSpace payload.
+        let mut leaf_res = Type3Resources::default();
+        leaf_res.color_spaces.insert(
+            "CS_LEAF".into(),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Indexed")),
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+                zpdf_core::PdfObject::Integer(255),
+                zpdf_core::PdfObject::String(zpdf_core::PdfString::new(vec![0x77; 8192])),
+            ]),
+        );
+        leaf_res.xobjects.insert(
+            "ImgLeaf".into(),
+            Type3XObject::Image(Arc::new(Type3ImageXObject {
+                dict: zpdf_core::PdfDict::new(),
+                data: Arc::from(vec![0xFFu8; 4096]),
+                smask: None,
+                mask_stream: None,
+            })),
+        );
+        let leaf_res_bytes = leaf_res.estimated_cache_bytes();
+        assert!(leaf_res_bytes > 12_000);
+
+        let leaf_form = Arc::new(Type3FormXObject {
+            dict: zpdf_core::PdfDict::new(),
+            data: Arc::from(&b"0 0 1 1 re f"[..]),
+            resources: Some(Arc::new(leaf_res)),
+        });
+
+        // Wrap `leaf_form` in a 9-level chain so the deep path reaches `leaf_form`
+        // past the old depth-8 cutoff.
+        let mut deep_chain = Arc::clone(&leaf_form);
+        for _ in 0..9 {
+            let mut r = Type3Resources::default();
+            r.xobjects
+                .insert("Next".into(), Type3XObject::Form(Arc::clone(&deep_chain)));
+            deep_chain = Arc::new(Type3FormXObject {
+                dict: zpdf_core::PdfDict::new(),
+                data: Arc::from(&b"/Next Do"[..]),
+                resources: Some(Arc::new(r)),
+            });
+        }
+
+        // Build many equivalent `(shallow, deep)` roots with distinct 4-char key
+        // pairs so randomized HashMap iteration hits both shallow-first and
+        // deep-first traversal orders. Every instance must report the EXACT same
+        // retained byte size and always include `leaf_res_bytes`.
+        let make_font = |shallow_key: &str, deep_key: &str| -> Arc<LoadedFont> {
+            let mut root = Type3Resources::default();
+            root.xobjects.insert(
+                shallow_key.into(),
+                Type3XObject::Form(Arc::clone(&leaf_form)),
+            );
+            root.xobjects
+                .insert(deep_key.into(), Type3XObject::Form(Arc::clone(&deep_chain)));
+            let mut char_procs = HashMap::new();
+            char_procs.insert("A".into(), Arc::from(&b"1 0 d0"[..]));
+            Arc::new(
+                LoadedFont::new_with_data(
+                    PdfFontType::Type3 {
+                        font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                        char_procs,
+                        encoding: vec!["A".into()],
+                        widths: vec![1.0],
+                        first_char: 0,
+                    },
+                    "T3OrderIndep".into(),
+                    Vec::new(),
+                    CidWidths::new(1.0),
+                )
+                .with_type3_resources(Arc::new(root)),
+            )
+        };
+
+        let mut costs = Vec::new();
+        for i in 0..16 {
+            let k1 = format!("A{i:03}");
+            let k2 = format!("B{i:03}");
+            let f_ab = make_font(&k1, &k2);
+            let f_ba = make_font(&k2, &k1);
+            let c_ab = f_ab.estimated_cache_bytes();
+            let c_ba = f_ba.estimated_cache_bytes();
+            assert_eq!(
+                c_ab, c_ba,
+                "equivalent shallow/deep aliases must have identical estimated_cache_bytes"
+            );
+            assert!(
+                c_ab > leaf_res_bytes,
+                "leaf_form retained resources ({leaf_res_bytes}) must always be charged, got {c_ab}"
+            );
+            // Admission must behave identically for both orderings around the boundary.
+            let mut b1 = FontCacheBudget::default();
+            let mut b2 = FontCacheBudget::default();
+            assert!(!b1.try_admit(&f_ab, c_ab - 1));
+            assert!(!b2.try_admit(&f_ba, c_ba - 1));
+            assert!(b1.try_admit(&f_ab, c_ab));
+            assert!(b2.try_admit(&f_ba, c_ba));
+            costs.push(c_ab);
+        }
+        assert!(
+            costs.iter().all(|&c| c == costs[0]),
+            "all equivalent alias orderings must produce identical admission cost, got {costs:?}"
         );
     }
 }

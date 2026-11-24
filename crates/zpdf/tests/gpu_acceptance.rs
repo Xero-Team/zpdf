@@ -4037,3 +4037,241 @@ fn pdf_image_mask_with_white_multiply_tiling_preserves_blue_backdrop_cpu_and_gpu
         }
     }
 }
+
+#[test]
+fn cpu_and_gpu_nine_level_nested_tiling_renders_innermost_color() {
+    use std::sync::Arc;
+    use zpdf::display_list::{
+        Color, DisplayList, FillRule, Paint, Path, RenderCommand, TilingPattern,
+    };
+    use zpdf_core::{Matrix, Rect};
+
+    // Build 9 nested opaque single-cell tiling patterns (exceeding the old
+    // backend depth cap of 8 while within the interpreter's 16-level limit),
+    // with bright green in the innermost cell.
+    let mut inner_cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+    let mut sq = Path::new();
+    sq.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+    inner_cell.push(RenderCommand::FillPath {
+        path: sq.clone(),
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    let mut cur = Arc::new(TilingPattern {
+        commands: Arc::new(inner_cell),
+        bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+        x_step: 20.0,
+        y_step: 20.0,
+        matrix: Matrix::identity(),
+        tiling_type: 1,
+    });
+    for _ in 0..8 {
+        let mut parent = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        parent.push(RenderCommand::FillPath {
+            path: sq.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&cur)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cur = Arc::new(TilingPattern {
+            commands: Arc::new(parent),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+    }
+
+    let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+    let mut target = Path::new();
+    target.rect(Rect::new(10.0, 10.0, 30.0, 30.0));
+    dl.push(RenderCommand::FillPath {
+        path: target,
+        rule: FillRule::NonZero,
+        paint: Paint::Tiling(cur),
+        alpha: 1.0,
+        overprint: None,
+    });
+
+    let check = |backend: &str, data: &[u8], w: u32| {
+        let off = ((20 * w + 20) * 4) as usize;
+        let px = &data[off..off + 4];
+        assert!(
+            px[0] < 10 && px[1] > 245 && px[2] < 10,
+            "{backend} 9-level nested tiling pattern must render innermost bright green, got {px:?}"
+        );
+    };
+
+    let cpu = zpdf_render_cpu::CpuRenderer::new()
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    check("CPU", &cpu.data, cpu.width);
+
+    match render_gpu_shared(&dl, None, None, 1.0) {
+        Ok(gpu) => check("GPU", &gpu.data, gpu.width),
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU 9-level nested tiling test (no adapter)");
+        }
+        Err(e) => panic!("GPU 9-level nested tiling test failed: {e}"),
+    }
+}
+
+#[test]
+fn pdf_scaled_form_nested_hatch_and_translated_page_hatch_render_accurately() {
+    let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+        let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\nendstream");
+        out
+    };
+    // 1) Scaled 2× Form with /POut inheriting Form-local /PHatch (10×10 cell, red [0..5],
+    //    blue [5..10]). At 2× Form scale, stripes MUST be 10px wide (red [0..10], blue [10..20]),
+    //    NOT 20px wide (4× double-scaled).
+    // 2) Two translated placements (dx=0 and dx=5) of /FormPageHatch whose Form-local tile
+    //    inherits page-anchored /PageHatch (10×10 cell, green [0..5] mod 10, white [5..10] mod 10):
+    //    at page x=22 (2 mod 10, inside dx=0) AND page x=62 (2 mod 10, inside dx=5 placement
+    //    spanning x=[55..75]), BOTH must be green, and x=27 / x=67 (7 mod 10) must be white!
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R \
+          /Resources << /XObject << /FormScaled 5 0 R /FormTrans 8 0 R >> \
+                        /Pattern << /PageHatch 10 0 R >> >> >>"
+            .to_vec(), // 3
+        stream(
+            "",
+            b"q 2 0 0 2 0 30 cm /FormScaled Do Q \
+              q 1 0 0 1 20 0 cm /FormTrans Do Q \
+              q 1 0 0 1 55 0 cm /FormTrans Do Q",
+        ), // 4
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 20 15] \
+             /Resources << /Pattern << /POut 6 0 R /PHatch 7 0 R >> >>",
+            b"/Pattern cs /POut scn 0 0 20 15 re f",
+        ), // 5
+        stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+             /BBox [0 0 20 15] /XStep 20 /YStep 15 /Resources << >>",
+            b"/Pattern cs /PHatch scn 0 0 20 15 re f",
+        ), // 6
+        stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+             /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+            b"1 0 0 rg 0 0 5 10 re f 0 0 1 rg 5 0 5 10 re f",
+        ), // 7
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 20 20] \
+             /Resources << /Pattern << /PInherit 9 0 R >> >>",
+            b"/Pattern cs /PInherit scn 0 0 20 20 re f",
+        ), // 8
+        stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+             /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>",
+            b"/Pattern cs /PageHatch scn 0 0 20 20 re f",
+        ), // 9
+        stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+             /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+            b"0 1 0 rg 0 0 5 10 re f",
+        ), // 10
+    ];
+    let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (idx, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    let count = objects.len() + 1;
+    pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+    for off in offsets {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let doc = zpdf::PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let mut images = zpdf_image::ImageCache::new();
+    let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+    let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+        .with_document(doc.file(), &page.resources)
+        .with_fonts(&mut fonts)
+        .with_images(&mut images)
+        .interpret_with_stats(&content);
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let check = |backend: &str, data: &[u8], w: u32| {
+        // 1) Scaled 2× Form covers PDF y=[30..60] (pixel y=[0..30]); sample y=15.
+        //    At 2× scale: x=[0..10] red, x=[10..20] blue, x=[20..30] red!
+        //    (If wrongly double-scaled to 4×, x=15 would still be red instead of blue.)
+        let r1 = px(data, w, 5, 15);
+        let b1 = px(data, w, 15, 15);
+        let r2 = px(data, w, 25, 15);
+        assert!(
+            r1[0] > 240 && r1[2] < 15,
+            "{backend} scaled Form stripe x=5 must be red, got {r1:?}"
+        );
+        assert!(
+            b1[2] > 240 && b1[0] < 15,
+            "{backend} scaled Form stripe x=15 must be blue (2x, not 4x), got {b1:?}"
+        );
+        assert!(
+            r2[0] > 240 && r2[2] < 15,
+            "{backend} scaled Form stripe x=25 must be red (2x period 20), got {r2:?}"
+        );
+
+        // 2) Translated Forms cover PDF y=[0..20] (pixel y=[40..60]); sample y=50.
+        //    Placement 1 spans x=[20..40], Placement 2 spans x=[55..75] (shifted by 35 = 3.5 periods).
+        //    Page-anchored /PageHatch is green at x mod 10 in [0..5], white in [5..10]:
+        //    so x=22 & x=62 are green, and x=27 & x=67 are white!
+        let g1 = px(data, w, 22, 50);
+        let w1 = px(data, w, 27, 50);
+        let g2 = px(data, w, 62, 50);
+        let w2 = px(data, w, 67, 50);
+        assert!(
+            g1[1] > 240 && g1[0] < 15,
+            "{backend} placement 1 x=22 (2 mod 10) must be green, got {g1:?}"
+        );
+        assert_eq!(
+            w1,
+            [255, 255, 255],
+            "{backend} placement 1 x=27 must be white"
+        );
+        assert!(
+            g2[1] > 240 && g2[0] < 15,
+            "{backend} placement 2 x=62 (2 mod 10, half-period shifted Form) must stay green, got {g2:?}"
+        );
+        assert_eq!(
+            w2,
+            [255, 255, 255],
+            "{backend} placement 2 x=67 (7 mod 10, half-period shifted Form) must stay white"
+        );
+    };
+
+    let cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    check("CPU", &cpu.data, cpu.width);
+
+    match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+        Ok(gpu) => check("GPU", &gpu.data, gpu.width),
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU scaled/translated nested hatch test (no adapter)");
+        }
+        Err(e) => panic!("GPU scaled/translated nested hatch test failed: {e}"),
+    }
+}

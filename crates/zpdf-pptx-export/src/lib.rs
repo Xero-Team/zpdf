@@ -221,6 +221,8 @@ struct ConversionStats {
     native_text_record_visits: usize,
     soft_mask_analysis_visits: usize,
     type3_bounds_cache_entries: usize,
+    #[cfg(test)]
+    tiling_backdrop_cmd_scans: usize,
 }
 
 fn display_list_to_slide_internal<'a>(
@@ -244,6 +246,7 @@ fn display_list_to_slide_internal<'a>(
         isolated_scope_stack: Vec::new(),
         page_backdrop_index: None,
         soft_mask_cache: SoftMaskAnalysisCache::default(),
+        tiling_backdrop_cache: TilingBackdropCache::default(),
         image_counter: 0,
         clip_stack: Vec::new(),
         shared_clip_stack: None,
@@ -258,6 +261,11 @@ fn display_list_to_slide_internal<'a>(
 
     converter.convert_display_list(display_list)?;
     converter.stats.type3_bounds_cache_entries = converter.type3_glyph_bounds.len();
+    #[cfg(test)]
+    {
+        converter.stats.tiling_backdrop_cmd_scans =
+            converter.tiling_backdrop_cache.commands_scanned;
+    }
 
     Ok((
         PptxSlide {
@@ -955,6 +963,8 @@ struct SlideConverter<'a> {
     page_backdrop_index: Option<BackdropIndex>,
     /// Shared cache of soft-mask display-list analysis across all mask uses on the slide.
     soft_mask_cache: SoftMaskAnalysisCache,
+    /// Shared memoization cache for tiling-pattern backdrop checks on this slide.
+    tiling_backdrop_cache: TilingBackdropCache,
     image_counter: usize,
     clip_stack: Vec<&'a RenderCommand>,
     shared_clip_stack: Option<std::rc::Rc<[&'a RenderCommand]>>,
@@ -997,12 +1007,13 @@ impl<'a> SlideConverter<'a> {
                     && *alpha > 0.0
             ) || command_has_renderable_overprint(c, self.font_cache)
                 || command_has_backdrop_dependent_native_overprint(c, self.font_cache)
-                || command_uses_tiling_backdrop(c, self.font_cache)
+                || command_uses_tiling_backdrop(c, self.font_cache, &mut self.tiling_backdrop_cache)
         });
         let isolated_inner_blends = compute_isolated_inner_non_normal_blends(
             commands,
             self.font_cache,
             &mut self.soft_mask_cache,
+            &mut self.tiling_backdrop_cache,
             &mut self.stats,
         );
         let later_non_normal_blends = NonNormalBlendIndex::build(
@@ -1010,6 +1021,7 @@ impl<'a> SlideConverter<'a> {
             self.page_rect,
             self.font_cache,
             &mut self.soft_mask_cache,
+            &mut self.tiling_backdrop_cache,
             &mut self.stats,
             !expanded.is_empty(),
         );
@@ -1176,7 +1188,11 @@ impl<'a> SlideConverter<'a> {
                             is_opaque_isolated_normal,
                             mask_analysis.renderable,
                         )?;
-                        let uses_backdrop = group_uses_page_backdrop(group_slice, self.font_cache);
+                        let uses_backdrop = group_uses_page_backdrop(
+                            group_slice,
+                            self.font_cache,
+                            &mut self.tiling_backdrop_cache,
+                        );
                         let backdrop =
                             uses_backdrop.then_some((commands.as_slice(), cmd_idx, end_idx));
                         let group_clip_len = self.clip_stack.len();
@@ -1294,7 +1310,11 @@ impl<'a> SlideConverter<'a> {
                             false,
                             RenderableMaskBounds::Unbounded,
                         )?;
-                        let uses_backdrop = group_uses_page_backdrop(group_slice, self.font_cache);
+                        let uses_backdrop = group_uses_page_backdrop(
+                            group_slice,
+                            self.font_cache,
+                            &mut self.tiling_backdrop_cache,
+                        );
                         let backdrop =
                             uses_backdrop.then_some((commands.as_slice(), cmd_idx, g_end - 1));
                         self.flatten_commands_group(group_slice, None, self.page_rect, backdrop)?;
@@ -1324,7 +1344,11 @@ impl<'a> SlideConverter<'a> {
                         false,
                         RenderableMaskBounds::Unbounded,
                     )?;
-                    let uses_backdrop = group_uses_page_backdrop(group_slice, self.font_cache);
+                    let uses_backdrop = group_uses_page_backdrop(
+                        group_slice,
+                        self.font_cache,
+                        &mut self.tiling_backdrop_cache,
+                    );
                     let backdrop = uses_backdrop.then_some((commands.as_slice(), cmd_idx, end_idx));
                     self.flatten_commands_group(group_slice, None, self.page_rect, backdrop)?;
                     for cmd in group_slice {
@@ -3666,7 +3690,11 @@ impl<'a> SlideConverter<'a> {
                     .is_some_and(|f| f.has_font_data());
                 let is_tiling = matches!(glyph_run.paint, Paint::Tiling(_));
                 let overprint_backdrop = command_has_renderable_overprint(cmd, self.font_cache);
-                let tiling_backdrop = command_uses_tiling_backdrop(cmd, self.font_cache);
+                let tiling_backdrop = command_uses_tiling_backdrop(
+                    cmd,
+                    self.font_cache,
+                    &mut self.tiling_backdrop_cache,
+                );
                 if has_outlines && (is_tiling || in_artwork_range || overprint_backdrop) {
                     let backdrop = (overprint_backdrop || tiling_backdrop).then_some((
                         all_commands,
@@ -3728,7 +3756,11 @@ impl<'a> SlideConverter<'a> {
                 }
                 let is_tiling = matches!(paint, Paint::Tiling(_));
                 let overprint_backdrop = overprint.is_some_and(|op| op.active != 0);
-                let tiling_backdrop = command_uses_tiling_backdrop(cmd, self.font_cache);
+                let tiling_backdrop = command_uses_tiling_backdrop(
+                    cmd,
+                    self.font_cache,
+                    &mut self.tiling_backdrop_cache,
+                );
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
                 let raster_artwork = is_tiling
@@ -3794,7 +3826,11 @@ impl<'a> SlideConverter<'a> {
                 }
                 let is_tiling = matches!(paint, Paint::Tiling(_));
                 let overprint_backdrop = overprint.is_some_and(|op| op.active != 0);
-                let tiling_backdrop = command_uses_tiling_backdrop(cmd, self.font_cache);
+                let tiling_backdrop = command_uses_tiling_backdrop(
+                    cmd,
+                    self.font_cache,
+                    &mut self.tiling_backdrop_cache,
+                );
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
                 let raster_artwork = is_tiling
@@ -4684,6 +4720,7 @@ fn compute_isolated_inner_non_normal_blends(
     commands: &[RenderCommand],
     font_cache: &FontCache,
     soft_mask_cache: &mut SoftMaskAnalysisCache,
+    tiling_backdrop_cache: &mut TilingBackdropCache,
     stats: &mut ConversionStats,
 ) -> Vec<bool> {
     let mut flags = vec![false; commands.len()];
@@ -4698,7 +4735,7 @@ fn compute_isolated_inner_non_normal_blends(
                 && alpha.is_finite()
                 && *alpha > 0.0
         ) || command_has_renderable_overprint(c, font_cache)
-            || command_uses_tiling_backdrop(c, font_cache)
+            || command_uses_tiling_backdrop(c, font_cache, tiling_backdrop_cache)
     }) {
         return flags;
     }
@@ -4756,7 +4793,11 @@ fn compute_isolated_inner_non_normal_blends(
             other
                 if zero_alpha_depth == 0
                     && (command_has_renderable_overprint(other, font_cache)
-                        || command_uses_tiling_backdrop(other, font_cache)) =>
+                        || command_uses_tiling_backdrop(
+                            other,
+                            font_cache,
+                            tiling_backdrop_cache,
+                        )) =>
             {
                 if let Some((_, _, has_inner)) = stack.last_mut() {
                     *has_inner = true;
@@ -4849,6 +4890,7 @@ impl NonNormalBlendIndex {
         page_rect: Rect,
         font_cache: &FontCache,
         soft_mask_cache: &mut SoftMaskAnalysisCache,
+        tiling_backdrop_cache: &mut TilingBackdropCache,
         stats: &mut ConversionStats,
         enabled: bool,
     ) -> Self {
@@ -4994,7 +5036,11 @@ impl NonNormalBlendIndex {
                 other
                     if isolated_normal_depth == 0
                         && (command_has_renderable_overprint(other, font_cache)
-                            || command_uses_tiling_backdrop(other, font_cache)) =>
+                            || command_uses_tiling_backdrop(
+                                other,
+                                font_cache,
+                                tiling_backdrop_cache,
+                            )) =>
                 {
                     if let Some(clip_rect) = clip_stack.last().copied().unwrap_or(Some(page_rect)) {
                         let draw_rect = match compute_commands_bounds(
@@ -6104,22 +6150,60 @@ fn resolve_overprint_color_on_rgb(
     (enc(rr), enc(rg), enc(rb))
 }
 
+/// Per-slide memoization table for `group_uses_page_backdrop_depth` /
+/// `command_uses_tiling_backdrop_depth`, keyed by `(Arc<DisplayList> pointer,
+/// recursion depth)` so shared nested pattern cell DAGs scan in linear time
+/// across every export pass.
+#[derive(Default)]
+struct TilingBackdropCache {
+    memo: std::collections::HashMap<(usize, u8), bool>,
+    #[cfg(test)]
+    commands_scanned: usize,
+}
+
 /// Whether flattening `cmds` depends on the already-painted page backdrop
 /// (a visible non-Normal blend group, renderable partial-colorant overprint,
 /// or backdrop-dependent `Paint::Tiling` not shielded by an enclosing isolated
 /// Normal group).
-fn group_uses_page_backdrop(cmds: &[RenderCommand], font_cache: &FontCache) -> bool {
-    group_uses_page_backdrop_depth(cmds, font_cache, 0)
+fn group_uses_page_backdrop(
+    cmds: &[RenderCommand],
+    font_cache: &FontCache,
+    cache: &mut TilingBackdropCache,
+) -> bool {
+    group_uses_page_backdrop_depth(cmds, font_cache, 0, cache)
 }
 
-fn command_uses_tiling_backdrop(cmd: &RenderCommand, font_cache: &FontCache) -> bool {
-    command_uses_tiling_backdrop_depth(cmd, font_cache, 0)
+fn command_uses_tiling_backdrop(
+    cmd: &RenderCommand,
+    font_cache: &FontCache,
+    cache: &mut TilingBackdropCache,
+) -> bool {
+    command_uses_tiling_backdrop_depth(cmd, font_cache, 0, cache)
+}
+
+fn tiling_cell_uses_page_backdrop(
+    cell: &std::sync::Arc<DisplayList>,
+    font_cache: &FontCache,
+    depth: u8,
+    cache: &mut TilingBackdropCache,
+) -> bool {
+    if depth >= 16 {
+        return true;
+    }
+    let key = (std::sync::Arc::as_ptr(cell) as usize, depth);
+    if let Some(&cached) = cache.memo.get(&key) {
+        return cached;
+    }
+    let result = group_uses_page_backdrop_depth(&cell.commands, font_cache, depth, cache);
+    cache.memo.insert(key, result);
+    result
 }
 
 fn command_uses_tiling_backdrop_depth(
     cmd: &RenderCommand,
     font_cache: &FontCache,
     depth: u8,
+    cache: &mut TilingBackdropCache,
 ) -> bool {
     if depth >= 16 {
         return true;
@@ -6140,7 +6224,7 @@ fn command_uses_tiling_backdrop_depth(
             alpha.is_finite()
                 && *alpha > 0.0
                 && !overprint.is_some_and(|op| op.active == 0)
-                && group_uses_page_backdrop_depth(&tiling.commands.commands, font_cache, depth + 1)
+                && tiling_cell_uses_page_backdrop(&tiling.commands, font_cache, depth + 1, cache)
         }
         RenderCommand::DrawGlyphRun(run) => {
             if let Paint::Tiling(tiling) = &run.paint {
@@ -6150,10 +6234,11 @@ fn command_uses_tiling_backdrop_depth(
                     && font_cache
                         .get(run.font_id)
                         .is_some_and(|f| f.has_font_data())
-                    && group_uses_page_backdrop_depth(
-                        &tiling.commands.commands,
+                    && tiling_cell_uses_page_backdrop(
+                        &tiling.commands,
                         font_cache,
                         depth + 1,
+                        cache,
                     )
             } else {
                 false
@@ -6167,9 +6252,14 @@ fn group_uses_page_backdrop_depth(
     cmds: &[RenderCommand],
     font_cache: &FontCache,
     depth: u8,
+    cache: &mut TilingBackdropCache,
 ) -> bool {
     let mut isolated_normal_depth = 0usize;
     for cmd in cmds {
+        #[cfg(test)]
+        {
+            cache.commands_scanned = cache.commands_scanned.saturating_add(1);
+        }
         match cmd {
             RenderCommand::PushBlendGroup {
                 blend_mode,
@@ -6204,7 +6294,7 @@ fn group_uses_page_backdrop_depth(
             other
                 if isolated_normal_depth == 0
                     && (command_has_renderable_overprint(other, font_cache)
-                        || command_uses_tiling_backdrop_depth(other, font_cache, depth)) =>
+                        || command_uses_tiling_backdrop_depth(other, font_cache, depth, cache)) =>
             {
                 return true;
             }
@@ -22415,6 +22505,97 @@ mod export_tests {
         assert!(
             px[0] < 10 && px[1] < 10 && px[2] > 245,
             "PPTX slide image mask with white Multiply tiling over blue must stay blue, got {px:?}"
+        );
+    }
+
+    #[test]
+    fn shared_nested_normal_tiling_dag_memoizes_backdrop_scans() {
+        use std::sync::Arc;
+        use zpdf_display_list::{FillRule, Path, TilingPattern};
+
+        // 15-level diamond DAG where each level paints 16 references to the same
+        // child `Arc<DisplayList>` (16^15 ≈ 1.15e18 naive paths!), all Normal.
+        // Memoizing backdrop checks by `(Arc::as_ptr(&cell), depth)` completes in
+        // O(unique cell commands) instead of traversing exponential paths.
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut child_arc = Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        Arc::make_mut(&mut child_arc).push(RenderCommand::FillPath {
+            path: sq.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        for _ in 0..14 {
+            let child = Arc::new(TilingPattern {
+                commands: Arc::clone(&child_arc),
+                bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+                x_step: 10.0,
+                y_step: 10.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            });
+            let mut parent = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+            for _ in 0..16 {
+                parent.push(RenderCommand::FillPath {
+                    path: sq.clone(),
+                    rule: FillRule::NonZero,
+                    paint: Paint::Tiling(Arc::clone(&child)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+            child_arc = Arc::new(parent);
+        }
+        let root_tiling = Arc::new(TilingPattern {
+            commands: child_arc,
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(root_tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let mut cache = TilingBackdropCache::default();
+        let fonts = FontCache::new();
+        assert!(
+            !command_uses_tiling_backdrop(&dl.commands[0], &fonts, &mut cache),
+            "Normal-only 15-level DAG must report false for page backdrop dependence"
+        );
+        // 14 intermediate levels × 16 commands + 1 leaf command = 225 unique commands.
+        assert!(
+            cache.commands_scanned <= 250,
+            "memoized backdrop scan must visit each (cell, depth) once (<= 250), got {}",
+            cache.commands_scanned
+        );
+
+        // Verify full PPTX slide export also stays bounded across all export passes
+        // (native_only_texts scan, isolated_inner_blends, and convert_command).
+        let (slide, stats) = display_list_to_slide_internal(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("slide export must succeed promptly");
+        assert_eq!(slide.elements.len(), 1);
+        assert!(
+            stats.tiling_backdrop_cmd_scans <= 300,
+            "full PPTX export must share memoized backdrop scans across passes (<= 300), got {}",
+            stats.tiling_backdrop_cmd_scans
         );
     }
 }

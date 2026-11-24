@@ -251,7 +251,7 @@ pub fn convert_pdf(
     })
 }
 
-const MAX_TILING_IMAGE_DEPTH: u8 = 8;
+const MAX_TILING_IMAGE_DEPTH: u8 = 16;
 const MAX_TILING_IMAGE_PLACEMENTS: usize = 4096;
 const MAX_TILING_IMAGE_VISITS: usize = 4096;
 const MAX_TILING_IMAGE_SCAN_COMMANDS: usize = 65_536;
