@@ -2,23 +2,82 @@
 
 ## Unreleased
 
+## 0.23.0 — First-class tiling patterns, Type 3 glyphs, CFF FontMatrix, and path transparency
+
+Released 2026-11-25.
+
 ### Compatibility
 
-- **Additive enum variant:** `zpdf_display_list::Paint` adds
-  `Paint::Tiling(Arc<TilingPattern>)` alongside the new `TilingPattern` struct
-  carrying a single pre-interpreted cell `DisplayList`, `/BBox`, `/XStep`,
-  `/YStep`, pattern-to-page matrix, and `/TilingType`. Downstream exhaustive
-  matches on `Paint` must handle `Paint::Tiling`. (#155)
 - **Breaking:** `zpdf_display_list::DisplayList` now stores expanded semantic
-  glyph runs in a private field accessed via `DisplayList::expanded_glyph_runs`
-  and `DisplayList::push_expanded_glyph_run`; construct display lists with
-  `DisplayList::new` rather than struct literals. (#156)
-- **Breaking:** `zpdf_pptx_export::SlideElement` adds the `Opacity { element, alpha }`
-  wrapper variant (alongside `Transformed`) to preserve paint opacity on native
-  editable shapes and text via DrawingML `<a:alpha val="..."/>`. Exhaustive
-  matches on `SlideElement` must handle `SlideElement::Opacity` (unwrapping
-  `element` and multiplying its `alpha` onto inner paints); existing opaque
-  variant constructors are unchanged. (#156)
+  glyph runs, pattern command ranges, and Type 3 glyph command ranges in private
+  fields accessed via `DisplayList::expanded_glyph_runs`,
+  `push_expanded_glyph_run`, `clear_expanded_glyph_runs`, `pattern_ranges`,
+  `push_pattern_range`, `clear_pattern_ranges`, `is_in_pattern_range`,
+  `type3_glyph_ranges`, `push_type3_glyph_range`, `clear_type3_glyph_ranges`,
+  `is_in_type3_glyph_range`, `clear_command_ranges`, `truncate_commands`, and
+  `owned_heap_bytes` (alongside the new `ExpandedGlyphRun`,
+  `RetainedMaskAccounting`, `RetainedMaskDelta`,
+  `RenderCommand::owned_heap_bytes`, and `Path::heap_bytes`). Construct display
+  lists with `DisplayList::new` rather than struct literals. (#156, #199, #155,
+  #200)
+- **Breaking (enum variants):** `zpdf_display_list::Paint` adds
+  `Paint::Tiling(Arc<TilingPattern>)` (alongside the new `TilingPattern`,
+  `TilingOverlapRanges`, `TilingBlendSegment`, `TilingBlendStep`, and
+  `MAX_TILING_OVERLAP_COPIES` items carrying a single pre-interpreted cell
+  `DisplayList`, `/BBox`, `/XStep`, `/YStep`, pattern-to-page matrix, and
+  `/TilingType`) and `Paint::Inherited` (used inside Type 3 CharProcs before an
+  explicit `d0` colour operator and for all marks inside `d1` CharProcs).
+  Downstream exhaustive matches on `Paint` must handle both `Paint::Tiling` and
+  `Paint::Inherited`. (#155, #200)
+- **Breaking (enum variant):** `zpdf_display_list::RenderCommand` adds
+  `RenderCommand::DrawInlineImage(InlineImageDraw)` alongside the new
+  `InlineImage` and `InlineImageDraw` structs carrying a self-contained decoded
+  RGBA8 bitmap directly on the command. Downstream exhaustive matches on
+  `RenderCommand` must handle `RenderCommand::DrawInlineImage`. (#156, #199,
+  #155, #200)
+- **Breaking:** exhaustive `zpdf_font::LoadedFont` struct literals must add
+  `type3_resources: None` and `type3_font_bbox: None` (matching the font
+  constructors and the new `with_type3_resources`, `type3_resources`,
+  `with_type3_font_bbox`, and `type3_font_bbox` methods, alongside the new
+  `Type3Resources`, `Type3XObject`, `Type3ImageXObject`, `Type3FormXObject`,
+  `Type3SoftMask`, `Type3Function`, `Type3Shading` types and
+  `estimated_pdf_{dict,object}_bytes[_within]` helpers). (#155, #200)
+- **Breaking:** exhaustive `zpdf_content::shading::ShadingDef` struct literals
+  must add `bbox: None` (or `Some(rect)` for shadings with an explicit `/BBox`),
+  alongside the new `ShadingDef::finite_geometry_bounds` and
+  `ShadingDef::coords_bounds` methods. (#155, #200)
+- **Breaking (enum variant):** `zpdf_pptx_export::SlideElement` adds the
+  `Opacity { element, alpha }` wrapper variant (alongside `Transformed`) to
+  preserve paint opacity on native editable shapes and text via DrawingML
+  `<a:alpha val="..."/>`. Downstream exhaustive matches on `SlideElement` must
+  handle `SlideElement::Opacity` (unwrapping `element` and multiplying its
+  `alpha` onto inner paints); existing opaque variant constructors are
+  unchanged. (#156, #199, #155, #200)
+- **Additive APIs (non-breaking):**
+  - `zpdf_content::InterpretStats` (already `#[non_exhaustive]`) adds
+    `pub type3_used_dest_bounds: bool`. (#155, #200)
+  - `zpdf_content::interpreter::ContentInterpreter` adds `for_type3_glyph`,
+    `with_type3_resources`, `with_type3_glyph_bbox`,
+    `with_type3_fallback_bounds`, `inverse_map_rect`,
+    `with_anisotropic_stroke_point_limit`, `with_skip_images`, and
+    `with_skip_type3_painting`. (#156, #199, #155, #200)
+  - `zpdf_display_list::SoftMask` adds `SoftMask::transform_with_images`
+    alongside the new `TransformedStroke` enum (`Filled`, `Stroked`, `Empty`);
+    `zpdf_display_list::BlendMode` derives `Hash` and adds
+    `BlendMode::pdf_name`. (#196, #197, #155, #200)
+  - `zpdf_image::ImageCache` adds `mark_placement_dependent`,
+    `is_placement_dependent`, `mark_partial`, `is_partial`, and
+    `type3_image_slot`. (#155, #200)
+  - `zpdf_render_cpu` adds `DEFAULT_RENDER_BUDGET`, `CpuRenderer` methods
+    (`current_surface`, `current_scale`, `is_over_budget`, `set_deadline`,
+    `clear_soft_mask_cache`, `pixmap_dimensions`, `actual_scale`,
+    `is_recording_non_isolated`, `copy_subrect`, `seed_pixmap`), and free
+    functions `collect_type3_mask_inline_images` and `transform_stroke_to_page`.
+    (#156, #199, #155, #200)
+  - `zpdf_writer` adds `PathPaintOptions`, re-exports `BlendMode`, and adds
+    `DocumentBuilder::add_path_with_options` and
+    `DocumentBuilder::add_tagged_path_with_options` while keeping `PathStyle`,
+    `add_path`, and `add_tagged_path` unchanged. (#196, #197)
 
 ### Rendering and performance
 
@@ -34,7 +93,7 @@
   repeats a GPU-rasterized cell texture above that cap, PowerPoint export
   rasterizes clipped pattern fills/strokes into slide images, and rich
   conversion extracts tiling-cell images with bounded transformed placements.
-  (#155)
+  (#155, #200)
 
 ### Rendering and Type 3 fonts (`zpdf-content`, `zpdf-display-list`, `zpdf-pptx-export`, `zpdf-font`, `zpdf-document`)
 
@@ -50,26 +109,37 @@
   inline images keyed by colour/resource/intent/footprint, suspend table rule
   capture during CharProcs, preserve semantic Type 3 runs on `DisplayList` so
   `zpdf-pptx-export` keeps editable text without double-painting, and support
-  `/BaseEncoding` / named `/Encoding` on Type 3 fonts. (#156)
+  `/BaseEncoding` / named `/Encoding` on Type 3 fonts. (#156, #199)
 
 ### Fonts (`zpdf-font`)
 
 - Honour CFF 1.0 top-level and per-FD `FontMatrix` entries (including
-  nibble-encoded real operands and `FDSelect` formats 0 and 3) when extracting
-  CFF glyph outlines, transforming coordinates by the effective `FontMatrix`
-  normalized into `units_per_em` space (using the per-FD matrix directly when
-  the Top DICT omits `FontMatrix`, and guarding against extreme floating-point
-  overflow) so non-0.001, anisotropic, and sheared CFF/`CIDFontType0C` fonts
-  render at the correct scale and slant. (#160)
+  nibble-encoded real operands and `FDSelect` formats 0, 3, and 4, plus `ttcf`
+  OpenType Collection table lookup) when extracting CFF glyph outlines,
+  transforming coordinates by the effective `FontMatrix` normalized into
+  `units_per_em` space (using the per-FD matrix directly when the Top DICT omits
+  `FontMatrix`, and guarding against extreme floating-point overflow) so
+  non-0.001, anisotropic, and sheared CFF/`CIDFontType0C` fonts render at the
+  correct scale and slant. (#160, #198)
 
 ### Authoring (`zpdf-writer`)
 
-- Add `PathPaintOptions`, re-exported `BlendMode`, `DocumentBuilder::add_path_with_options`,
-  and `DocumentBuilder::add_tagged_path_with_options` to support per-path fill
+- Add `PathPaintOptions`, re-exported `BlendMode`,
+  `DocumentBuilder::add_path_with_options`, and
+  `DocumentBuilder::add_tagged_path_with_options` to support per-path fill
   opacity (`/ca`), stroke opacity (`/CA`), and standard PDF blend modes (`/BM`,
   including `BlendMode::Multiply`) via deduplicated `/ExtGState` resources
   isolated inside per-path `q … Q` scopes, while keeping `PathStyle` and
-  `add_path` fully backward-compatible. (#196)
+  `add_path` fully backward-compatible. (#196, #197)
+- Escape marked-content structure role names as PDF Name tokens (`#XX` escaping
+  per ISO 32000-1 §7.3.5) and validate tag roles (rejecting empty or
+  NUL-containing roles) before mutating page state in
+  `DocumentBuilder::add_tagged_*`. (#196, #197)
+
+### Dependencies and distribution
+
+- Rebuild the shipped browser WASM/JS package and source/artifact fingerprint
+  for version 0.23.0.
 
 ## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle
 
