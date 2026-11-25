@@ -32,15 +32,19 @@ Released 2026-11-25.
   `TilingOverlapRanges`, `TilingBlendSegment`, `TilingBlendStep`, and
   `MAX_TILING_OVERLAP_COPIES` items carrying a single pre-interpreted cell
   `DisplayList`, `/BBox`, `/XStep`, `/YStep`, pattern-to-page matrix, and
-  `/TilingType`) and `Paint::Inherited`. Inside Type 3 CharProcs, `d0` only
-  sets the glyph advance — a fill still emits `Paint::Inherited` until the
-  glyph explicitly sets a fill (non-stroking) colour (for example via `rg`),
-  and stroke colour is tracked independently (so strokes emit
-  `Paint::Inherited` until the glyph explicitly sets a stroking colour such as
-  `RG`); inside `d1` CharProcs, colour operators are suppressed so all fills
-  and strokes emit `Paint::Inherited`. Downstream exhaustive matches on `Paint`
-  must handle both `Paint::Tiling` and `Paint::Inherited` (applying the
-  enclosing text paint for `Paint::Inherited`). (#155, #200)
+  `/TilingType`) and `Paint::Inherited`. During normal page interpretation,
+  Type 3 glyphs expand with the page graphics state so `d1` fills and strokes
+  inherit the enclosing nonstroking paint directly (for example emitting
+  `Paint::Solid` or `Paint::Tiling`); during standalone glyph replay with
+  `ContentInterpreter::for_type3_glyph()`, `Paint::Inherited` is emitted
+  whenever that enclosing paint still needs to be supplied — `d0` only sets the
+  glyph advance (so a fill emits `Paint::Inherited` until the glyph explicitly
+  sets a fill colour such as `rg`, and stroke colour is tracked independently
+  until an explicit stroking colour such as `RG` runs), while `d1` suppresses
+  colour operators so all fills and strokes emit `Paint::Inherited`. Downstream
+  exhaustive matches on `Paint` must handle both `Paint::Tiling` and
+  `Paint::Inherited` (applying the enclosing text paint for
+  `Paint::Inherited`). (#155, #200)
 - **Breaking (enum variant):** `zpdf_display_list::RenderCommand` adds
   `RenderCommand::DrawInlineImage(InlineImageDraw)` alongside the new
   `InlineImage` and `InlineImageDraw` structs carrying a self-contained decoded
