@@ -467,14 +467,14 @@ impl PageRecorder {
     /// (honoring `max_gpu_texture_bytes`) and record an image quad referencing it.
     pub fn add_type3_image_cached(
         &mut self,
-        key: Type3ImageKey,
+        key: Option<Type3ImageKey>,
         quad: [TexturedVertex; 4],
         make_img: impl FnOnce() -> zpdf_image::DecodedImage,
     ) {
         if !self.can_record() {
             return;
         }
-        if let Some(&image_id) = self.type3_image_cache.get(&key) {
+        if let Some(image_id) = key.and_then(|k| self.type3_image_cache.get(&k).copied()) {
             self.add_image(quad, image_id);
             return;
         }
@@ -497,7 +497,9 @@ impl PageRecorder {
         };
         self.type3_image_bytes = next_bytes;
         self.type3_images.push(img);
-        self.type3_image_cache.insert(key, image_id);
+        if let Some(k) = key {
+            self.type3_image_cache.insert(k, image_id);
+        }
         self.add_image(quad, image_id);
     }
 

@@ -293,6 +293,9 @@ struct SvgWriter<'a> {
     type3_glyphs: HashMap<(FontId, u16), Option<Rc<Type3Glyph>>>,
     type3_glyph_commands: usize,
     type3_glyph_image_bytes: u64,
+    /// Content-interpreter limits applied when replaying standalone Type 3
+    /// CharProc streams.
+    parse_limits: zpdf_core::ParseLimits,
 }
 
 /// What an `<image>` def holds: a page image, a retained inline image, a Type 3
@@ -690,6 +693,7 @@ impl<'a> SvgWriter<'a> {
             type3_glyphs: HashMap::new(),
             type3_glyph_commands: 0,
             type3_glyph_image_bytes: 0,
+            parse_limits: zpdf_core::ParseLimits::default(),
         }
     }
 
@@ -5262,7 +5266,7 @@ impl<'a> SvgWriter<'a> {
                 bounds: Option<SvgRect>,
             },
             ColoredImage {
-                key: ImageDefKey,
+                key: Option<ImageDefKey>,
                 program: Rc<Type3Glyph>,
                 image_id: ImageId,
                 transform: zpdf_core::Matrix,
@@ -5433,7 +5437,7 @@ impl<'a> SvgWriter<'a> {
                             let prev_mask = writer.stroke_mask;
                             writer.clip = *clip;
                             writer.stroke_mask = *stroke_mask;
-                            writer.place_image(*key, image, None, transform, *alpha * opacity);
+                            writer.place_image_opt(*key, image, None, transform, *alpha * opacity);
                             writer.clip = prev_clip;
                             writer.stroke_mask = prev_mask;
                         }
@@ -5837,17 +5841,18 @@ impl<'a> SvgWriter<'a> {
                             max_x = max_x.max(ix1);
                             max_y = max_y.max(iy1);
                             let tint = [white.r, white.g, white.b, white.a].map(f32::to_bits);
-                            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
-                            let key = ImageDefKey::Type3Stencil {
-                                font: run.font_id,
-                                glyph: glyph.glyph_id,
-                                image: slot,
-                                tint,
-                                placement_bounds: is_dep
-                                    .then_some(program.placement_bounds)
-                                    .flatten(),
-                            };
-                            self.place_image(key, image, Some(&white), &transform, alpha);
+                            let key = program.images.type3_image_slot(draw.image_id).map(
+                                |(is_dep, slot)| ImageDefKey::Type3Stencil {
+                                    font: run.font_id,
+                                    glyph: glyph.glyph_id,
+                                    image: slot,
+                                    tint,
+                                    placement_bounds: is_dep
+                                        .then_some(program.placement_bounds)
+                                        .flatten(),
+                                },
+                            );
+                            self.place_image_opt(key, image, Some(&white), &transform, alpha);
                         } else {
                             flush_shape(
                                 self,
@@ -5859,16 +5864,17 @@ impl<'a> SvgWriter<'a> {
                                 &mut max_y,
                                 &mut cur_pad,
                             );
-                            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
-                            let key = ImageDefKey::Type3Stencil {
-                                font: run.font_id,
-                                glyph: glyph.glyph_id,
-                                image: slot,
-                                tint: [u32::MAX; 4],
-                                placement_bounds: is_dep
-                                    .then_some(program.placement_bounds)
-                                    .flatten(),
-                            };
+                            let key = program.images.type3_image_slot(draw.image_id).map(
+                                |(is_dep, slot)| ImageDefKey::Type3Stencil {
+                                    font: run.font_id,
+                                    glyph: glyph.glyph_id,
+                                    image: slot,
+                                    tint: [u32::MAX; 4],
+                                    placement_bounds: is_dep
+                                        .then_some(program.placement_bounds)
+                                        .flatten(),
+                                },
+                            );
                             let bounds = SvgRect::from_bounds_clamped(
                                 ix0,
                                 iy0,
@@ -6040,7 +6046,7 @@ impl<'a> SvgWriter<'a> {
                             let prev_mask = writer.stroke_mask;
                             writer.clip = *clip;
                             writer.stroke_mask = *stroke_mask;
-                            writer.place_image(*key, image, None, transform, *alpha * opacity);
+                            writer.place_image_opt(*key, image, None, transform, *alpha * opacity);
                             writer.clip = prev_clip;
                             writer.stroke_mask = prev_mask;
                         }
@@ -6454,7 +6460,7 @@ impl<'a> SvgWriter<'a> {
         if let Some(glyph) = self.type3_glyphs.get(&(font_id, glyph_id)) {
             return glyph.clone();
         }
-        let mut used_dest_bounds = false;
+        let mut skip_cache = false;
         let glyph = font
             .type3_glyph_stream(glyph_id)
             .map(|(stream, font_matrix)| {
@@ -6465,12 +6471,18 @@ impl<'a> SvgWriter<'a> {
                     .with_type3_resources(font.type3_resources())
                     .with_type3_glyph_bbox(font.type3_font_bbox())
                     .with_type3_fallback_bounds(dest_bounds)
-                    .with_images(&mut images);
+                    .with_images(&mut images)
+                    .with_limits(&self.parse_limits);
                 if let Some(deadline) = self.deadline {
                     interp = interp.with_deadline(deadline);
                 }
                 let (list, stats) = interp.interpret_with_stats(stream);
-                used_dest_bounds = stats.type3_used_dest_bounds;
+                if stats.diagnostics.resource_limit_reached || stats.diagnostics.time_limit_reached
+                {
+                    images.mark_partial();
+                }
+                let used_dest_bounds = stats.type3_used_dest_bounds;
+                skip_cache = used_dest_bounds || images.is_partial();
                 let placement_bounds = used_dest_bounds.then(|| match dest_bounds {
                     Some(r) => [
                         canonical_f64_bits(r.x0),
@@ -6487,7 +6499,7 @@ impl<'a> SvgWriter<'a> {
                     placement_bounds,
                 })
             });
-        if used_dest_bounds {
+        if skip_cache {
             return glyph;
         }
         let (commands, image_bytes) = glyph.as_ref().map_or((1, 0), |g| {
@@ -6678,31 +6690,39 @@ impl<'a> SvgWriter<'a> {
                             // The glyph interpreter paints stencils in its
                             // default black; the text colour is the paint.
                             let tint = [color.r, color.g, color.b, color.a].map(f32::to_bits);
-                            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
-                            let key = ImageDefKey::Type3Stencil {
-                                font: run.font_id,
-                                glyph: glyph.glyph_id,
-                                image: slot,
-                                tint,
-                                placement_bounds: is_dep
-                                    .then_some(program.placement_bounds)
-                                    .flatten(),
-                            };
-                            self.place_image(key, image, Some(color), &transform, alpha * opacity);
+                            let key = program.images.type3_image_slot(draw.image_id).map(
+                                |(is_dep, slot)| ImageDefKey::Type3Stencil {
+                                    font: run.font_id,
+                                    glyph: glyph.glyph_id,
+                                    image: slot,
+                                    tint,
+                                    placement_bounds: is_dep
+                                        .then_some(program.placement_bounds)
+                                        .flatten(),
+                                },
+                            );
+                            self.place_image_opt(
+                                key,
+                                image,
+                                Some(color),
+                                &transform,
+                                alpha * opacity,
+                            );
                         } else {
                             // A coloured (`d0`) glyph's image keeps its own
                             // colours; cache it per glyph like a stencil.
-                            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
-                            let key = ImageDefKey::Type3Stencil {
-                                font: run.font_id,
-                                glyph: glyph.glyph_id,
-                                image: slot,
-                                tint: [u32::MAX; 4],
-                                placement_bounds: is_dep
-                                    .then_some(program.placement_bounds)
-                                    .flatten(),
-                            };
-                            self.place_image(key, image, None, &transform, alpha * opacity);
+                            let key = program.images.type3_image_slot(draw.image_id).map(
+                                |(is_dep, slot)| ImageDefKey::Type3Stencil {
+                                    font: run.font_id,
+                                    glyph: glyph.glyph_id,
+                                    image: slot,
+                                    tint: [u32::MAX; 4],
+                                    placement_bounds: is_dep
+                                        .then_some(program.placement_bounds)
+                                        .flatten(),
+                                },
+                            );
+                            self.place_image_opt(key, image, None, &transform, alpha * opacity);
                         }
                     }
                     _ => {}
@@ -6755,19 +6775,16 @@ impl<'a> SvgWriter<'a> {
                 );
                 return;
             };
-            let (is_dep, slot) = program.images.type3_image_slot(draw.image_id);
-            self.place_image(
-                ImageDefKey::Type3MaskImage {
+            let key = program
+                .images
+                .type3_image_slot(draw.image_id)
+                .map(|(is_dep, slot)| ImageDefKey::Type3MaskImage {
                     font: font_id,
                     glyph: glyph_id,
                     image: slot,
                     placement_bounds: is_dep.then_some(program.placement_bounds).flatten(),
-                },
-                image,
-                None,
-                &draw.transform,
-                alpha,
-            );
+                });
+            self.place_image_opt(key, image, None, &draw.transform, alpha);
             return;
         }
         let Some(image) = self.images.get(draw.image_id) else {
@@ -6840,8 +6857,19 @@ impl<'a> SvgWriter<'a> {
         transform: &zpdf_core::Matrix,
         alpha: f32,
     ) {
+        self.place_image_opt(Some(key), image, tint, transform, alpha);
+    }
+
+    fn place_image_opt(
+        &mut self,
+        key: Option<ImageDefKey>,
+        image: &DecodedImage,
+        tint: Option<&Color>,
+        transform: &zpdf_core::Matrix,
+        alpha: f32,
+    ) {
         self.place_rgba_image(
-            Some(key),
+            key,
             image.width,
             image.height,
             &image.data,
@@ -14756,6 +14784,266 @@ mod tests {
         assert!(
             p2_blue.red() < 15 && p2_blue.blue() > 240,
             "placement 2 right gradient must remain blue, got {p2_blue:?}"
+        );
+    }
+
+    #[test]
+    fn svg_type3_partial_image_budget_does_not_alias_surviving_blue_bitmap_to_red() {
+        use std::sync::Arc;
+        use zpdf_font::{
+            Type3Function, Type3ImageXObject, Type3Resources, Type3Shading, Type3XObject,
+        };
+
+        // CharProc paints:
+        //   1. Unbounded axial shading `/Fade sh` (`/FontBBox [0 0 0 0]`)
+        //   2. Large 128×128 solid red bitmap `/Red Do` (64 KiB RGBA) at [0..10, 0..10] page units
+        //   3. Small 4×4 solid blue bitmap `/Blue Do` (64 B RGBA) at [12..20, 0..10] page units
+        // Under a 960_000-byte per-glyph image budget:
+        //   - Placement 1 (clipped to 100×10, aspect 10:1 -> 768×77 ≈ 236 KiB gradient):
+        //     gradient + red (64 KiB) + blue (64 B) all fit; red lands in fixed slot 0.
+        //   - Placement 2 (clipped to 100×40, aspect 2.5:1 -> 768×308 ≈ 946 KiB gradient):
+        //     gradient fits, red (64 KiB) is DROPPED by `admit_image`, and blue (64 B)
+        //     survives at local `image_id = 1` (red's former slot).
+        // Bypassing cross-placement image reuse on partial glyph caches ensures the
+        // surviving blue bitmap renders BLUE instead of aliasing Placement 1's red PNG.
+        let mut func_dict = zpdf_core::PdfDict::new();
+        func_dict.insert(
+            zpdf_core::PdfName::new("FunctionType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("Domain"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C0"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.2),
+                zpdf_core::PdfObject::Real(0.2),
+                zpdf_core::PdfObject::Real(0.2),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C1"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.8),
+                zpdf_core::PdfObject::Real(0.8),
+                zpdf_core::PdfObject::Real(0.8),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("N"),
+            zpdf_core::PdfObject::Real(1.0),
+        );
+        let mut sh_dict = zpdf_core::PdfDict::new();
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ShadingType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Coords"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1000.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Extend"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Bool(true),
+                zpdf_core::PdfObject::Bool(true),
+            ]),
+        );
+
+        let make_rgb_xobj = |w: i64, h: i64, rgb: [u8; 3]| -> Arc<Type3ImageXObject> {
+            let mut d = zpdf_core::PdfDict::new();
+            d.insert(
+                zpdf_core::PdfName::new("Subtype"),
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Image")),
+            );
+            d.insert(
+                zpdf_core::PdfName::new("Width"),
+                zpdf_core::PdfObject::Integer(w),
+            );
+            d.insert(
+                zpdf_core::PdfName::new("Height"),
+                zpdf_core::PdfObject::Integer(h),
+            );
+            d.insert(
+                zpdf_core::PdfName::new("BitsPerComponent"),
+                zpdf_core::PdfObject::Integer(8),
+            );
+            d.insert(
+                zpdf_core::PdfName::new("ColorSpace"),
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+            );
+            let data: Vec<u8> = rgb.into_iter().cycle().take((w * h * 3) as usize).collect();
+            Arc::new(Type3ImageXObject {
+                dict: d,
+                data: Arc::from(data),
+                smask: None,
+                mask_stream: None,
+            })
+        };
+
+        let mut t3_res = Type3Resources::default();
+        t3_res.shadings.insert(
+            "Fade".into(),
+            Arc::new(Type3Shading {
+                dict: sh_dict,
+                stream_data: None,
+                functions: vec![Arc::new(Type3Function::Dict {
+                    dict: func_dict,
+                    children: Vec::new(),
+                })],
+            }),
+        );
+        t3_res.xobjects.insert(
+            "Red".into(),
+            Type3XObject::Image(make_rgb_xobj(128, 128, [255, 0, 0])),
+        );
+        t3_res.xobjects.insert(
+            "Blue".into(),
+            Type3XObject::Image(make_rgb_xobj(4, 4, [0, 0, 255])),
+        );
+
+        // FontMatrix = 0.04 => 250 glyph units = 10 page units.
+        // Red at [0..250, 0..250] -> [0..10, 0..10]; Blue at [300..500, 0..250] -> [12..20, 0..10].
+        let charproc = b"2500 0 d0 /Fade sh \
+                         q 250 0 0 250 0 0 cm /Red Do Q \
+                         q 200 0 0 250 300 0 cm /Blue Do Q";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.04, 0.0, 0.0, 0.04, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![2500.0],
+                first_char: 0,
+            },
+            "PartialImageBudgetBlueSurvivesSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(2500.0),
+        )
+        .with_type3_resources(Arc::new(t3_res))
+        .with_type3_font_bbox(Rect::new(0.0, 0.0, 0.0, 0.0));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 60.0));
+        // Placement 1: narrow 100×10 strip at y=[0..10] -> ~236 KiB gradient; all 3 images fit.
+        dl.push(RenderCommand::PushClip {
+            path: rect_path(0.0, 0.0, 100.0, 10.0),
+            rule: FillRule::NonZero,
+        });
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        dl.push(RenderCommand::PopClip);
+        // Placement 2: tall 100×40 strip at y=[20..60] -> ~946 KiB gradient; drops 64 KiB Red, keeps 64 B Blue.
+        dl.push(RenderCommand::PushClip {
+            path: rect_path(0.0, 20.0, 100.0, 60.0),
+            rule: FillRule::NonZero,
+        });
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 20.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        dl.push(RenderCommand::PopClip);
+
+        let images = ImageCache::new();
+        let options = SvgOptions::default();
+        let mut writer = SvgWriter::new(
+            dl.page_rect,
+            100.0,
+            60.0,
+            &dl.commands,
+            &fonts,
+            &images,
+            &options,
+        );
+        // Placement 1 padded clip is ~100×12 (~286 KiB gradient); all 3 fit.
+        // Placement 2 padded clip is ~100×42 (~992 KiB gradient); gradient fits,
+        // 64 KiB Red exceeds 1_010_000 B and is dropped, while 64 B Blue survives.
+        writer.parse_limits.max_image_cache_bytes = 1_010_000;
+        writer.emit_commands(&dl.commands, EmitDepth::default());
+        writer.flush_pending_backdrop();
+        writer.flush_disjoint_backdrop();
+        let svg = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100pt\" height=\"60pt\" viewBox=\"0 0 100 60\">\n\
+             <defs>\n{}</defs>\n{}</svg>\n",
+            writer.defs, writer.out
+        );
+
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(100, 60).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(
+                100.0 / tree.size().width(),
+                60.0 / tree.size().height(),
+            ),
+            &mut pixmap.as_mut(),
+        );
+        // Placement 1 (page y=[0..10] -> svg y=[50..60]): Red at (5, 55), Blue at (16, 55).
+        let p1_red = pixmap.pixel(5, 55).expect("p1_red");
+        let p1_blue = pixmap.pixel(16, 55).expect("p1_blue");
+        assert!(
+            p1_red.red() > 240 && p1_red.blue() < 15,
+            "placement 1 red bitmap must be red, got {p1_red:?}"
+        );
+        assert!(
+            p1_blue.blue() > 240 && p1_blue.red() < 15,
+            "placement 1 blue bitmap must be blue, got {p1_blue:?}"
+        );
+        // Placement 2 (page y=[20..30] -> svg y=[30..40]): Red was dropped (gray gradient at (5, 35)),
+        // surviving Blue at (16, 35) MUST remain blue (NOT aliased to Placement 1's red PNG!).
+        let p2_dropped_red = pixmap.pixel(5, 35).expect("p2_dropped_red");
+        let p2_surviving_blue = pixmap.pixel(16, 35).expect("p2_surviving_blue");
+        assert!(
+            p2_dropped_red.red().abs_diff(p2_dropped_red.blue()) < 15,
+            "placement 2 red bitmap should have been dropped under 960 KB cap leaving gray gradient, got {p2_dropped_red:?}"
+        );
+        assert!(
+            p2_surviving_blue.blue() > 240 && p2_surviving_blue.red() < 15,
+            "placement 2 surviving blue bitmap must stay blue (not reuse red slot 0 PNG), got {p2_surviving_blue:?}"
         );
     }
 }

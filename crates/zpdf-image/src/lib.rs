@@ -19,6 +19,10 @@ pub struct ImageCache {
     /// Image IDs whose pixel contents depended on placement bounds (e.g.
     /// standalone Type 3 unclipped unbounded shadings with all-zero `/FontBBox`).
     placement_dependent: Vec<ImageId>,
+    /// Set whenever an image admission was rejected or marked truncated so
+    /// cross-placement Type 3 caches never alias surviving images into an
+    /// earlier dropped bitmap's slot.
+    partial: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +45,7 @@ impl ImageCache {
             next_id: 0,
             bytes_used: 0,
             placement_dependent: Vec::new(),
+            partial: false,
         }
     }
 
@@ -61,21 +66,34 @@ impl ImageCache {
         self.placement_dependent.contains(&id)
     }
 
-    /// Return `(is_placement_dependent, category_ordinal)` for `id` within a
-    /// freshly interpreted Type 3 glyph `ImageCache`. Invariant bitmaps and
-    /// placement-dependent shading rasters are numbered independently (`0, 1,
-    /// ...`), so fixed bitmaps keep stable cache keys across placements even
-    /// when an unbounded shading is present in the same CharProc or skipped at
-    /// another placement.
-    pub fn type3_image_slot(&self, id: ImageId) -> (bool, u32) {
+    /// Mark this cache as partial (an image was dropped or interpretation
+    /// truncated), disabling cross-placement fixed-slot reuse.
+    pub fn mark_partial(&mut self) {
+        self.partial = true;
+    }
+
+    /// True when at least one image admission failed or this cache was marked
+    /// partial.
+    pub fn is_partial(&self) -> bool {
+        self.partial
+    }
+
+    /// Return `Some((is_placement_dependent, category_ordinal))` for `id`
+    /// within a complete freshly interpreted Type 3 glyph `ImageCache`, or
+    /// `None` when the cache is partial so callers bypass cross-placement
+    /// image reuse and never alias a surviving bitmap into a dropped slot.
+    pub fn type3_image_slot(&self, id: ImageId) -> Option<(bool, u32)> {
+        if self.partial {
+            return None;
+        }
         if self.placement_dependent.is_empty() {
-            return (false, id);
+            return Some((false, id));
         }
         if let Some(pos) = self.placement_dependent.iter().position(|&p| p == id) {
-            (true, pos as u32)
+            Some((true, pos as u32))
         } else {
             let prior_dep = self.placement_dependent.iter().filter(|&&p| p < id).count() as u32;
-            (false, id.saturating_sub(prior_dep))
+            Some((false, id.saturating_sub(prior_dep)))
         }
     }
 
@@ -108,12 +126,22 @@ impl ImageCache {
     ) -> Option<ImageId> {
         // Charge the retained allocation, not merely its initialized length:
         // decoded buffers commonly reserve their final RGBA size up front.
-        let image_bytes = u64::try_from(image.data.capacity()).ok()?;
-        let new_total = self.bytes_used.checked_add(image_bytes)?;
+        let Some(image_bytes) = u64::try_from(image.data.capacity()).ok() else {
+            self.partial = true;
+            return None;
+        };
+        let Some(new_total) = self.bytes_used.checked_add(image_bytes) else {
+            self.partial = true;
+            return None;
+        };
         if new_total > max_bytes {
+            self.partial = true;
             return None;
         }
-        let id = self.next_free_id()?;
+        let Some(id) = self.next_free_id() else {
+            self.partial = true;
+            return None;
+        };
         self.images.insert(id, image);
         self.bytes_used = new_total;
         Some(id)

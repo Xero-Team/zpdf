@@ -1430,17 +1430,16 @@ fn record_dl_commands_at(
                         images: cache,
                         placement_bounds,
                     }) => {
-                        let (is_dep, slot) = cache.type3_image_slot(draw.image_id);
-                        (
-                            cache.get(draw.image_id),
-                            Some(record::Type3ImageKey {
+                        let key = cache.type3_image_slot(draw.image_id).map(|(is_dep, slot)| {
+                            record::Type3ImageKey {
                                 font_id,
                                 glyph_id,
                                 image_id: slot,
                                 stencil_tint: None,
                                 placement_bounds: is_dep.then_some(placement_bounds).flatten(),
-                            }),
-                        )
+                            }
+                        });
+                        (cache.get(draw.image_id), Some(key))
                     }
                     None => (None, None),
                 };

@@ -7032,7 +7032,7 @@ impl<'a> CpuRenderer<'a> {
         if let Some(glyph) = self.type3_glyphs.get(&(font_id, glyph_id)) {
             return glyph.clone();
         }
-        let mut used_dest_bounds = false;
+        let mut skip_cache = false;
         let glyph = font
             .type3_glyph_stream(glyph_id)
             .map(|(stream, font_matrix)| {
@@ -7049,7 +7049,11 @@ impl<'a> CpuRenderer<'a> {
                     interp = interp.with_deadline(deadline);
                 }
                 let (list, stats) = interp.interpret_with_stats(stream);
-                used_dest_bounds = stats.type3_used_dest_bounds;
+                if stats.diagnostics.resource_limit_reached || stats.diagnostics.time_limit_reached
+                {
+                    images.mark_partial();
+                }
+                skip_cache = stats.type3_used_dest_bounds || images.is_partial();
                 let inline_images = collect_type3_mask_inline_images(&list, &images);
                 Arc::new(Type3Glyph {
                     list,
@@ -7058,7 +7062,7 @@ impl<'a> CpuRenderer<'a> {
                     font_matrix,
                 })
             });
-        if used_dest_bounds {
+        if skip_cache {
             return glyph;
         }
         let (commands, image_bytes) = glyph.as_ref().map_or((1, 0), |g| {

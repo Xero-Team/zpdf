@@ -6958,6 +6958,9 @@ impl<'a> ContentInterpreter<'a> {
     fn warn_image_dropped(&mut self, bytes: u64) {
         self.type3_image_dropped = true;
         self.stats.diagnostics.resource_limit_reached = true;
+        if let Some(cache) = self.image_cache.as_deref_mut() {
+            cache.mark_partial();
+        }
         tracing::warn!(
             "image cache byte limit ({}) or ID capacity reached; dropping {bytes}-byte image",
             self.max_image_cache_bytes
