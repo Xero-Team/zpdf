@@ -32,10 +32,15 @@ Released 2026-11-25.
   `TilingOverlapRanges`, `TilingBlendSegment`, `TilingBlendStep`, and
   `MAX_TILING_OVERLAP_COPIES` items carrying a single pre-interpreted cell
   `DisplayList`, `/BBox`, `/XStep`, `/YStep`, pattern-to-page matrix, and
-  `/TilingType`) and `Paint::Inherited` (used inside Type 3 CharProcs before an
-  explicit `d0` colour operator and for all marks inside `d1` CharProcs).
-  Downstream exhaustive matches on `Paint` must handle both `Paint::Tiling` and
-  `Paint::Inherited`. (#155, #200)
+  `/TilingType`) and `Paint::Inherited`. Inside Type 3 CharProcs, `d0` only
+  sets the glyph advance — a fill still emits `Paint::Inherited` until the
+  glyph explicitly sets a fill (non-stroking) colour (for example via `rg`),
+  and stroke colour is tracked independently (so strokes emit
+  `Paint::Inherited` until the glyph explicitly sets a stroking colour such as
+  `RG`); inside `d1` CharProcs, colour operators are suppressed so all fills
+  and strokes emit `Paint::Inherited`. Downstream exhaustive matches on `Paint`
+  must handle both `Paint::Tiling` and `Paint::Inherited` (applying the
+  enclosing text paint for `Paint::Inherited`). (#155, #200)
 - **Breaking (enum variant):** `zpdf_display_list::RenderCommand` adds
   `RenderCommand::DrawInlineImage(InlineImageDraw)` alongside the new
   `InlineImage` and `InlineImageDraw` structs carrying a self-contained decoded
@@ -83,8 +88,12 @@ Released 2026-11-25.
     (#156, #199, #155, #200)
   - `zpdf_writer` adds `PathPaintOptions`, re-exports `BlendMode`, and adds
     `DocumentBuilder::add_path_with_options` and
-    `DocumentBuilder::add_tagged_path_with_options` while keeping `PathStyle`,
-    `add_path`, and `add_tagged_path` unchanged. (#196, #197)
+    `DocumentBuilder::add_tagged_path_with_options`. Existing `PathStyle`,
+    `add_path`, and `add_tagged_path` signatures are unchanged, though
+    `add_tagged_path` (like the other `DocumentBuilder::add_tagged_*` methods)
+    now returns `InvalidInput` before mutating page state when passed an empty
+    or NUL-containing custom structure role that succeeded in `0.22.0` (see
+    `### Authoring`). (#196, #197)
 
 ### Rendering and performance
 
@@ -121,7 +130,7 @@ Released 2026-11-25.
 ### Fonts (`zpdf-font`)
 
 - Honour CFF 1.0 top-level and per-FD `FontMatrix` entries (including
-  nibble-encoded real operands and `FDSelect` formats 0, 3, and 4, plus `ttcf`
+  nibble-encoded real operands and `FDSelect` formats 0 and 3, plus `ttcf`
   OpenType Collection table lookup) when extracting CFF glyph outlines,
   transforming coordinates by the effective `FontMatrix` normalized into
   `units_per_em` space (using the per-FD matrix directly when the Top DICT omits
