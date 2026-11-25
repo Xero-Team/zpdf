@@ -19,4 +19,5 @@ zpdf-display-list.workspace = true
 zpdf-font = { workspace = true }
 zpdf-image.workspace = true
 zpdf-color.workspace = true
+tiny-skia-path.workspace = true
 tracing.workspace = true

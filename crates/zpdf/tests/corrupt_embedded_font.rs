@@ -3094,7 +3094,13 @@ fn fallback_text_completeness_handles_pattern_tf_invisible_limits_and_one_byte_t
     assert!(
         pat_page.display_list.commands.iter().any(|cmd| matches!(
             cmd,
-            RenderCommand::DrawGlyphRun(run) if run.font_id == f0_id && !run.glyphs.is_empty()
+            RenderCommand::FillPath {
+                paint: zpdf::display_list::Paint::Tiling(tiling),
+                ..
+            } if tiling.commands.commands.iter().any(|inner| matches!(
+                inner,
+                RenderCommand::DrawGlyphRun(run) if run.font_id == f0_id && !run.glyphs.is_empty()
+            ))
         )),
         "tiling pattern cell must actually execute `/F0 10 Tf` and emit a DrawGlyphRun for /F0"
     );

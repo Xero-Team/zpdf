@@ -10,7 +10,7 @@ mod text_grouper;
 
 use image::ImageEncoder;
 use zpdf_core::{Rect, Result};
-use zpdf_display_list::{DisplayList, RenderCommand};
+use zpdf_display_list::{DisplayList, Paint, RenderCommand};
 use zpdf_font::FontCache;
 use zpdf_image::ImageCache;
 
@@ -220,6 +220,9 @@ struct ConversionStats {
     backdrop_groups_completed: usize,
     native_text_record_visits: usize,
     soft_mask_analysis_visits: usize,
+    type3_bounds_cache_entries: usize,
+    #[cfg(test)]
+    tiling_backdrop_cmd_scans: usize,
 }
 
 fn display_list_to_slide_internal<'a>(
@@ -243,17 +246,26 @@ fn display_list_to_slide_internal<'a>(
         isolated_scope_stack: Vec::new(),
         page_backdrop_index: None,
         soft_mask_cache: SoftMaskAnalysisCache::default(),
+        tiling_backdrop_cache: TilingBackdropCache::default(),
         image_counter: 0,
         clip_stack: Vec::new(),
         shared_clip_stack: None,
         backdrop_mgr: BackdropManager::new(render_budget),
         render_budget,
+        bounds_deadline: render_budget.map(|b| zpdf_core::time::Instant::now() + b),
+        type3_glyph_bounds: std::collections::HashMap::new(),
         stats: ConversionStats::default(),
         #[cfg(test)]
         expire_backdrop_after_groups,
     };
 
     converter.convert_display_list(display_list)?;
+    converter.stats.type3_bounds_cache_entries = converter.type3_glyph_bounds.len();
+    #[cfg(test)]
+    {
+        converter.stats.tiling_backdrop_cmd_scans =
+            converter.tiling_backdrop_cache.commands_scanned;
+    }
 
     Ok((
         PptxSlide {
@@ -951,11 +963,19 @@ struct SlideConverter<'a> {
     page_backdrop_index: Option<BackdropIndex>,
     /// Shared cache of soft-mask display-list analysis across all mask uses on the slide.
     soft_mask_cache: SoftMaskAnalysisCache,
+    /// Shared memoization cache for tiling-pattern backdrop checks on this slide.
+    tiling_backdrop_cache: TilingBackdropCache,
     image_counter: usize,
     clip_stack: Vec<&'a RenderCommand>,
     shared_clip_stack: Option<std::rc::Rc<[&'a RenderCommand]>>,
     backdrop_mgr: BackdropManager<'a>,
     render_budget: Option<std::time::Duration>,
+    /// Shared deadline propagated to Type 3 glyph-bounds measurement.
+    bounds_deadline: Option<zpdf_core::time::Instant>,
+    /// Per-slide cache of conservative glyph-space ink bounds for synthetic
+    /// Type 3 `DrawGlyphRun`s so repeated occurrences never re-interpret
+    /// CharProcs or re-decode images.
+    type3_glyph_bounds: std::collections::HashMap<(zpdf_font::FontId, u16), CommandBounds>,
     stats: ConversionStats,
     #[cfg(test)]
     expire_backdrop_after_groups: Option<usize>,
@@ -987,11 +1007,13 @@ impl<'a> SlideConverter<'a> {
                     && *alpha > 0.0
             ) || command_has_renderable_overprint(c, self.font_cache)
                 || command_has_backdrop_dependent_native_overprint(c, self.font_cache)
+                || command_uses_tiling_backdrop(c, self.font_cache, &mut self.tiling_backdrop_cache)
         });
         let isolated_inner_blends = compute_isolated_inner_non_normal_blends(
             commands,
             self.font_cache,
             &mut self.soft_mask_cache,
+            &mut self.tiling_backdrop_cache,
             &mut self.stats,
         );
         let later_non_normal_blends = NonNormalBlendIndex::build(
@@ -999,6 +1021,7 @@ impl<'a> SlideConverter<'a> {
             self.page_rect,
             self.font_cache,
             &mut self.soft_mask_cache,
+            &mut self.tiling_backdrop_cache,
             &mut self.stats,
             !expanded.is_empty(),
         );
@@ -1165,7 +1188,11 @@ impl<'a> SlideConverter<'a> {
                             is_opaque_isolated_normal,
                             mask_analysis.renderable,
                         )?;
-                        let uses_backdrop = group_uses_page_backdrop(group_slice, self.font_cache);
+                        let uses_backdrop = group_uses_page_backdrop(
+                            group_slice,
+                            self.font_cache,
+                            &mut self.tiling_backdrop_cache,
+                        );
                         let backdrop =
                             uses_backdrop.then_some((commands.as_slice(), cmd_idx, end_idx));
                         let group_clip_len = self.clip_stack.len();
@@ -1283,7 +1310,11 @@ impl<'a> SlideConverter<'a> {
                             false,
                             RenderableMaskBounds::Unbounded,
                         )?;
-                        let uses_backdrop = group_uses_page_backdrop(group_slice, self.font_cache);
+                        let uses_backdrop = group_uses_page_backdrop(
+                            group_slice,
+                            self.font_cache,
+                            &mut self.tiling_backdrop_cache,
+                        );
                         let backdrop =
                             uses_backdrop.then_some((commands.as_slice(), cmd_idx, g_end - 1));
                         self.flatten_commands_group(group_slice, None, self.page_rect, backdrop)?;
@@ -1313,7 +1344,11 @@ impl<'a> SlideConverter<'a> {
                         false,
                         RenderableMaskBounds::Unbounded,
                     )?;
-                    let uses_backdrop = group_uses_page_backdrop(group_slice, self.font_cache);
+                    let uses_backdrop = group_uses_page_backdrop(
+                        group_slice,
+                        self.font_cache,
+                        &mut self.tiling_backdrop_cache,
+                    );
                     let backdrop = uses_backdrop.then_some((commands.as_slice(), cmd_idx, end_idx));
                     self.flatten_commands_group(group_slice, None, self.page_rect, backdrop)?;
                     for cmd in group_slice {
@@ -1354,6 +1389,340 @@ impl<'a> SlideConverter<'a> {
             r = t;
         }
         CommandBounds::Known(r)
+    }
+
+    fn type3_glyph_local_bounds(
+        &mut self,
+        font_id: zpdf_font::FontId,
+        font: &zpdf_font::LoadedFont,
+        glyph_id: u16,
+    ) -> Result<CommandBounds> {
+        const MAX_CACHED_TYPE3_BOUNDS: usize = 4096;
+        if let Some(&cached) = self.type3_glyph_bounds.get(&(font_id, glyph_id)) {
+            return Ok(cached);
+        }
+        if self
+            .bounds_deadline
+            .is_some_and(|d| zpdf_core::time::Instant::now() >= d)
+        {
+            return Err(zpdf_core::Error::StreamDecode(
+                "PPTX Type 3 bounds measurement exceeded time budget".into(),
+            ));
+        }
+        let Some((stream, _)) = font.type3_glyph_stream(glyph_id) else {
+            return Ok(CommandBounds::Empty);
+        };
+        let glyph_rect = Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
+        let mut images = ImageCache::new();
+        let mut interp = zpdf_content::interpreter::ContentInterpreter::new(glyph_rect)
+            .for_type3_glyph()
+            .with_type3_resources(font.type3_resources())
+            .with_type3_glyph_bbox(font.type3_font_bbox())
+            .with_images(&mut images);
+        if let Some(d) = self.bounds_deadline {
+            interp = interp.with_deadline(d);
+        }
+        let (dl, stats) = interp.interpret_with_stats(stream);
+        if stats.diagnostics.time_limit_reached {
+            return Err(zpdf_core::Error::StreamDecode(
+                "PPTX Type 3 bounds measurement exceeded time budget".into(),
+            ));
+        }
+        if stats.type3_used_dest_bounds {
+            // Unclipped unbounded shading with unspecified `/FontBBox [0 0 0 0]`
+            // extends across the active slide/clip crop rather than the
+            // placeholder glyph rectangle.
+            if self.type3_glyph_bounds.len() < MAX_CACHED_TYPE3_BOUNDS {
+                self.type3_glyph_bounds
+                    .insert((font_id, glyph_id), CommandBounds::Unknown);
+            }
+            return Ok(CommandBounds::Unknown);
+        }
+
+        #[derive(Clone, Copy)]
+        enum ClipBound {
+            Unbounded,
+            Empty,
+            Rect(Rect),
+        }
+
+        let local_stroke_overshoot = |style: &zpdf_display_list::StrokeStyle| -> f64 {
+            let width = if style.width.is_finite() {
+                style.width.max(0.0) as f64
+            } else {
+                0.0
+            };
+            let reach = match style.join {
+                zpdf_display_list::LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0) as f64,
+                _ => std::f64::consts::SQRT_2,
+            };
+            (width * 0.5 * reach.max(std::f64::consts::SQRT_2)).max(1e-3)
+        };
+        let pad_rect = |r: Rect, pad: f64| -> Option<Rect> {
+            let r = r.normalize();
+            (r.x0.is_finite()
+                && r.y0.is_finite()
+                && r.x1.is_finite()
+                && r.y1.is_finite()
+                && pad.is_finite()
+                && pad >= 0.0)
+                .then(|| Rect::new(r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad))
+        };
+        let union_rect = |acc: Option<Rect>, r: Rect| -> Option<Rect> {
+            let r = r.normalize();
+            if !(r.x0.is_finite() && r.y0.is_finite() && r.x1.is_finite() && r.y1.is_finite()) {
+                return acc;
+            }
+            Some(match acc {
+                Some(a) => Rect::new(
+                    a.x0.min(r.x0),
+                    a.y0.min(r.y0),
+                    a.x1.max(r.x1),
+                    a.y1.max(r.y1),
+                ),
+                None => r,
+            })
+        };
+
+        let mut acc: Option<Rect> = None;
+        let mut clips: Vec<ClipBound> = Vec::new();
+        let mut push_rect = |r: Rect, clips: &[ClipBound]| {
+            let effective = match clips.last().copied().unwrap_or(ClipBound::Unbounded) {
+                ClipBound::Unbounded => Some(r),
+                ClipBound::Empty => None,
+                ClipBound::Rect(cb) => intersect_rect(r, cb),
+            };
+            if let Some(clipped) = effective {
+                acc = union_rect(acc, clipped);
+            }
+        };
+
+        for cmd in &dl.commands {
+            match cmd {
+                RenderCommand::PushClip { path, .. } => {
+                    let top = clips.last().copied().unwrap_or(ClipBound::Unbounded);
+                    let next = if path.is_empty() {
+                        ClipBound::Empty
+                    } else if let Some(cb) = path_control_bounds(path) {
+                        match top {
+                            ClipBound::Unbounded => ClipBound::Rect(cb),
+                            ClipBound::Empty => ClipBound::Empty,
+                            ClipBound::Rect(prev) => {
+                                intersect_rect(prev, cb).map_or(ClipBound::Empty, ClipBound::Rect)
+                            }
+                        }
+                    } else {
+                        top
+                    };
+                    clips.push(next);
+                }
+                RenderCommand::PushClipStroke { path, style } => {
+                    let top = clips.last().copied().unwrap_or(ClipBound::Unbounded);
+                    let pad = local_stroke_overshoot(style);
+                    let next = if path.is_empty() {
+                        ClipBound::Empty
+                    } else if let Some(cb) =
+                        path_control_bounds(path).and_then(|r| pad_rect(r, pad))
+                    {
+                        match top {
+                            ClipBound::Unbounded => ClipBound::Rect(cb),
+                            ClipBound::Empty => ClipBound::Empty,
+                            ClipBound::Rect(prev) => {
+                                intersect_rect(prev, cb).map_or(ClipBound::Empty, ClipBound::Rect)
+                            }
+                        }
+                    } else {
+                        top
+                    };
+                    clips.push(next);
+                }
+                RenderCommand::PopClip => {
+                    clips.pop();
+                }
+                RenderCommand::FillPath { path, .. } => {
+                    if let Some(r) = path_control_bounds(path) {
+                        push_rect(r, &clips);
+                    }
+                }
+                RenderCommand::StrokePath { path, style, .. } => {
+                    let pad = local_stroke_overshoot(style);
+                    if let Some(r) = path_control_bounds(path).and_then(|b| pad_rect(b, pad)) {
+                        push_rect(r, &clips);
+                    }
+                }
+                RenderCommand::DrawImage(draw) if draw.transform.is_finite() => {
+                    let corners = [
+                        zpdf_core::Point::new(0.0, 0.0).transform(&draw.transform),
+                        zpdf_core::Point::new(1.0, 0.0).transform(&draw.transform),
+                        zpdf_core::Point::new(0.0, 1.0).transform(&draw.transform),
+                        zpdf_core::Point::new(1.0, 1.0).transform(&draw.transform),
+                    ];
+                    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+                    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                    for p in corners {
+                        x0 = x0.min(p.x);
+                        y0 = y0.min(p.y);
+                        x1 = x1.max(p.x);
+                        y1 = y1.max(p.y);
+                    }
+                    if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() {
+                        push_rect(Rect::new(x0, y0, x1, y1), &clips);
+                    }
+                }
+                RenderCommand::DrawInlineImage(draw) if draw.transform.is_finite() => {
+                    let corners = [
+                        zpdf_core::Point::new(0.0, 0.0).transform(&draw.transform),
+                        zpdf_core::Point::new(1.0, 0.0).transform(&draw.transform),
+                        zpdf_core::Point::new(0.0, 1.0).transform(&draw.transform),
+                        zpdf_core::Point::new(1.0, 1.0).transform(&draw.transform),
+                    ];
+                    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+                    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                    for p in corners {
+                        x0 = x0.min(p.x);
+                        y0 = y0.min(p.y);
+                        x1 = x1.max(p.x);
+                        y1 = y1.max(p.y);
+                    }
+                    if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() {
+                        push_rect(Rect::new(x0, y0, x1, y1), &clips);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let result = acc.map_or(CommandBounds::Empty, CommandBounds::Known);
+        if self.type3_glyph_bounds.len() < MAX_CACHED_TYPE3_BOUNDS {
+            self.type3_glyph_bounds.insert((font_id, glyph_id), result);
+        }
+        Ok(result)
+    }
+
+    fn type3_glyph_run_bounds(
+        &mut self,
+        run: &zpdf_display_list::GlyphRun,
+    ) -> Result<CommandBounds> {
+        if run.glyphs.is_empty() {
+            return Ok(CommandBounds::Empty);
+        }
+        if !run.transform.is_finite() || !run.font_size.is_finite() || !run.h_scale.is_finite() {
+            return Ok(CommandBounds::Unknown);
+        }
+        let Some(font) = self.font_cache.get(run.font_id) else {
+            return Ok(CommandBounds::Unknown);
+        };
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut saw_paint = false;
+        for (i, glyph) in run.glyphs.iter().enumerate() {
+            if (i & 63) == 0
+                && self
+                    .bounds_deadline
+                    .is_some_and(|d| zpdf_core::time::Instant::now() >= d)
+            {
+                return Err(zpdf_core::Error::StreamDecode(
+                    "PPTX Type 3 bounds measurement exceeded time budget".into(),
+                ));
+            }
+            let Some((_, fm)) = font.type3_glyph_stream(glyph.glyph_id) else {
+                continue;
+            };
+            let local = match self.type3_glyph_local_bounds(run.font_id, font, glyph.glyph_id)? {
+                CommandBounds::Empty => continue,
+                CommandBounds::Unknown => return Ok(CommandBounds::Unknown),
+                CommandBounds::Known(r) => r,
+            };
+            let glyph_to_page = run
+                .transform
+                .concat(&zpdf_core::Matrix::translate(
+                    glyph.x as f64,
+                    glyph.y as f64,
+                ))
+                .concat(&zpdf_core::Matrix::scale(
+                    run.font_size as f64 * run.h_scale as f64,
+                    run.font_size as f64,
+                ))
+                .concat(&zpdf_core::Matrix::new(
+                    fm[0], fm[1], fm[2], fm[3], fm[4], fm[5],
+                ));
+            if !glyph_to_page.is_finite() {
+                return Ok(CommandBounds::Unknown);
+            }
+            for p in [
+                zpdf_core::Point::new(local.x0, local.y0).transform(&glyph_to_page),
+                zpdf_core::Point::new(local.x1, local.y0).transform(&glyph_to_page),
+                zpdf_core::Point::new(local.x0, local.y1).transform(&glyph_to_page),
+                zpdf_core::Point::new(local.x1, local.y1).transform(&glyph_to_page),
+            ] {
+                if !p.x.is_finite() || !p.y.is_finite() {
+                    return Ok(CommandBounds::Unknown);
+                }
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+                saw_paint = true;
+            }
+        }
+        if !saw_paint {
+            return Ok(CommandBounds::Empty);
+        }
+        Ok(CommandBounds::Known(Rect::new(x0, y0, x1, y1)))
+    }
+
+    fn compute_commands_bounds_cached(
+        &mut self,
+        commands: &[RenderCommand],
+    ) -> Result<CommandBounds> {
+        let has_type3 = commands.iter().any(|cmd| {
+            matches!(
+                cmd,
+                RenderCommand::DrawGlyphRun(run)
+                    if !run.glyphs.is_empty()
+                        && self.font_cache.get(run.font_id).is_some_and(|f| f.is_type3())
+            )
+        });
+        if !has_type3 {
+            return Ok(compute_commands_bounds(
+                commands,
+                (0.0, 0.0),
+                self.font_cache,
+            ));
+        }
+        let mut acc: Option<Rect> = None;
+        for cmd in commands {
+            let b = match cmd {
+                RenderCommand::DrawGlyphRun(run)
+                    if self
+                        .font_cache
+                        .get(run.font_id)
+                        .is_some_and(|f| f.is_type3()) =>
+                {
+                    self.type3_glyph_run_bounds(run)?
+                }
+                other => compute_commands_bounds(
+                    std::slice::from_ref(other),
+                    (0.0, 0.0),
+                    self.font_cache,
+                ),
+            };
+            match b {
+                CommandBounds::Empty => {}
+                CommandBounds::Unknown => return Ok(CommandBounds::Unknown),
+                CommandBounds::Known(r) => {
+                    acc = Some(match acc {
+                        Some(a) => Rect::new(
+                            a.x0.min(r.x0),
+                            a.y0.min(r.y0),
+                            a.x1.max(r.x1),
+                            a.y1.max(r.y1),
+                        ),
+                        None => r,
+                    });
+                }
+            }
+        }
+        Ok(acc.map_or(CommandBounds::Empty, CommandBounds::Known))
     }
 
     fn live_backdrop_pixels(&self) -> u64 {
@@ -2934,8 +3303,7 @@ impl<'a> SlideConverter<'a> {
 
         let fallback_bounds =
             intersect_rect(group_bounds, self.page_rect).unwrap_or(self.page_rect);
-        let mut raw_bounds = match compute_commands_bounds(group_cmds, (0.0, 0.0), self.font_cache)
-        {
+        let mut raw_bounds = match self.compute_commands_bounds_cached(group_cmds)? {
             CommandBounds::Empty => return Ok(()),
             CommandBounds::Known(r) => Rect::new(r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0),
             CommandBounds::Unknown => fallback_bounds,
@@ -3333,9 +3701,19 @@ impl<'a> SlideConverter<'a> {
                     .font_cache
                     .get(glyph_run.font_id)
                     .is_some_and(|f| f.has_font_data());
+                let is_tiling = matches!(glyph_run.paint, Paint::Tiling(_));
                 let overprint_backdrop = command_has_renderable_overprint(cmd, self.font_cache);
-                if has_outlines && (in_artwork_range || overprint_backdrop) {
-                    let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
+                let tiling_backdrop = command_uses_tiling_backdrop(
+                    cmd,
+                    self.font_cache,
+                    &mut self.tiling_backdrop_cache,
+                );
+                if has_outlines && (is_tiling || in_artwork_range || overprint_backdrop) {
+                    let backdrop = (overprint_backdrop || tiling_backdrop).then_some((
+                        all_commands,
+                        cmd_idx,
+                        cmd_idx,
+                    ));
                     self.flatten_commands_group(
                         &all_commands[cmd_idx..=cmd_idx],
                         None,
@@ -3389,15 +3767,26 @@ impl<'a> SlideConverter<'a> {
                 if effective_alpha <= 0.0 || overprint.is_some_and(|op| op.active == 0) {
                     return Ok(());
                 }
+                let is_tiling = matches!(paint, Paint::Tiling(_));
                 let overprint_backdrop = overprint.is_some_and(|op| op.active != 0);
+                let tiling_backdrop = command_uses_tiling_backdrop(
+                    cmd,
+                    self.font_cache,
+                    &mut self.tiling_backdrop_cache,
+                );
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
-                let raster_artwork = overprint_backdrop
+                let raster_artwork = is_tiling
+                    || overprint_backdrop
                     || (in_artwork_range
                         && (effective_alpha < 1.0 - 1e-3
                             || artwork_fill_needs_raster(path, *rule, paint)));
                 if clipped_artwork || raster_artwork {
-                    let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
+                    let backdrop = (overprint_backdrop || tiling_backdrop).then_some((
+                        all_commands,
+                        cmd_idx,
+                        cmd_idx,
+                    ));
                     self.flatten_commands_group(
                         &all_commands[cmd_idx..=cmd_idx],
                         None,
@@ -3448,15 +3837,26 @@ impl<'a> SlideConverter<'a> {
                 if effective_alpha <= 0.0 || overprint.is_some_and(|op| op.active == 0) {
                     return Ok(());
                 }
+                let is_tiling = matches!(paint, Paint::Tiling(_));
                 let overprint_backdrop = overprint.is_some_and(|op| op.active != 0);
+                let tiling_backdrop = command_uses_tiling_backdrop(
+                    cmd,
+                    self.font_cache,
+                    &mut self.tiling_backdrop_cache,
+                );
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
-                let raster_artwork = overprint_backdrop
+                let raster_artwork = is_tiling
+                    || overprint_backdrop
                     || (in_artwork_range
                         && (effective_alpha < 1.0 - 1e-3
                             || artwork_stroke_needs_raster(path, style, paint)));
                 if clipped_artwork || raster_artwork {
-                    let backdrop = overprint_backdrop.then_some((all_commands, cmd_idx, cmd_idx));
+                    let backdrop = (overprint_backdrop || tiling_backdrop).then_some((
+                        all_commands,
+                        cmd_idx,
+                        cmd_idx,
+                    ));
                     self.flatten_commands_group(
                         &all_commands[cmd_idx..=cmd_idx],
                         None,
@@ -4333,6 +4733,7 @@ fn compute_isolated_inner_non_normal_blends(
     commands: &[RenderCommand],
     font_cache: &FontCache,
     soft_mask_cache: &mut SoftMaskAnalysisCache,
+    tiling_backdrop_cache: &mut TilingBackdropCache,
     stats: &mut ConversionStats,
 ) -> Vec<bool> {
     let mut flags = vec![false; commands.len()];
@@ -4347,6 +4748,7 @@ fn compute_isolated_inner_non_normal_blends(
                 && alpha.is_finite()
                 && *alpha > 0.0
         ) || command_has_renderable_overprint(c, font_cache)
+            || command_uses_tiling_backdrop(c, font_cache, tiling_backdrop_cache)
     }) {
         return flags;
     }
@@ -4402,7 +4804,13 @@ fn compute_isolated_inner_non_normal_blends(
                 }
             }
             other
-                if zero_alpha_depth == 0 && command_has_renderable_overprint(other, font_cache) =>
+                if zero_alpha_depth == 0
+                    && (command_has_renderable_overprint(other, font_cache)
+                        || command_uses_tiling_backdrop(
+                            other,
+                            font_cache,
+                            tiling_backdrop_cache,
+                        )) =>
             {
                 if let Some((_, _, has_inner)) = stack.last_mut() {
                     *has_inner = true;
@@ -4495,6 +4903,7 @@ impl NonNormalBlendIndex {
         page_rect: Rect,
         font_cache: &FontCache,
         soft_mask_cache: &mut SoftMaskAnalysisCache,
+        tiling_backdrop_cache: &mut TilingBackdropCache,
         stats: &mut ConversionStats,
         enabled: bool,
     ) -> Self {
@@ -4519,7 +4928,7 @@ impl NonNormalBlendIndex {
                 RenderCommand::PushBlendGroup {
                     blend_mode,
                     isolated,
-                    knockout,
+                    knockout: _,
                     alpha,
                     mask,
                     bounds,
@@ -4622,7 +5031,12 @@ impl NonNormalBlendIndex {
                                     index.insert(idx, clip_rect);
                                 }
                             }
-                        } else if *isolated || *knockout || group_alpha < 1.0 || mask.is_some() {
+                        } else if *isolated
+                            || group_alpha <= 0.0
+                            || soft_mask_cache
+                                .analyze(mask.as_ref(), font_cache, stats)
+                                .is_proven_empty()
+                        {
                             isolated_normal_depth = 1;
                         }
                     } else {
@@ -4634,7 +5048,12 @@ impl NonNormalBlendIndex {
                 }
                 other
                     if isolated_normal_depth == 0
-                        && command_has_renderable_overprint(other, font_cache) =>
+                        && (command_has_renderable_overprint(other, font_cache)
+                            || command_uses_tiling_backdrop(
+                                other,
+                                font_cache,
+                                tiling_backdrop_cache,
+                            )) =>
                 {
                     if let Some(clip_rect) = clip_stack.last().copied().unwrap_or(Some(page_rect)) {
                         let draw_rect = match compute_commands_bounds(
@@ -5744,19 +6163,123 @@ fn resolve_overprint_color_on_rgb(
     (enc(rr), enc(rg), enc(rb))
 }
 
+/// Per-slide memoization table for `group_uses_page_backdrop_depth` /
+/// `command_uses_tiling_backdrop_depth`, keyed by `(Arc<DisplayList> pointer,
+/// recursion depth)` so shared nested pattern cell DAGs scan in linear time
+/// across every export pass.
+#[derive(Default)]
+struct TilingBackdropCache {
+    memo: std::collections::HashMap<(usize, u8), bool>,
+    #[cfg(test)]
+    commands_scanned: usize,
+}
+
 /// Whether flattening `cmds` depends on the already-painted page backdrop
-/// (a visible non-Normal blend group or renderable partial-colorant overprint
-/// not shielded by an enclosing isolated Normal group).
-fn group_uses_page_backdrop(cmds: &[RenderCommand], font_cache: &FontCache) -> bool {
+/// (a visible non-Normal blend group, renderable partial-colorant overprint,
+/// or backdrop-dependent `Paint::Tiling` not shielded by an enclosing isolated
+/// Normal group).
+fn group_uses_page_backdrop(
+    cmds: &[RenderCommand],
+    font_cache: &FontCache,
+    cache: &mut TilingBackdropCache,
+) -> bool {
+    group_uses_page_backdrop_depth(cmds, font_cache, 0, cache)
+}
+
+fn command_uses_tiling_backdrop(
+    cmd: &RenderCommand,
+    font_cache: &FontCache,
+    cache: &mut TilingBackdropCache,
+) -> bool {
+    command_uses_tiling_backdrop_depth(cmd, font_cache, 0, cache)
+}
+
+fn tiling_cell_uses_page_backdrop(
+    cell: &std::sync::Arc<DisplayList>,
+    font_cache: &FontCache,
+    depth: u8,
+    cache: &mut TilingBackdropCache,
+) -> bool {
+    if depth > 16 {
+        return true;
+    }
+    let key = (std::sync::Arc::as_ptr(cell) as usize, depth);
+    if let Some(&cached) = cache.memo.get(&key) {
+        return cached;
+    }
+    let result = group_uses_page_backdrop_depth(&cell.commands, font_cache, depth, cache);
+    cache.memo.insert(key, result);
+    result
+}
+
+fn command_uses_tiling_backdrop_depth(
+    cmd: &RenderCommand,
+    font_cache: &FontCache,
+    depth: u8,
+    cache: &mut TilingBackdropCache,
+) -> bool {
+    match cmd {
+        RenderCommand::FillPath {
+            paint: Paint::Tiling(tiling),
+            alpha,
+            overprint,
+            ..
+        }
+        | RenderCommand::StrokePath {
+            paint: Paint::Tiling(tiling),
+            alpha,
+            overprint,
+            ..
+        } => {
+            alpha.is_finite()
+                && *alpha > 0.0
+                && !overprint.is_some_and(|op| op.active == 0)
+                && tiling_cell_uses_page_backdrop(
+                    &tiling.commands,
+                    font_cache,
+                    depth.saturating_add(1),
+                    cache,
+                )
+        }
+        RenderCommand::DrawGlyphRun(run) => {
+            if let Paint::Tiling(tiling) = &run.paint {
+                run.alpha.is_finite()
+                    && run.alpha > 0.0
+                    && !run.overprint.is_some_and(|op| op.active == 0)
+                    && font_cache
+                        .get(run.font_id)
+                        .is_some_and(|f| f.has_font_data())
+                    && tiling_cell_uses_page_backdrop(
+                        &tiling.commands,
+                        font_cache,
+                        depth.saturating_add(1),
+                        cache,
+                    )
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn group_uses_page_backdrop_depth(
+    cmds: &[RenderCommand],
+    font_cache: &FontCache,
+    depth: u8,
+    cache: &mut TilingBackdropCache,
+) -> bool {
     let mut isolated_normal_depth = 0usize;
     for cmd in cmds {
+        #[cfg(test)]
+        {
+            cache.commands_scanned = cache.commands_scanned.saturating_add(1);
+        }
         match cmd {
             RenderCommand::PushBlendGroup {
                 blend_mode,
                 isolated,
-                knockout,
                 alpha,
-                mask,
                 ..
             } => {
                 if isolated_normal_depth == 0 {
@@ -5769,7 +6292,11 @@ fn group_uses_page_backdrop(cmds: &[RenderCommand], font_cache: &FontCache) -> b
                         isolated_normal_depth = 1;
                     } else if *blend_mode != zpdf_display_list::BlendMode::Normal {
                         return true;
-                    } else if *isolated || *knockout || group_alpha < 1.0 || mask.is_some() {
+                    } else if *isolated {
+                        // Only an isolated Normal group shields its children from
+                        // the enclosing backdrop; non-isolated translucent, masked,
+                        // or knockout Normal groups still composite inner blends
+                        // against the live backdrop (ISO 32000-1 §11.4.4).
                         isolated_normal_depth = 1;
                     }
                 } else {
@@ -5781,7 +6308,8 @@ fn group_uses_page_backdrop(cmds: &[RenderCommand], font_cache: &FontCache) -> b
             }
             other
                 if isolated_normal_depth == 0
-                    && command_has_renderable_overprint(other, font_cache) =>
+                    && (command_has_renderable_overprint(other, font_cache)
+                        || command_uses_tiling_backdrop_depth(other, font_cache, depth, cache)) =>
             {
                 return true;
             }
@@ -7065,6 +7593,22 @@ impl SoftMaskRebaser {
         }
     }
 
+    fn map_paint(&self, paint: &Paint, dx: f64, dy: f64) -> Paint {
+        match paint {
+            Paint::Tiling(tiling) => {
+                Paint::Tiling(std::sync::Arc::new(zpdf_display_list::TilingPattern {
+                    commands: std::sync::Arc::clone(&tiling.commands),
+                    bbox: tiling.bbox,
+                    x_step: tiling.x_step,
+                    y_step: tiling.y_step,
+                    matrix: self.map_matrix(tiling.matrix, dx, dy),
+                    tiling_type: tiling.tiling_type,
+                }))
+            }
+            other => other.clone(),
+        }
+    }
+
     fn translate_render_command(
         &mut self,
         cmd: &RenderCommand,
@@ -7082,7 +7626,7 @@ impl SoftMaskRebaser {
                 RenderCommand::FillPath {
                     path: self.map_path(path, dx, dy),
                     rule: *rule,
-                    paint: paint.clone(),
+                    paint: self.map_paint(paint, dx, dy),
                     alpha: *alpha,
                     overprint: *overprint,
                 },
@@ -7099,7 +7643,7 @@ impl SoftMaskRebaser {
                     RenderCommand::StrokePath {
                         path: self.map_path(path, dx, dy),
                         style: self.map_uniform_stroke_style(style),
-                        paint: paint.clone(),
+                        paint: self.map_paint(paint, dx, dy),
                         alpha: *alpha,
                         overprint: *overprint,
                     }
@@ -7138,7 +7682,7 @@ impl SoftMaskRebaser {
                     RenderCommand::FillPath {
                         path: outlined,
                         rule: zpdf_display_list::FillRule::NonZero,
-                        paint: paint.clone(),
+                        paint: self.map_paint(paint, dx, dy),
                         alpha: *alpha,
                         overprint: *overprint,
                     }
@@ -7158,7 +7702,7 @@ impl SoftMaskRebaser {
                     RenderCommand::FillPath {
                         path: outlined,
                         rule: zpdf_display_list::FillRule::NonZero,
-                        paint: paint.clone(),
+                        paint: self.map_paint(paint, dx, dy),
                         alpha: *alpha,
                         overprint: *overprint,
                     }
@@ -7168,6 +7712,7 @@ impl SoftMaskRebaser {
             RenderCommand::DrawGlyphRun(run) => {
                 let mut moved = run.clone();
                 moved.transform = self.map_matrix(moved.transform, dx, dy);
+                moved.paint = self.map_paint(&run.paint, dx, dy);
                 (RenderCommand::DrawGlyphRun(moved), true)
             }
             RenderCommand::DrawImage(d) => {
@@ -19687,6 +20232,2639 @@ mod export_tests {
             )
             .is_err(),
             "vertically overlapping translucent labels in the same column must still reject"
+        );
+    }
+
+    #[test]
+    fn tiling_pattern_fill_and_stroke_export_as_clipped_slide_images() {
+        use std::sync::Arc;
+        use zpdf_core::Point;
+        use zpdf_display_list::{FillRule, Path, StrokeStyle, TilingPattern};
+
+        // Two-color 20×20 tile: red left half [0..10], blue right half [10..20].
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let mut left = Path::new();
+        left.rect(Rect::new(0.0, 0.0, 10.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: left,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut right = Path::new();
+        right.rect(Rect::new(10.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: right,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        // 1) Pattern-filled rectangle [20..100] × [100..160].
+        let mut rect_path = Path::new();
+        rect_path.rect(Rect::new(20.0, 100.0, 100.0, 160.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect_path,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        // 2) Pattern-stroked diagonal line from (20, 20) to (100, 80) with width 16.
+        let mut line_path = Path::new();
+        line_path.move_to(Point::new(20.0, 20.0));
+        line_path.line_to(Point::new(100.0, 80.0));
+        dl.push(RenderCommand::StrokePath {
+            path: line_path,
+            style: StrokeStyle {
+                width: 16.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let fonts = FontCache::new();
+        let images = ImageCache::new();
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("display_list_to_slide");
+
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "patterned fill and stroke must emit two slide elements"
+        );
+
+        let mut decoded_images = Vec::new();
+        for elem in &slide.elements {
+            match elem.base() {
+                SlideElement::Image {
+                    width_emu,
+                    height_emu,
+                    image_data,
+                    ..
+                } => {
+                    assert!(*width_emu > 0 && *height_emu > 0);
+                    let img = image::load_from_memory(image_data)
+                        .expect("valid PNG")
+                        .to_rgba8();
+                    decoded_images.push(img);
+                }
+                other => panic!(
+                    "expected SlideElement::Image for tiling pattern fill/stroke, got {other:?}"
+                ),
+            }
+        }
+
+        // Fill image must contain both opaque red and opaque blue pixels from the tile.
+        let fill_img = &decoded_images[0];
+        let has_red = fill_img
+            .pixels()
+            .any(|p| p[0] > 200 && p[1] < 40 && p[2] < 40 && p[3] > 200);
+        let has_blue = fill_img
+            .pixels()
+            .any(|p| p[0] < 40 && p[1] < 40 && p[2] > 200 && p[3] > 200);
+        assert!(
+            has_red && has_blue,
+            "patterned fill image must preserve both tile colors"
+        );
+
+        // Stroke image must contain both red and blue along the diagonal stroke
+        // AND transparent pixels in the off-stroke corners (clipped to stroke outline).
+        let stroke_img = &decoded_images[1];
+        let stroke_has_red = stroke_img
+            .pixels()
+            .any(|p| p[0] > 200 && p[1] < 40 && p[2] < 40 && p[3] > 200);
+        let stroke_has_blue = stroke_img
+            .pixels()
+            .any(|p| p[0] < 40 && p[1] < 40 && p[2] > 200 && p[3] > 200);
+        let stroke_has_transparent = stroke_img.pixels().any(|p| p[3] == 0);
+        assert!(
+            stroke_has_red && stroke_has_blue,
+            "patterned stroke image must preserve both tile colors instead of defaulting to black"
+        );
+        assert!(
+            stroke_has_transparent,
+            "patterned stroke image must stay transparent outside the stroked outline"
+        );
+
+        // Ensure the serialized PPTX archive embeds both rendered PNG media entries.
+        let bytes = PptxWriter::new(PptxPresentation {
+            slides: vec![slide],
+            width_emu: pt_to_emu(200.0),
+            height_emu: pt_to_emu(200.0),
+        })
+        .write_to_bytes()
+        .expect("pptx bytes");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        assert!(!zip_entry(&mut archive, "ppt/media/image1.png").is_empty());
+        assert!(!zip_entry(&mut archive, "ppt/media/image2.png").is_empty());
+    }
+
+    /// Composite a `PptxSlide`'s rectangles and PNG images in slide order onto
+    /// opaque white paper at `scale` px/pt so tests can assert exact visual
+    /// output on the finished slide.
+    fn composite_slide_over_white(
+        slide: &PptxSlide,
+        page_w: f64,
+        page_h: f64,
+        scale: f64,
+    ) -> image::RgbaImage {
+        let w = (page_w * scale).round() as u32;
+        let h = (page_h * scale).round() as u32;
+        let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([255, 255, 255, 255]));
+        let emu_to_px = |emu: i64| -> f64 { (emu as f64 / 12700.0) * scale };
+        for elem in &slide.elements {
+            let mut elem_alpha = 1.0f32;
+            let mut cur = elem;
+            loop {
+                match cur {
+                    SlideElement::Opacity { element, alpha } => {
+                        elem_alpha *= *alpha;
+                        cur = element;
+                    }
+                    SlideElement::Transformed { element, .. } => {
+                        cur = element;
+                    }
+                    _ => break,
+                }
+            }
+            match cur {
+                SlideElement::Rectangle {
+                    x_emu,
+                    y_emu,
+                    width_emu,
+                    height_emu,
+                    fill_rgb: Some((r, g, b)),
+                    ..
+                } => {
+                    let x0 = emu_to_px(*x_emu).floor().max(0.0) as u32;
+                    let y0 = emu_to_px(*y_emu).floor().max(0.0) as u32;
+                    let x1 = emu_to_px(*x_emu + *width_emu).ceil().min(w as f64) as u32;
+                    let y1 = emu_to_px(*y_emu + *height_emu).ceil().min(h as f64) as u32;
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            if elem_alpha >= 1.0 {
+                                canvas.put_pixel(x, y, image::Rgba([*r, *g, *b, 255]));
+                            } else if elem_alpha > 0.0 {
+                                let dst = canvas.get_pixel_mut(x, y);
+                                let src = [*r, *g, *b];
+                                for c in 0..3 {
+                                    let out = src[c] as f32 * elem_alpha
+                                        + dst[c] as f32 * (1.0 - elem_alpha);
+                                    dst[c] = out.round().clamp(0.0, 255.0) as u8;
+                                }
+                                dst[3] = 255;
+                            }
+                        }
+                    }
+                }
+                SlideElement::Image {
+                    x_emu,
+                    y_emu,
+                    width_emu,
+                    height_emu,
+                    image_data,
+                    ..
+                } => {
+                    let img = image::load_from_memory(image_data)
+                        .expect("valid PNG")
+                        .to_rgba8();
+                    let dx0 = emu_to_px(*x_emu);
+                    let dy0 = emu_to_px(*y_emu);
+                    let dw = emu_to_px(*width_emu);
+                    let dh = emu_to_px(*height_emu);
+                    if dw <= 0.0 || dh <= 0.0 {
+                        continue;
+                    }
+                    let px0 = dx0.floor().max(0.0) as u32;
+                    let py0 = dy0.floor().max(0.0) as u32;
+                    let px1 = (dx0 + dw).ceil().min(w as f64) as u32;
+                    let py1 = (dy0 + dh).ceil().min(h as f64) as u32;
+                    for py in py0..py1 {
+                        let v = ((py as f64 + 0.5 - dy0) / dh * img.height() as f64)
+                            .floor()
+                            .clamp(0.0, (img.height() - 1) as f64)
+                            as u32;
+                        for px in px0..px1 {
+                            let u = ((px as f64 + 0.5 - dx0) / dw * img.width() as f64)
+                                .floor()
+                                .clamp(0.0, (img.width() - 1) as f64)
+                                as u32;
+                            let src = img.get_pixel(u, v);
+                            let sa = (src[3] as f32 / 255.0) * elem_alpha;
+                            if sa == 0.0 {
+                                continue;
+                            }
+                            let dst = canvas.get_pixel_mut(px, py);
+                            for c in 0..3 {
+                                let out = src[c] as f32 * sa + dst[c] as f32 * (1.0 - sa);
+                                dst[c] = out.round().clamp(0.0, 255.0) as u8;
+                            }
+                            dst[3] = 255;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        canvas
+    }
+
+    #[test]
+    fn backdrop_dependent_tiling_pattern_composites_preceding_slide_backdrop() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, TilingPattern};
+
+        // 1) Opaque white Multiply cell over a solid blue rectangle must leave
+        //    the composited slide blue (never overwriting it with opaque white).
+        let make_multiply_tile = |color: Color| -> Arc<TilingPattern> {
+            let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            let mut cell_rect = Path::new();
+            cell_rect.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+            cell.push(RenderCommand::FillPath {
+                path: cell_rect,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(color),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+            Arc::new(TilingPattern {
+                commands: Arc::new(cell),
+                bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+                x_step: 20.0,
+                y_step: 20.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            })
+        };
+
+        let mut dl_white = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut bg = Path::new();
+        bg.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl_white.push(RenderCommand::FillPath {
+            path: bg.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut fg = Path::new();
+        fg.rect(Rect::new(20.0, 20.0, 60.0, 60.0));
+        dl_white.push(RenderCommand::FillPath {
+            path: fg.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(make_multiply_tile(Color::white())),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let slide_white = display_list_to_slide(
+            &dl_white,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp_white = composite_slide_over_white(&slide_white, 100.0, 100.0, 2.0);
+        let center_white = comp_white.get_pixel(80, 120);
+        assert!(
+            center_white[0] < 10 && center_white[1] < 10 && center_white[2] > 245,
+            "white Multiply pattern over blue backdrop must stay blue on slide, got {center_white:?}"
+        );
+
+        // 2) 50% gray Multiply over solid blue emits a PNG darkened to [0, 0, ~128]
+        //    rather than gray [128, 128, 128].
+        let mut dl_gray = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl_gray.push(RenderCommand::FillPath {
+            path: bg,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_gray.push(RenderCommand::FillPath {
+            path: fg,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(make_multiply_tile(Color::rgb(0.5, 0.5, 0.5))),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let slide_gray = display_list_to_slide(
+            &dl_gray,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let img_bytes = slide_gray
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::Image { image_data, .. } => Some(image_data.as_slice()),
+                _ => None,
+            })
+            .expect("gray Multiply pattern image element");
+        let img = image::load_from_memory(img_bytes)
+            .expect("valid PNG")
+            .to_rgba8();
+        let center = img.get_pixel(img.width() / 2, img.height() / 2);
+        assert!(
+            center[0] < 10 && center[1] < 10 && (120..=136).contains(&center[2]) && center[3] > 245,
+            "50% gray Multiply over blue must export darkened blue [0,0,~128], got {center:?}"
+        );
+    }
+
+    #[test]
+    fn translucent_backdrop_image_with_hatch_gap_is_composited_only_once() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, ImageDraw, Path, TilingPattern};
+        use zpdf_image::DecodedImage;
+
+        // Preceding slide element: 50%-opaque black image [0, 0, 0, 128] over [0..100]×[0..100].
+        let mut images = ImageCache::new();
+        let img_id = images.insert(DecodedImage {
+            width: 2,
+            height: 2,
+            data: [0, 0, 0, 128].repeat(4),
+            has_alpha: true,
+            is_image_mask: false,
+            premultiplied: true,
+        });
+
+        // 20×20 Multiply hatch: left half [0..10] painted opaque red Multiply,
+        // right half [10..20] left as an UNPAINTED GAP.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut stripe = Path::new();
+        stripe.rect(Rect::new(0.0, 0.0, 10.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: stripe,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::DrawImage(ImageDraw {
+            image_id: img_id,
+            transform: Matrix::scale(100.0, 100.0),
+            alpha: 1.0,
+            is_image_mask: false,
+        }));
+        let mut box_path = Path::new();
+        box_path.rect(Rect::new(20.0, 20.0, 80.0, 80.0));
+        dl.push(RenderCommand::FillPath {
+            path: box_path,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "slide must contain translucent backdrop image + hatch overlay PNG"
+        );
+
+        let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+        // Unpainted gap inside hatch (PDF x=35 -> px=70, PDF y=50 -> px y=100):
+        // must show 50%-opaque black over white (~127), NEVER doubled 75% black (~64)!
+        let gap = comp.get_pixel(70, 100);
+        assert!(
+            (120..=135).contains(&gap[0])
+                && (120..=135).contains(&gap[1])
+                && (120..=135).contains(&gap[2]),
+            "unpainted hatch gap over 50%-black image must stay ~50% gray (~127), not doubled 75% (~64), got {gap:?}"
+        );
+        // Painted red Multiply stripe (PDF x=25 -> px=50, PDF y=50 -> px y=100):
+        // red Multiply over 50%-black image on white = [~127, 0, 0].
+        let stripe_px = comp.get_pixel(50, 100);
+        assert!(
+            (120..=135).contains(&stripe_px[0]) && stripe_px[1] < 10 && stripe_px[2] < 10,
+            "red Multiply stripe over 50%-black image must composite to [~127,0,0], got {stripe_px:?}"
+        );
+    }
+
+    #[test]
+    fn enclosing_blend_group_mask_and_mode_apply_to_patterned_fills_and_strokes() {
+        use std::sync::Arc;
+        use zpdf_core::Point;
+        use zpdf_display_list::{
+            BlendMode, FillRule, Path, SoftMask, SoftMaskKind, StrokeStyle, TilingPattern,
+        };
+
+        let make_solid_tile = |color: Color| -> Arc<TilingPattern> {
+            let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+            let mut sq = Path::new();
+            sq.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+            cell.push(RenderCommand::FillPath {
+                path: sq,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(color),
+                alpha: 1.0,
+                overprint: None,
+            });
+            Arc::new(TilingPattern {
+                commands: Arc::new(cell),
+                bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+                x_step: 20.0,
+                y_step: 20.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            })
+        };
+
+        // 1) Normal red tile (both fill and stroke) under an all-zero alpha soft mask
+        //    must be completely invisible (no red PNG emitted).
+        let zero_mask = SoftMask {
+            commands: Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0))),
+            kind: SoftMaskKind::Alpha,
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+        let red_tile = make_solid_tile(Color::rgb(1.0, 0.0, 0.0));
+        let mut dl_masked = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl_masked.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            alpha: 1.0,
+            mask: Some(zero_mask),
+        });
+        let mut rect_p = Path::new();
+        rect_p.rect(Rect::new(10.0, 10.0, 50.0, 50.0));
+        dl_masked.push(RenderCommand::FillPath {
+            path: rect_p,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&red_tile)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut line_p = Path::new();
+        line_p.move_to(Point::new(10.0, 70.0));
+        line_p.line_to(Point::new(90.0, 70.0));
+        dl_masked.push(RenderCommand::StrokePath {
+            path: line_p,
+            style: StrokeStyle {
+                width: 10.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Tiling(red_tile),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_masked.push(RenderCommand::PopBlendGroup);
+
+        let slide_masked = display_list_to_slide(
+            &dl_masked,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        assert!(
+            slide_masked.elements.is_empty(),
+            "Normal red patterned fill and stroke under all-zero alpha soft mask must be invisible, got {} elements",
+            slide_masked.elements.len()
+        );
+
+        // 2) Normal 50%-gray tile inside an enclosing `Multiply` blend group over
+        //    a solid blue backdrop must preserve the enclosing Multiply blend mode
+        //    for both patterned fill and patterned stroke (darkened blue [0,0,~128]).
+        let gray_tile = make_solid_tile(Color::rgb(0.5, 0.5, 0.5));
+        let mut dl_blend = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut bg = Path::new();
+        bg.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl_blend.push(RenderCommand::FillPath {
+            path: bg,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_blend.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut fill_r = Path::new();
+        fill_r.rect(Rect::new(10.0, 10.0, 40.0, 40.0));
+        dl_blend.push(RenderCommand::FillPath {
+            path: fill_r,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&gray_tile)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut stroke_l = Path::new();
+        stroke_l.move_to(Point::new(10.0, 75.0));
+        stroke_l.line_to(Point::new(90.0, 75.0));
+        dl_blend.push(RenderCommand::StrokePath {
+            path: stroke_l,
+            style: StrokeStyle {
+                width: 14.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Tiling(gray_tile),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_blend.push(RenderCommand::PopBlendGroup);
+
+        let slide_blend = display_list_to_slide(
+            &dl_blend,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp = composite_slide_over_white(&slide_blend, 100.0, 100.0, 2.0);
+        // Inside fill (PDF x=25, y=25 -> px (50, 150)) and stroke (PDF x=50, y=75 -> px (100, 50)):
+        for (label, px) in [
+            ("enclosing Multiply fill", comp.get_pixel(50, 150)),
+            ("enclosing Multiply stroke", comp.get_pixel(100, 50)),
+        ] {
+            assert!(
+                px[0] < 10 && px[1] < 10 && (120..=136).contains(&px[2]),
+                "{label} over blue must darken blue to [0,0,~128], not opaque gray, got {px:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_finite_miter_limit_is_not_cropped_in_pattern_stroke_bounds() {
+        use std::sync::Arc;
+        use zpdf_core::Point;
+        use zpdf_display_list::{FillRule, LineJoin, Path, StrokeStyle, TilingPattern};
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // 1) `stroke_style_grow` must honor actual finite `miter_limit = 200.0` without
+        //    clamping to 100.0 (grow = width/2 * 200 = 200pt, not 100pt).
+        let style_200 = StrokeStyle {
+            width: 2.0,
+            join: LineJoin::Miter,
+            miter_limit: 200.0,
+            ..StrokeStyle::default()
+        };
+        let grow_200 = stroke_style_grow(&style_200).expect("finite stroke grow");
+        assert!(
+            (grow_200 - 200.0).abs() < 1e-6,
+            "stroke_style_grow must use actual finite miter_limit=200 (grow=200), got {grow_200:?}"
+        );
+
+        // Non-finite miter limit returns None (caller falls back to page_rect).
+        let inf_style = StrokeStyle {
+            width: 2.0,
+            join: LineJoin::Miter,
+            miter_limit: f32::INFINITY,
+            ..StrokeStyle::default()
+        };
+        assert!(stroke_style_grow(&inf_style).is_none());
+
+        // 2) Acute V corner rendered through tiny-skia (sin(theta) ≈ 0.012 > tiny-skia's
+        //    Nearly180 threshold, width = 4, miter_limit = 200): miter tip extends
+        //    ~166pt to the left of vertex (200, 100) to x ≈ 34pt, and must be fully
+        //    present in the exported slide PNG (not cropped at vertex or page edge).
+        let mut wide_v = Path::new();
+        wide_v.move_to(Point::new(280.0, 101.2));
+        wide_v.line_to(Point::new(200.0, 100.0));
+        wide_v.line_to(Point::new(280.0, 98.8));
+        let style = StrokeStyle {
+            width: 4.0,
+            join: LineJoin::Miter,
+            miter_limit: 200.0,
+            ..StrokeStyle::default()
+        };
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 300.0, 200.0));
+        dl.push(RenderCommand::StrokePath {
+            path: wide_v,
+            style,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 300.0, 200.0, 2.0);
+        // At 2 px/pt, vertex is at px 400 and miter tip reaches ~x = 67pt (px ~134).
+        let mut min_red_x = u32::MAX;
+        for x in 0..comp.width() {
+            let p = comp.get_pixel(x, 200);
+            if p[0] > 200 && p[1] < 150 && p[2] < 150 {
+                min_red_x = min_red_x.min(x);
+            }
+        }
+        assert!(
+            min_red_x < 180,
+            "miter tip extending ~133pt past vertex must reach px < 180 (x < 90pt), earliest red px was {min_red_x}"
+        );
+    }
+
+    #[test]
+    fn running_backdrop_scales_linearly_and_rejects_over_budget_partial_rasters() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, TilingPattern};
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.5, 0.5, 0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // 1) 100 disjoint backdrop-dependent patterned rectangles over a blue page
+        //    all export accurately via the O(N) running backdrop.
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        let mut bg = Path::new();
+        bg.rect(Rect::new(0.0, 0.0, 200.0, 200.0));
+        dl.push(RenderCommand::FillPath {
+            path: bg,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        for row in 0..10 {
+            for col in 0..10 {
+                let x0 = col as f64 * 20.0 + 2.0;
+                let y0 = row as f64 * 20.0 + 2.0;
+                let mut r = Path::new();
+                r.rect(Rect::new(x0, y0, x0 + 14.0, y0 + 14.0));
+                dl.push(RenderCommand::FillPath {
+                    path: r,
+                    rule: FillRule::NonZero,
+                    paint: Paint::Tiling(Arc::clone(&tiling)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+        }
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let img_count = slide
+            .elements
+            .iter()
+            .filter(|e| matches!(e.base(), SlideElement::Image { .. }))
+            .count();
+        assert_eq!(
+            img_count, 100,
+            "all 100 disjoint backdrop patterns must export"
+        );
+
+        // 2) Zero render budget forces CpuRenderer over-budget immediately:
+        //    exporter must surface a time-budget error to the caller instead
+        //    of silently returning an incomplete slide.
+        let over_budget_err = display_list_to_slide_internal(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(std::time::Duration::ZERO),
+            None,
+        )
+        .err();
+        assert!(
+            matches!(
+                over_budget_err,
+                Some(zpdf_core::Error::StreamDecode(ref msg)) if msg.contains("time budget")
+            ),
+            "over-budget timeout must surface time-budget error to caller, got {over_budget_err:?}"
+        );
+    }
+
+    #[test]
+    fn overlapping_pattern_siblings_in_isolated_opacity_group_apply_opacity_once() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, TilingPattern};
+
+        // Opaque black 10×10 tile.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let black_tile = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Isolated Normal group at 50% opacity containing two overlapping
+        // opaque black patterned fills: [10..70]×[20..80] and [30..90]×[20..80].
+        // Overlap [30..70] must composite to 50% black (~128), NOT 75% black (~64).
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        let mut left = Path::new();
+        left.rect(Rect::new(10.0, 20.0, 70.0, 80.0));
+        dl.push(RenderCommand::FillPath {
+            path: left,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&black_tile)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut right = Path::new();
+        right.rect(Rect::new(30.0, 20.0, 90.0, 80.0));
+        dl.push(RenderCommand::FillPath {
+            path: right,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(black_tile),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+        // Non-overlapping left (x=20 -> px=40), overlap center (x=50 -> px=100),
+        // non-overlapping right (x=80 -> px=160), all at y=50 -> px=100.
+        for (label, px) in [
+            ("left-only", comp.get_pixel(40, 100)),
+            ("overlap", comp.get_pixel(100, 100)),
+            ("right-only", comp.get_pixel(160, 100)),
+        ] {
+            assert!(
+                (120..=136).contains(&px[0])
+                    && (120..=136).contains(&px[1])
+                    && (120..=136).contains(&px[2]),
+                "{label} inside isolated 50% group must be 50% black (~128), not 75% (~64), got {px:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_blend_group_preserves_painted_backdrop_past_32_commands() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, TilingPattern};
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.5, 0.5, 0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let gray_mul = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        for isolated in [true, false] {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Normal,
+                isolated,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+                alpha: if isolated { 1.0 } else { 0.99 },
+                mask: None,
+            });
+            // Opaque blue background inside the group.
+            let mut bg = Path::new();
+            bg.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(RenderCommand::FillPath {
+                path: bg,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            // 50 detail marks elsewhere (well past the old 32-command cutoff).
+            for i in 0..50 {
+                let mut dot = Path::new();
+                let x = (i % 10) as f64 * 2.0;
+                let y = (i / 10) as f64 * 2.0;
+                dot.rect(Rect::new(x, y, x + 1.0, y + 1.0));
+                dl.push(RenderCommand::FillPath {
+                    path: dot,
+                    rule: FillRule::NonZero,
+                    paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+            // Gray Multiply tile over the blue region [40..80]×[40..80].
+            let mut fg = Path::new();
+            fg.rect(Rect::new(40.0, 40.0, 80.0, 80.0));
+            dl.push(RenderCommand::FillPath {
+                path: fg,
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(Arc::clone(&gray_mul)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+
+            let slide = display_list_to_slide(
+                &dl,
+                0,
+                &FontCache::new(),
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+            .expect("slide export");
+            let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+            let center = comp.get_pixel(120, 80); // PDF (60, 60) -> px (120, 80)
+            assert!(
+                center[0] < 12 && center[1] < 12 && (120..=138).contains(&center[2]),
+                "isolated={isolated}: gray Multiply after 50+ commands over blue inside group must be dark blue [0,0,~128], not gray, got {center:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_level_screen_pattern_uses_white_paper_while_isolated_group_stays_transparent() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, TilingPattern};
+
+        // Opaque black Screen cell: over white slide paper Screen(1, 0) = white;
+        // inside an isolated child group (transparent backdrop), opaque black
+        // Screen renders opaque black.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let black_screen = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // 1) Page-level opaque black Screen on an empty white slide must stay white.
+        let mut dl_page = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(20.0, 20.0, 80.0, 80.0));
+        dl_page.push(RenderCommand::FillPath {
+            path: r.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&black_screen)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let slide_page = display_list_to_slide(
+            &dl_page,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp_page = composite_slide_over_white(&slide_page, 100.0, 100.0, 2.0);
+        let px_page = comp_page.get_pixel(100, 100);
+        assert!(
+            px_page[0] > 245 && px_page[1] > 245 && px_page[2] > 245,
+            "page-level opaque black Screen on empty white slide must stay white, got {px_page:?}"
+        );
+
+        // 2) Same opaque black Screen inside an isolated Normal child group
+        //    must see transparent group backdrop and paint opaque black.
+        let mut dl_iso = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl_iso.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        dl_iso.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(black_screen),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_iso.push(RenderCommand::PopBlendGroup);
+        let slide_iso = display_list_to_slide(
+            &dl_iso,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp_iso = composite_slide_over_white(&slide_iso, 100.0, 100.0, 2.0);
+        let px_iso = comp_iso.get_pixel(100, 100);
+        assert!(
+            px_iso[0] < 10 && px_iso[1] < 10 && px_iso[2] < 10,
+            "opaque black Screen inside isolated child group must render opaque black, got {px_iso:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_tiling_pattern_matches_placed_extent_to_raster_pixel_grid() {
+        use std::sync::Arc;
+        use zpdf_display_list::{FillRule, Path, TilingPattern};
+
+        // At 2 px/pt, a 0.25-pt-wide opaque red rectangle rounds up to 1 pixel
+        // wide (0.5 pt). The slide image width must match the 1-pixel raster
+        // extent (0.5 pt) instead of shrinking it back down to 0.25 pt.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut thin = Path::new();
+        thin.rect(Rect::new(10.0, 10.0, 10.25, 20.0));
+        dl.push(RenderCommand::FillPath {
+            path: thin,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let (x_emu, width_emu, height_emu, image_data) = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::Image {
+                    x_emu,
+                    width_emu,
+                    height_emu,
+                    image_data,
+                    ..
+                } => Some((*x_emu, *width_emu, *height_emu, image_data.as_slice())),
+                _ => None,
+            })
+            .expect("narrow pattern image");
+        let img = image::load_from_memory(image_data)
+            .expect("valid PNG")
+            .to_rgba8();
+        let x_pt = x_emu as f64 / 12700.0;
+        let placed_w_pt = width_emu as f64 / 12700.0;
+        let placed_h_pt = height_emu as f64 / 12700.0;
+        assert!(
+            x_pt <= 10.0 + 1e-3 && x_pt + placed_w_pt >= 10.25 - 1e-3,
+            "placed box must cover [10.0..10.25], got [{x_pt}..{}]",
+            x_pt + placed_w_pt
+        );
+        assert!(placed_h_pt >= 10.0 - 1e-3);
+        // Total horizontal ink across the middle row = sum(alpha_x) * (placed_w / img.width)
+        // must preserve the full 0.25pt stripe width rather than shrinking it via unaligned
+        // pixel rounding (~0.125pt).
+        let mid_y = img.height() / 2;
+        let px_w_pt = placed_w_pt / img.width() as f64;
+        let mut ink_w_pt = 0.0;
+        for x in 0..img.width() {
+            let px = img.get_pixel(x, mid_y);
+            if px[3] > 0 {
+                assert!(
+                    px[0] > 240 && px[1] < 10 && px[2] < 10,
+                    "ink pixel at x={x} should be pure red, got {px:?}"
+                );
+                ink_w_pt += (px[3] as f64 / 255.0) * px_w_pt;
+            }
+        }
+        assert!(
+            (0.22..=0.28).contains(&ink_w_pt),
+            "narrow 0.25pt tiling stripe must preserve ~0.25pt total horizontal ink on slide, got {ink_w_pt:.4}pt (img={}x{}, placed_w={placed_w_pt:.4}pt)",
+            img.width(),
+            img.height()
+        );
+    }
+
+    #[test]
+    fn patterned_type3_glyph_run_exports_as_raster_image_with_clip_and_opacity() {
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{
+            FillRule, GlyphRun, Paint, Path, PositionedGlyph, RenderCommand, TilingPattern,
+        };
+        use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+        // 8×8 uncolored Type 3 bitmap glyph (`/IM true`): top 4 rows opaque ink, bottom 4 transparent.
+        let charproc =
+            b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\xff\xff\xff\xff EI";
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".into();
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    Arc::<[u8]>::from(&charproc[..]),
+                )]),
+                encoding,
+                widths: vec![1.0],
+                first_char: 65,
+            },
+            "Type3PptxPattern".into(),
+            Vec::new(),
+            CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        // 8×8 tiling cell: left 4pt red, right 4pt blue.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        let mut left = Path::new();
+        left.rect(Rect::new(0.0, 0.0, 4.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: left,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut right = Path::new();
+        right.rect(Rect::new(4.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: right,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Clip to x=[8..24] so only the left 16pt of the 24pt glyph renders,
+        // and apply 50% glyph opacity.
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        let mut clip = Path::new();
+        clip.rect(Rect::new(8.0, 8.0, 24.0, 32.0));
+        dl.push(RenderCommand::PushClip {
+            path: clip,
+            rule: FillRule::NonZero,
+        });
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 24.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 65,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 24.0,
+            }],
+            paint: Paint::Tiling(tiling),
+            alpha: 0.5,
+            overprint: None,
+            transform: Matrix::translate(8.0, 8.0),
+            h_scale: 1.0,
+        }));
+        dl.push(RenderCommand::PopClip);
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        assert!(
+            !slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::TextBox { .. })),
+            "patterned Type 3 glyph run must not emit a black TextBox"
+        );
+        assert!(
+            slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::Image { .. })),
+            "patterned Type 3 glyph run must emit a raster SlideElement::Image"
+        );
+
+        let comp = composite_slide_over_white(&slide, 40.0, 40.0, 2.0);
+        // Top half (PDF y=26 -> px y=28): x=10 (px x=20) is 50% red over white [255, ~128, ~128];
+        // x=14 (px x=28) is 50% blue over white [~128, ~128, 255];
+        // clipped region x=28 (px x=56) and transparent bottom half (PDF y=14 -> px y=52) stay white.
+        let red_px = comp.get_pixel(20, 28);
+        let blue_px = comp.get_pixel(28, 28);
+        let clipped_px = comp.get_pixel(56, 28);
+        let bottom_px = comp.get_pixel(20, 52);
+        assert!(
+            red_px[0] > 245 && (118..=138).contains(&red_px[1]) && (118..=138).contains(&red_px[2]),
+            "patterned Type 3 glyph red stripe at 50% opacity must composite to pink, got {red_px:?}"
+        );
+        assert!(
+            (118..=138).contains(&blue_px[0])
+                && (118..=138).contains(&blue_px[1])
+                && blue_px[2] > 245,
+            "patterned Type 3 glyph blue stripe at 50% opacity must composite to light blue, got {blue_px:?}"
+        );
+        assert_eq!(clipped_px, &image::Rgba([255, 255, 255, 255]));
+        assert_eq!(bottom_px, &image::Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn zero_alpha_image_and_diverged_fill_prefix_stay_consistent_with_screen_pattern() {
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{
+            BlendMode, FillRule, ImageDraw, Paint, Path, RenderCommand, TilingPattern,
+        };
+        use zpdf_image::DecodedImage;
+
+        let mut images = ImageCache::new();
+        let blue_id = images.insert(DecodedImage {
+            width: 2,
+            height: 2,
+            data: vec![
+                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+            ],
+            has_alpha: false,
+            is_image_mask: false,
+            premultiplied: false,
+        });
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let white_screen = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Case 1: Opaque blue image with `ImageDraw.alpha = 0` under white Screen pattern
+        // must leave the slide white (never blue).
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl.push(RenderCommand::DrawImage(ImageDraw {
+            image_id: blue_id,
+            transform: Matrix::scale(40.0, 40.0),
+            alpha: 0.0,
+            is_image_mask: false,
+        }));
+        let mut box_path = Path::new();
+        box_path.rect(Rect::new(10.0, 10.0, 30.0, 30.0));
+        dl.push(RenderCommand::FillPath {
+            path: box_path.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&white_screen)),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 40.0, 40.0, 2.0);
+        let mid = comp.get_pixel(40, 40);
+        assert_eq!(
+            mid,
+            &image::Rgba([255, 255, 255, 255]),
+            "zero-alpha blue image under white Screen pattern must stay white, got {mid:?}"
+        );
+
+        // Case 2: Native translucent FillPath (`alpha = 0.0`, which native OOXML
+        // shapes ignore) followed by white Screen pattern: `prefix_diverged`
+        // must replace the affected region with the true white composite instead
+        // of leaving the native blue shape visible.
+        let mut dl2 = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        let mut bg = Path::new();
+        bg.rect(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl2.push(RenderCommand::FillPath {
+            path: bg,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 0.0,
+            overprint: None,
+        });
+        dl2.push(RenderCommand::FillPath {
+            path: box_path,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(white_screen),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let slide2 = display_list_to_slide(
+            &dl2,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp2 = composite_slide_over_white(&slide2, 40.0, 40.0, 2.0);
+        let mid2 = comp2.get_pixel(40, 40);
+        assert_eq!(
+            mid2,
+            &image::Rgba([255, 255, 255, 255]),
+            "diverged native fill prefix under white Screen pattern must replace affected region with white, got {mid2:?}"
+        );
+    }
+
+    #[test]
+    fn patterned_glyph_after_translucent_prefix_limits_replacement_to_glyph_ink_bounds() {
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{
+            BlendMode, FillRule, GlyphRun, Paint, Path, PositionedGlyph, RenderCommand,
+            TilingPattern,
+        };
+        use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+        let charproc = b"1 0 0 0 1 1 d1 0 0 1 1 re f";
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".into();
+        let type3_font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    Arc::<[u8]>::from(&charproc[..]),
+                )]),
+                encoding,
+                widths: vec![1.0],
+                first_char: 65,
+            },
+            "Type3TightBounds".into(),
+            Vec::new(),
+            CidWidths::new(1.0),
+        );
+        let text_font = LoadedFont::new_standard("Helvetica".into()).expect("Helvetica font");
+        let mut fonts = FontCache::new();
+        let t3_id = fonts.insert("F1".into(), type3_font);
+        let text_id = fonts.insert("F2".into(), text_font);
+
+        // Backdrop-dependent Multiply blue tiling pattern.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 300.0, 300.0));
+        // 1. Translucent native rectangle sets `prefix_diverged = true`.
+        let mut prefix_rect = Path::new();
+        prefix_rect.rect(Rect::new(10.0, 10.0, 60.0, 60.0));
+        dl.push(RenderCommand::FillPath {
+            path: prefix_rect,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        // 2. Distant native TextBox at (200, 200) that must stay exposed.
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id: text_id,
+            font_size: 14.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: b'O' as u16,
+                    code_len: 1,
+                    code: b'O' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 10.0,
+                },
+                PositionedGlyph {
+                    glyph_id: b'K' as u16,
+                    code_len: 1,
+                    code: b'K' as u32,
+                    x: 10.0,
+                    y: 0.0,
+                    advance: 10.0,
+                },
+            ],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(200.0, 200.0),
+            h_scale: 1.0,
+        }));
+        // 3. Small unclipped backdrop-dependent patterned glyph at [20..44]×[20..44].
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id: t3_id,
+            font_size: 24.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 65,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 24.0,
+            }],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(20.0, 20.0),
+            h_scale: 1.0,
+        }));
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let text_box = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::TextBox {
+                    text,
+                    x_emu,
+                    y_emu,
+                    width_emu,
+                    height_emu,
+                    ..
+                } => Some((text.as_str(), *x_emu, *y_emu, *width_emu, *height_emu)),
+                _ => None,
+            })
+            .expect("distant native TextBox must remain on the slide");
+        assert_eq!(text_box.0, "OK");
+
+        let img_rect = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::Image {
+                    x_emu,
+                    y_emu,
+                    width_emu,
+                    height_emu,
+                    ..
+                } => Some((*x_emu, *y_emu, *width_emu, *height_emu)),
+                _ => None,
+            })
+            .expect("patterned glyph replacement image");
+        // Image bounds must stay tightly bounded to the 24×24pt glyph (<= 30pt with padding)
+        // and must NOT overlap the distant TextBox at x=200pt.
+        assert!(
+            img_rect.2 < pt_to_emu(35.0) && img_rect.3 < pt_to_emu(35.0),
+            "replacement PNG must be bounded to glyph ink bounds (~26pt), got {}×{} pt",
+            img_rect.2 as f64 / 12700.0,
+            img_rect.3 as f64 / 12700.0
+        );
+        let img_x1 = img_rect.0 + img_rect.2;
+        assert!(
+            img_x1 < text_box.1,
+            "replacement PNG right edge ({}pt) must stay strictly left of distant TextBox ({}pt)",
+            img_x1 as f64 / 12700.0,
+            text_box.1 as f64 / 12700.0
+        );
+    }
+
+    #[test]
+    fn sheared_image_before_screen_pattern_replaces_pptx_corner() {
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{
+            BlendMode, FillRule, ImageDraw, Paint, Path, RenderCommand, TilingPattern,
+        };
+        use zpdf_image::DecodedImage;
+
+        let mut images = ImageCache::new();
+        let blue_id = images.insert(DecodedImage {
+            width: 2,
+            height: 2,
+            data: vec![
+                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+            ],
+            has_alpha: false,
+            is_image_mask: false,
+            premultiplied: false,
+        });
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let white_screen = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        // Unclipped sheared opaque blue RGB image:
+        // PDF parallelogram corners: (10,20), (50,20), (30,60), (70,60).
+        // PowerPoint orthogonal rectangle: x=[20..60], PDF y=[17.64..62.36].
+        // PDF point (22, 56) is WHITE in CPU replay, but BLUE in PowerPoint's orthogonal image box.
+        dl.push(RenderCommand::DrawImage(ImageDraw {
+            image_id: blue_id,
+            transform: Matrix::new(40.0, 0.0, 20.0, 40.0, 10.0, 20.0),
+            alpha: 1.0,
+            is_image_mask: false,
+        }));
+        let mut corner = Path::new();
+        corner.rect(Rect::new(15.0, 45.0, 35.0, 65.0));
+        dl.push(RenderCommand::FillPath {
+            path: corner,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(white_screen),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+        // PDF (22, 56) -> PPT (22, 44) -> pixel (44, 88).
+        let px = comp.get_pixel(44, 88);
+        assert_eq!(
+            px,
+            &image::Rgba([255, 255, 255, 255]),
+            "white Screen pattern over corner covered only by PowerPoint's orthogonal sheared-image box must become white, got {px:?}"
+        );
+    }
+
+    #[test]
+    fn type3_named_resource_stencil_do_bounds_and_renders_on_slide() {
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{FillRule, Paint, Path, RenderCommand, TilingPattern};
+        use zpdf_font::{
+            CidWidths, FontCache, LoadedFont, PdfFontType, Type3ImageXObject, Type3Resources,
+            Type3XObject,
+        };
+
+        let mut img_dict = zpdf_core::PdfDict::new();
+        img_dict.insert(
+            zpdf_core::PdfName::new("Subtype"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Image")),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("Width"),
+            zpdf_core::PdfObject::Integer(8),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("Height"),
+            zpdf_core::PdfObject::Integer(8),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("BitsPerComponent"),
+            zpdf_core::PdfObject::Integer(1),
+        );
+        img_dict.insert(
+            zpdf_core::PdfName::new("ImageMask"),
+            zpdf_core::PdfObject::Bool(true),
+        );
+        let mut resources = Type3Resources::default();
+        resources.xobjects.insert(
+            "Ink".into(),
+            Type3XObject::Image(Arc::new(Type3ImageXObject {
+                dict: img_dict,
+                data: Arc::from([0u8; 8].as_slice()),
+                smask: None,
+                mask_stream: None,
+            })),
+        );
+
+        let named_stream = b"1 0 0 0 1 1 d1 /Ink Do";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    Arc::<[u8]>::from(&named_stream[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3NamedPptx".into(),
+            Vec::new(),
+            CidWidths::new(1.0),
+        )
+        .with_type3_resources(Arc::new(resources));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 24.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 24.0,
+            }],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(20.0, 20.0),
+            h_scale: 1.0,
+        }));
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 100.0, 100.0, 1.0);
+        // PDF (32, 32) -> PPT (32, 68).
+        let glyph_px = comp.get_pixel(32, 68);
+        let outside_px = comp.get_pixel(5, 5);
+        assert!(
+            glyph_px[0] < 15 && glyph_px[1] < 15 && glyph_px[2] > 240,
+            "named `/Ink Do` Type 3 glyph must render blue on PPTX slide, got {glyph_px:?}"
+        );
+        assert_eq!(outside_px, &image::Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn type3_glyph_bounds_cached_across_repeated_occurrences_and_honors_deadline() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{FillRule, Paint, Path, RenderCommand, TilingPattern};
+        use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+        let inline_stream =
+            b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    Arc::<[u8]>::from(&inline_stream[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3CachedBounds".into(),
+            Vec::new(),
+            CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let glyphs: Vec<PositionedGlyph> = (0..500)
+            .map(|i| PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: (i % 25) as f32 * 4.0,
+                y: (i / 25) as f32 * 4.0,
+                advance: 4.0,
+            })
+            .collect();
+        let run = GlyphRun {
+            font_id,
+            font_size: 4.0,
+            glyphs,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(10.0, 10.0),
+            h_scale: 1.0,
+        };
+
+        let images = ImageCache::new();
+        let options = ConversionOptions::default();
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        dl.push(RenderCommand::DrawGlyphRun(run));
+
+        let (slide, stats) = display_list_to_slide_internal(
+            &dl,
+            0,
+            &fonts,
+            &images,
+            &options,
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("500 repeated Type 3 glyphs within budget");
+        assert_eq!(
+            stats.type3_bounds_cache_entries, 1,
+            "500 occurrences of one Type 3 glyph must populate only 1 cache entry"
+        );
+        let (x_pt, y_pt, w_pt, h_pt) = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::Image {
+                    x_emu,
+                    y_emu,
+                    width_emu,
+                    height_emu,
+                    ..
+                } => Some((
+                    *x_emu as f64 / 12700.0,
+                    *y_emu as f64 / 12700.0,
+                    *width_emu as f64 / 12700.0,
+                    *height_emu as f64 / 12700.0,
+                )),
+                _ => None,
+            })
+            .expect("patterned Type 3 run must emit an image");
+        // Page height is 200; PDF y=[10..90] maps to PPTX top-down y=[110..190], x=[10..110].
+        assert!(
+            x_pt <= 10.5 && x_pt + w_pt >= 109.5 && y_pt <= 110.5 && y_pt + h_pt >= 189.5,
+            "cached bounds must cover all 500 placements, got x={x_pt}..{} y={y_pt}..{}",
+            x_pt + w_pt,
+            y_pt + h_pt
+        );
+
+        // Zero budget propagates a time-budget error from Type 3 bounds measurement.
+        match display_list_to_slide_internal(
+            &dl,
+            0,
+            &fonts,
+            &images,
+            &options,
+            Some(Duration::ZERO),
+            None,
+        ) {
+            Err(zpdf_core::Error::StreamDecode(msg)) => {
+                assert!(msg.contains("time budget"), "unexpected error: {msg}");
+            }
+            Ok(_) => panic!("zero budget must time out during Type 3 bounds measurement"),
+            Err(other) => panic!("expected time-budget StreamDecode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spaced_native_text_before_white_screen_pattern_replaces_gap() {
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{BlendMode, FillRule, Paint, Path, RenderCommand, TilingPattern};
+        use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+        const PRIMARY_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+        let text_font = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "SpacedTestTTF".into(),
+            PRIMARY_TTF.to_vec(),
+            CidWidths::new(600.0),
+        );
+        let gid_a = text_font.unicode_glyph('A' as u32).unwrap().0;
+        let gid_b = text_font.unicode_glyph('B' as u32).unwrap().0;
+        let mut fonts = FontCache::new();
+        let text_id = fonts.insert("F1".into(), text_font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let white_screen = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 120.0, 80.0));
+        // Opaque "AB" run with large Tc spacing: 'A' at x=10, 'B' pushed out to x=70.
+        // PowerPoint emits a single "AB" TextBox with normal kerning, placing 'B' near x=20..30.
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id: text_id,
+            font_size: 18.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: gid_a,
+                    code_len: 1,
+                    code: b'A' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 60.0,
+                },
+                PositionedGlyph {
+                    glyph_id: gid_b,
+                    code_len: 1,
+                    code: b'B' as u32,
+                    x: 60.0,
+                    y: 0.0,
+                    advance: 12.0,
+                },
+            ],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(10.0, 30.0),
+            h_scale: 1.0,
+        }));
+        // White Screen pattern over the PDF gap [22..55]×[25..55] (where PowerPoint places 'B').
+        let mut gap = Path::new();
+        gap.rect(Rect::new(22.0, 25.0, 55.0, 55.0));
+        dl.push(RenderCommand::FillPath {
+            path: gap,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&white_screen)),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let png_bytes = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::Image { image_data, .. } => Some(image_data.as_slice()),
+                _ => None,
+            })
+            .expect("white Screen pattern over spaced text gap must emit opaque replacement PNG");
+        let decoded = image::load_from_memory(png_bytes)
+            .expect("valid PNG")
+            .to_rgba8();
+        let center = decoded.get_pixel(decoded.width() / 2, decoded.height() / 2);
+        assert_eq!(
+            center,
+            &image::Rgba([255, 255, 255, 255]),
+            "replacement PNG over spaced text gap must be opaque white to cover misplaced PowerPoint 'B', got {center:?}"
+        );
+
+        // When the same overlapped run uses an outline-less placeholder font,
+        // the backdrop overlap guard must refuse to silently drop the text.
+        let mut placeholder_fonts = FontCache::new();
+        let ph_id = placeholder_fonts.insert(
+            "F1".into(),
+            LoadedFont::new_standard("Helvetica".into()).expect("Helvetica font"),
+        );
+        let mut ph_dl = dl.clone();
+        if let RenderCommand::DrawGlyphRun(ref mut run) = ph_dl.commands[0] {
+            run.font_id = ph_id;
+        }
+        assert!(
+            display_list_to_slide(
+                &ph_dl,
+                0,
+                &placeholder_fonts,
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+            .is_err(),
+            "backdrop tiling pattern overlapping outline-less native text must return an error"
+        );
+    }
+
+    #[test]
+    fn tiling_with_translucent_non_isolated_multiply_group_preserves_blue_slide_backdrop() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, SoftMask, SoftMaskKind, TilingPattern};
+
+        // 1) Tile containing a 50%-opacity NON-ISOLATED Normal group with a white Multiply mark:
+        //    over opaque blue, Multiply(white, blue) == blue, so compositing at 50% opacity
+        //    must keep the slide pure blue (NOT lighten it toward [128, 128, 255]).
+        let mut cell_alpha = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell_alpha.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        cell_alpha.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut tile_rect = Path::new();
+        tile_rect.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell_alpha.push(RenderCommand::FillPath {
+            path: tile_rect.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell_alpha.push(RenderCommand::PopBlendGroup);
+        cell_alpha.push(RenderCommand::PopBlendGroup);
+
+        // 2) Tile containing a masked NON-ISOLATED Normal group with a white Multiply mark.
+        let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        mask_dl.push(RenderCommand::FillPath {
+            path: tile_rect.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut cell_mask = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell_mask.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: Some(SoftMask {
+                kind: SoftMaskKind::Alpha,
+                commands: Arc::new(mask_dl),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: None,
+            }),
+        });
+        cell_mask.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell_mask.push(RenderCommand::FillPath {
+            path: tile_rect,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell_mask.push(RenderCommand::PopBlendGroup);
+        cell_mask.push(RenderCommand::PopBlendGroup);
+
+        for (label, cell) in [("alpha_0_5", cell_alpha), ("soft_mask", cell_mask)] {
+            let tiling = Arc::new(TilingPattern {
+                commands: Arc::new(cell),
+                bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+                x_step: 20.0,
+                y_step: 20.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            });
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+            let mut bg = Path::new();
+            bg.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(RenderCommand::FillPath {
+                path: bg,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            let mut target = Path::new();
+            target.rect(Rect::new(20.0, 20.0, 80.0, 80.0));
+            dl.push(RenderCommand::FillPath {
+                path: target,
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(tiling),
+                alpha: 1.0,
+                overprint: None,
+            });
+
+            let slide = display_list_to_slide(
+                &dl,
+                0,
+                &FontCache::new(),
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+            .expect("slide export");
+            let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+            let center = comp.get_pixel(100, 100);
+            assert!(
+                center[0] < 10 && center[1] < 10 && center[2] > 245,
+                "PPTX tile with non-isolated {label} Normal group wrapping white Multiply over blue must stay pure blue, got {center:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_image_mask_with_white_multiply_tiling_preserves_blue_backdrop_on_slide() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let mask_bits: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff];
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /XObject << /MaskImg 5 0 R >> /Pattern << /P1 6 0 R >> >> >>"
+                .to_vec(),
+            stream(
+                "",
+                b"0 0 1 rg 0 0 100 100 re f /Pattern cs /P1 scn q 60 0 0 60 20 20 cm /MaskImg Do Q",
+            ),
+            stream(
+                "/Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 1 /ImageMask true",
+                &mask_bits,
+            ),
+            stream(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                 /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+                 /Resources << /ExtGState << /GSM << /Type /ExtGState /BM /Multiply >> >> >>",
+                b"/GSM gs 1 1 1 rg 0 0 10 10 re f",
+            ),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let mut images = ImageCache::new();
+        let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+        // Inside top painted half of stencil (page x=50, y=65 -> canvas x=100, y=70).
+        let px = comp.get_pixel(100, 70);
+        assert!(
+            px[0] < 10 && px[1] < 10 && px[2] > 245,
+            "PPTX slide image mask with white Multiply tiling over blue must stay blue, got {px:?}"
+        );
+    }
+
+    #[test]
+    fn shared_nested_normal_tiling_dag_memoizes_backdrop_scans() {
+        use std::sync::Arc;
+        use zpdf_display_list::{FillRule, GlyphRun, Path, PositionedGlyph, TilingPattern};
+
+        // 16-level diamond DAG (the full supported interpreter nesting depth)
+        // where each intermediate level paints 16 references to the same child
+        // `Arc<DisplayList>` (16^15 ≈ 1.15e18 naive paths!), all Normal.
+        // Memoizing backdrop checks by `(Arc::as_ptr(&cell), depth)` completes in
+        // O(unique cell commands), inspects the 16th tile's solid mark without
+        // falsely requiring a slide backdrop, and exports cleanly even when
+        // overlapping outline-less native text.
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut child_arc = Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        Arc::make_mut(&mut child_arc).push(RenderCommand::FillPath {
+            path: sq.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        for _ in 0..15 {
+            let child = Arc::new(TilingPattern {
+                commands: Arc::clone(&child_arc),
+                bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+                x_step: 10.0,
+                y_step: 10.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            });
+            let mut parent = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+            for _ in 0..16 {
+                parent.push(RenderCommand::FillPath {
+                    path: sq.clone(),
+                    rule: FillRule::NonZero,
+                    paint: Paint::Tiling(Arc::clone(&child)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+            child_arc = Arc::new(parent);
+        }
+        let root_tiling = Arc::new(TilingPattern {
+            commands: Arc::clone(&child_arc),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Add overlapping native text backed by an outline-less standard font
+        // before the 16-level Normal tile: if the 16th level were falsely
+        // flagged as backdrop-dependent, the exporter would require a slide
+        // backdrop and reject the slide over the outline-less text.
+        let mut fonts = FontCache::new();
+        let ph_id = fonts.insert(
+            "F1".into(),
+            LoadedFont::new_standard("Helvetica".into()).expect("Helvetica font"),
+        );
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id: ph_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 8.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(2.0, 4.0),
+            h_scale: 1.0,
+        }));
+        let mut cover = Path::new();
+        cover.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(RenderCommand::FillPath {
+            path: cover.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&root_tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let mut cache = TilingBackdropCache::default();
+        assert!(
+            !command_uses_tiling_backdrop(&dl.commands[1], &fonts, &mut cache),
+            "Normal-only 16-level DAG must inspect the 16th tile and report false for page backdrop dependence"
+        );
+        // 15 intermediate levels × 16 commands + 1 leaf command = 241 unique commands.
+        assert!(
+            cache.commands_scanned <= 260,
+            "memoized backdrop scan must visit each (cell, depth) once (<= 260), got {}",
+            cache.commands_scanned
+        );
+
+        // Descending beyond the supported 16 levels (17 levels) MUST still
+        // trigger the conservative backdrop-dependent fallback.
+        let mut level17_parent = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        level17_parent.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&root_tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let level17_tiling = Arc::new(TilingPattern {
+            commands: Arc::new(level17_parent),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+        let level17_cmd = RenderCommand::FillPath {
+            path: cover,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(level17_tiling),
+            alpha: 1.0,
+            overprint: None,
+        };
+        let mut cache17 = TilingBackdropCache::default();
+        assert!(
+            command_uses_tiling_backdrop(&level17_cmd, &fonts, &mut cache17),
+            "17-level tiling chain beyond the 16-level limit must conservatively require a backdrop"
+        );
+
+        // Verify full PPTX slide export succeeds over the outline-less native
+        // text and stays bounded across all export passes.
+        let (slide, stats) = display_list_to_slide_internal(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("16-level Normal tiling over outline-less native text must export cleanly");
+        assert!(
+            slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::TextBox { .. })),
+            "native text box must be preserved under a Normal 16-level tiling pattern"
+        );
+        assert!(
+            slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::Image { .. })),
+            "16-level Normal tiling pattern must emit its tile overlay image"
+        );
+        assert!(
+            stats.tiling_backdrop_cmd_scans <= 320,
+            "full PPTX export must share memoized backdrop scans across passes (<= 320), got {}",
+            stats.tiling_backdrop_cmd_scans
+        );
+    }
+
+    #[test]
+    fn pptx_flattened_type3_unclipped_axial_shading_all_zero_bbox_preserves_extended_color() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{
+            Color, FillRule, GlyphRun, Paint, Path, PositionedGlyph, TilingPattern,
+        };
+        use zpdf_font::{
+            CidWidths, FontCache, LoadedFont, PdfFontType, Type3Function, Type3Resources,
+            Type3Shading,
+        };
+
+        let mut func_dict = zpdf_core::PdfDict::new();
+        func_dict.insert(
+            zpdf_core::PdfName::new("FunctionType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("Domain"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C0"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(1.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C1"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("N"),
+            zpdf_core::PdfObject::Real(1.0),
+        );
+        let mut sh_dict = zpdf_core::PdfDict::new();
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ShadingType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Coords"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(500.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Extend"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Bool(true),
+                zpdf_core::PdfObject::Bool(true),
+            ]),
+        );
+        let mut t3_res = Type3Resources::default();
+        t3_res.shadings.insert(
+            "Fade".into(),
+            Arc::new(Type3Shading {
+                dict: sh_dict,
+                stream_data: None,
+                functions: vec![Arc::new(Type3Function::Dict {
+                    dict: func_dict,
+                    children: Vec::new(),
+                })],
+            }),
+        );
+        let charproc = b"2500 0 d0 /Fade sh";
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [0.04, 0.0, 0.0, 0.04, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![2500.0],
+                first_char: 0,
+            },
+            "AllZeroAxialPptx".into(),
+            Vec::new(),
+            CidWidths::new(2500.0),
+        )
+        .with_type3_resources(Arc::new(t3_res))
+        .with_type3_font_bbox(Rect::new(0.0, 0.0, 0.0, 0.0));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut cell_path = Path::new();
+        cell_path.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: cell_path,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let (slide, _) = display_list_to_slide_internal(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+            Some(zpdf_render_cpu::DEFAULT_RENDER_BUDGET),
+            None,
+        )
+        .expect("PPTX export of patterned Type 3 axial shading");
+
+        let (x_emu, width_emu, image_data) = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::Image {
+                    x_emu,
+                    width_emu,
+                    image_data,
+                    ..
+                } => Some((*x_emu, *width_emu, image_data.as_slice())),
+                _ => None,
+            })
+            .expect("flattened Type 3 run must produce a SlideElement::Image");
+
+        let full_slide_w_emu = pt_to_emu(100.0);
+        assert!(
+            x_emu <= pt_to_emu(1.0) && width_emu >= full_slide_w_emu - pt_to_emu(2.0),
+            "flattened crop must span the full 100pt slide instead of placeholder 40pt (x_emu={x_emu}, width_emu={width_emu}, expected ~{full_slide_w_emu})"
+        );
+        let img = image::load_from_memory(image_data)
+            .expect("valid flattened PNG")
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        // 80% across the 100pt slide = glyph x=2000 (past 1000 units), extended solid blue.
+        let px = img.get_pixel((w * 8) / 10, h / 2);
+        assert!(
+            px[0] < 15 && px[1] < 15 && px[2] > 240 && px[3] > 240,
+            "flattened PPTX image at x=80% (glyph x=2000) must preserve extended blue, got {px:?}"
         );
     }
 }

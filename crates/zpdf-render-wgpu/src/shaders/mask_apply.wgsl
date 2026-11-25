@@ -19,9 +19,9 @@ struct MaskU {
     kind: u32,          // 1 = luminosity, 2 = alpha
     dx: i32,            // device-pixel coverage offset: sample at coord - (dx, dy)
     dy: i32,
-    pad0: u32,
+    non_isolated: u32,  // 0 = isolated (g * cov), 1 = non-isolated Normal (mix(base, g, group_alpha * cov)), 2 = ISO §11.4.5 backdrop removal
     backdrop_luma: f32, // coverage where the offset reads outside the built mask
-    pad1: f32,
+    group_alpha: f32,   // constant group opacity for non-isolated mix
     pad2: f32,
     pad3: f32,
     lut: array<vec4<u32>, 16>, // /TR transfer LUT, 256 bytes packed 4 per u32
@@ -31,6 +31,7 @@ struct MaskU {
 @group(1) @binding(0) var group_tex: texture_2d<f32>;
 @group(1) @binding(1) var mask_tex: texture_2d<f32>;
 @group(1) @binding(2) var<uniform> mu: MaskU;
+@group(1) @binding(3) var base_tex: texture_2d<f32>;
 
 struct VsIn {
     @location(0) pos: vec2<f32>,
@@ -78,6 +79,27 @@ fn fs_mask(in: VsOut) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(i32(in.clip_pos.x), i32(in.clip_pos.y));
     let g = textureLoad(group_tex, coord, 0); // group (premultiplied), at dest
 
+    if (mu.non_isolated == 2u) {
+        // ISO 32000-1 §11.4.5 non-isolated group backdrop removal:
+        // `group_tex` holds (C_n, α_n) evaluated over `base_tex` = (C_0, α_0);
+        // `mask_tex.a` holds α_g (accumulated group alpha over transparent).
+        let ga = textureLoad(mask_tex, coord, 0).a;
+        if (ga <= 0.0) {
+            return vec4<f32>(0.0);
+        }
+        let d = textureLoad(base_tex, coord, 0);
+        var c_n = vec3<f32>(0.0);
+        if (g.a > 0.0) {
+            c_n = g.rgb / g.a;
+        }
+        var c_0 = vec3<f32>(0.0);
+        if (d.a > 0.0) {
+            c_0 = d.rgb / d.a;
+        }
+        let c_g = clamp(c_n + (c_n - c_0) * (d.a / ga - d.a), vec3<f32>(0.0), vec3<f32>(1.0));
+        return vec4<f32>(c_g * ga, ga);
+    }
+
     // Sample coverage at the destination shifted by the reuse offset. Reads
     // outside the built mask take the unpainted value — the /BC backdrop for a
     // luminosity mask, 0 for an alpha mask — which is what a fresh raster yields
@@ -113,6 +135,12 @@ fn fs_mask(in: VsOut) -> @location(0) vec4<f32> {
     // would pick a different LUT slot on exact x.5 ties.
     let idx = u32(floor(clamp(cov, 0.0, 1.0) * 255.0 + 0.5));
     cov = transfer(idx);
+
+    if (mu.non_isolated != 0u) {
+        let d = textureLoad(base_tex, coord, 0);
+        let w = clamp(mu.group_alpha * cov, 0.0, 1.0);
+        return mix(d, g, w);
+    }
 
     // Scaling premultiplied RGBA by coverage applies the mask to the group.
     return g * cov;

@@ -194,6 +194,292 @@ pub struct LoadedFont {
     ///
     /// [`set_variations`]: LoadedFont::set_variations
     pub variations: Vec<([u8; 4], f32)>,
+    /// Pre-resolved named resources (`/XObject`, `/ColorSpace`, `/ExtGState`)
+    /// from a Type 3 font's `/Resources` dictionary so CharProcs can execute
+    /// `/Name Do`, `/GS gs`, and named color spaces without a live `PdfFile`.
+    pub type3_resources: Option<Arc<Type3Resources>>,
+    /// Declared non-degenerate `/FontBBox` of a Type 3 font in glyph space,
+    /// used as the shading/replay bounds when a CharProc has no explicit clip.
+    pub type3_font_bbox: Option<zpdf_core::Rect>,
+}
+
+/// Pre-resolved image XObject referenced by a Type 3 font's `/Resources`.
+#[derive(Debug, Clone)]
+pub struct Type3ImageXObject {
+    /// Image dictionary with indirect metadata keys resolved to direct objects.
+    pub dict: zpdf_core::PdfDict,
+    /// Decoded image stream bytes.
+    pub data: Arc<[u8]>,
+    /// Optional resolved `/SMask` image stream.
+    pub smask: Option<Box<Type3ImageXObject>>,
+    /// Optional resolved `/Mask` 1-bpc stencil stream.
+    pub mask_stream: Option<Box<Type3ImageXObject>>,
+}
+
+/// Pre-resolved Form XObject referenced by a Type 3 font's `/Resources`.
+#[derive(Debug, Clone)]
+pub struct Type3FormXObject {
+    pub dict: zpdf_core::PdfDict,
+    pub data: Arc<[u8]>,
+    pub resources: Option<Arc<Type3Resources>>,
+}
+
+/// Pre-resolved XObject resource entry for Type 3 CharProc replay.
+#[derive(Debug, Clone)]
+pub enum Type3XObject {
+    Image(Arc<Type3ImageXObject>),
+    Form(Arc<Type3FormXObject>),
+}
+
+/// Pre-resolved `/SMask` value inside a Type 3 font's `/ExtGState` resource so
+/// standalone CharProc replay can build soft masks without a live `PdfFile`.
+#[derive(Debug, Clone)]
+pub enum Type3SoftMask {
+    /// `/SMask /None` — clears the active soft mask.
+    None,
+    /// `/SMask << /S ... /G <Form> /BC ... /TR ... >>`
+    Dict {
+        /// True for `/S /Alpha`, false for `/S /Luminosity`.
+        is_alpha: bool,
+        /// Pre-resolved transparency group Form XObject (`/G`) and its resources.
+        group: Arc<Type3FormXObject>,
+        /// Backdrop luminosity approximation from `/BC` in `[0, 1]`.
+        backdrop_luma: f32,
+        /// Pre-resolved `/TR` transfer function (including recursive stitching
+        /// sub-functions and stream payloads) when present and not `/Identity`.
+        transfer: Option<Arc<Type3Function>>,
+    },
+}
+
+/// Pre-resolved PDF function node (dict, stream with decoded bytes, or
+/// stitching sub-functions) carried inside [`Type3Shading`] and
+/// [`Type3SoftMask`] so standalone Type 3 replay can evaluate `/Function` and
+/// `/TR` without a live `PdfFile`.
+#[derive(Debug, Clone)]
+pub enum Type3Function {
+    /// Non-stream function dictionary (Type 2 exponential, or Type 3 stitching
+    /// whose child `/Functions` entries are stored in `children`).
+    Dict {
+        dict: zpdf_core::PdfDict,
+        children: Vec<Arc<Type3Function>>,
+    },
+    /// Stream-backed function (Type 0 sampled or Type 4 PostScript calculator).
+    Stream {
+        dict: zpdf_core::PdfDict,
+        data: Arc<[u8]>,
+    },
+}
+
+/// Pre-resolved `/Shading` resource carried by [`Type3Resources`] so standalone
+/// Type 3 CharProc / soft-mask replay can execute `/Name sh` without a live
+/// `PdfFile`.
+#[derive(Debug, Clone)]
+pub struct Type3Shading {
+    /// Resolved shading dictionary (`ShadingType`, `Coords`, `ColorSpace`,
+    /// `Domain`, `Extend`, mesh decode keys, etc.).
+    pub dict: zpdf_core::PdfDict,
+    /// Decoded stream bytes for mesh shadings (Types 4–7); `None` for Types 2–3.
+    pub stream_data: Option<Arc<[u8]>>,
+    /// Pre-resolved `/Function` entry (one multi-output function, N 1-output
+    /// functions, or empty for mesh shadings with direct vertex colors).
+    pub functions: Vec<Arc<Type3Function>>,
+}
+
+/// Resolved named resources carried by a Type 3 [`LoadedFont`] so CharProcs
+/// can resolve `/Name Do`, `/GS gs`, `/Shading sh`, and named `/ColorSpace`
+/// entries during standalone replay across CPU, GPU, SVG, and PPTX backends.
+#[derive(Debug, Clone, Default)]
+pub struct Type3Resources {
+    pub xobjects: HashMap<String, Type3XObject>,
+    pub color_spaces: HashMap<String, zpdf_core::PdfObject>,
+    pub ext_g_states: HashMap<String, zpdf_core::PdfDict>,
+    /// Pre-resolved `/SMask` entries for named `/ExtGState` resources, keyed by
+    /// the same ExtGState resource name.
+    pub ext_g_state_smasks: HashMap<String, Type3SoftMask>,
+    /// Pre-resolved `/Shading` entries referenced by `sh` inside Type 3
+    /// CharProcs, Forms, and `/SMask` transparency groups.
+    pub shadings: HashMap<String, Arc<Type3Shading>>,
+}
+
+#[derive(Default)]
+struct Type3BytesVisited {
+    /// Deduplicates shared `Arc<[u8]>` decoded stream payloads.
+    stream_ptrs: HashSet<usize>,
+    /// Deduplicates shared `Arc<Type3ImageXObject>` nodes.
+    image_ptrs: HashSet<usize>,
+    /// Deduplicates shared `Arc<Type3FormXObject>` nodes (and their nested graphs).
+    form_ptrs: HashSet<usize>,
+    /// Deduplicates shared `Arc<Type3Shading>` nodes.
+    shading_ptrs: HashSet<usize>,
+    /// Deduplicates shared `Arc<Type3Function>` nodes.
+    function_ptrs: HashSet<usize>,
+    /// Deduplicates shared `Type3Resources` maps.
+    resource_ptrs: HashSet<usize>,
+}
+
+impl Type3Function {
+    fn estimated_bytes(root: &Arc<Self>, visited: &mut Type3BytesVisited) -> u64 {
+        let mut bytes = 0u64;
+        let mut stack: Vec<&Arc<Self>> = vec![root];
+        while let Some(func) = stack.pop() {
+            if !visited.function_ptrs.insert(Arc::as_ptr(func) as usize) {
+                continue;
+            }
+            bytes = bytes.saturating_add(std::mem::size_of::<Self>() as u64);
+            match func.as_ref() {
+                Self::Dict { dict, children } => {
+                    bytes = bytes
+                        .saturating_add(estimated_pdf_dict_bytes(dict))
+                        .saturating_add(
+                            (children.capacity() as u64)
+                                .saturating_mul(std::mem::size_of::<Arc<Self>>() as u64),
+                        );
+                    for child in children {
+                        stack.push(child);
+                    }
+                }
+                Self::Stream { dict, data } => {
+                    bytes = bytes.saturating_add(estimated_pdf_dict_bytes(dict));
+                    if visited.stream_ptrs.insert(data.as_ptr() as usize) {
+                        bytes = bytes.saturating_add(data.len() as u64);
+                    }
+                }
+            }
+        }
+        bytes
+    }
+}
+
+impl Type3Resources {
+    pub fn is_empty(&self) -> bool {
+        self.xobjects.is_empty()
+            && self.color_spaces.is_empty()
+            && self.ext_g_states.is_empty()
+            && self.ext_g_state_smasks.is_empty()
+            && self.shadings.is_empty()
+    }
+
+    /// Estimate retained heap bytes across the entire reachable Type 3 resource
+    /// graph using an explicit worklist so every distinct allocation is counted
+    /// exactly once regardless of alias depth or `HashMap` traversal order.
+    pub fn estimated_cache_bytes(&self) -> u64 {
+        let mut visited = Type3BytesVisited::default();
+        let mut worklist: Vec<&Self> = vec![self];
+        let mut bytes = 0u64;
+        while let Some(res) = worklist.pop() {
+            if !visited.resource_ptrs.insert(res as *const Self as usize) {
+                continue;
+            }
+            bytes = bytes
+                .saturating_add(estimated_map_bytes(&res.xobjects))
+                .saturating_add(estimated_map_bytes(&res.color_spaces))
+                .saturating_add(estimated_map_bytes(&res.ext_g_states))
+                .saturating_add(estimated_map_bytes(&res.ext_g_state_smasks))
+                .saturating_add(estimated_map_bytes(&res.shadings));
+            for (name, xobj) in &res.xobjects {
+                bytes = bytes.saturating_add(name.capacity() as u64);
+                match xobj {
+                    Type3XObject::Image(img) => {
+                        if visited.image_ptrs.insert(Arc::as_ptr(img) as usize) {
+                            bytes = bytes
+                                .saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64)
+                                .saturating_add(img.estimated_bytes(&mut visited));
+                        }
+                    }
+                    Type3XObject::Form(form) => {
+                        if visited.form_ptrs.insert(Arc::as_ptr(form) as usize) {
+                            bytes = bytes
+                                .saturating_add(std::mem::size_of::<Type3FormXObject>() as u64)
+                                .saturating_add(estimated_pdf_dict_bytes(&form.dict));
+                            if visited.stream_ptrs.insert(form.data.as_ptr() as usize) {
+                                bytes = bytes.saturating_add(form.data.len() as u64);
+                            }
+                            if let Some(child_res) = &form.resources {
+                                worklist.push(child_res.as_ref());
+                            }
+                        }
+                    }
+                }
+            }
+            for (name, cs) in &res.color_spaces {
+                bytes = bytes
+                    .saturating_add(name.capacity() as u64)
+                    .saturating_add(estimated_pdf_object_bytes(cs));
+            }
+            for (name, gs) in &res.ext_g_states {
+                bytes = bytes
+                    .saturating_add(name.capacity() as u64)
+                    .saturating_add(estimated_pdf_dict_bytes(gs));
+            }
+            for (name, smask) in &res.ext_g_state_smasks {
+                bytes = bytes.saturating_add(name.capacity() as u64);
+                if let Type3SoftMask::Dict {
+                    group, transfer, ..
+                } = smask
+                {
+                    if visited.form_ptrs.insert(Arc::as_ptr(group) as usize) {
+                        bytes = bytes
+                            .saturating_add(std::mem::size_of::<Type3FormXObject>() as u64)
+                            .saturating_add(estimated_pdf_dict_bytes(&group.dict));
+                        if visited.stream_ptrs.insert(group.data.as_ptr() as usize) {
+                            bytes = bytes.saturating_add(group.data.len() as u64);
+                        }
+                        if let Some(child_res) = &group.resources {
+                            worklist.push(child_res.as_ref());
+                        }
+                    }
+                    if let Some(tr) = transfer {
+                        bytes =
+                            bytes.saturating_add(Type3Function::estimated_bytes(tr, &mut visited));
+                    }
+                }
+            }
+            for (name, shading) in &res.shadings {
+                bytes = bytes.saturating_add(name.capacity() as u64);
+                if visited.shading_ptrs.insert(Arc::as_ptr(shading) as usize) {
+                    bytes = bytes
+                        .saturating_add(std::mem::size_of::<Type3Shading>() as u64)
+                        .saturating_add(estimated_pdf_dict_bytes(&shading.dict))
+                        .saturating_add(
+                            (shading.functions.capacity() as u64)
+                                .saturating_mul(std::mem::size_of::<Arc<Type3Function>>() as u64),
+                        );
+                    if let Some(data) = &shading.stream_data {
+                        if visited.stream_ptrs.insert(data.as_ptr() as usize) {
+                            bytes = bytes.saturating_add(data.len() as u64);
+                        }
+                    }
+                    for func in &shading.functions {
+                        bytes = bytes
+                            .saturating_add(Type3Function::estimated_bytes(func, &mut visited));
+                    }
+                }
+            }
+        }
+        bytes
+    }
+}
+
+impl Type3ImageXObject {
+    fn estimated_bytes(&self, visited: &mut Type3BytesVisited) -> u64 {
+        let mut bytes = 0u64;
+        let mut stack: Vec<&Self> = vec![self];
+        while let Some(img) = stack.pop() {
+            bytes = bytes.saturating_add(estimated_pdf_dict_bytes(&img.dict));
+            if visited.stream_ptrs.insert(img.data.as_ptr() as usize) {
+                bytes = bytes.saturating_add(img.data.len() as u64);
+            }
+            if let Some(sm) = &img.smask {
+                bytes = bytes.saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64);
+                stack.push(sm.as_ref());
+            }
+            if let Some(m) = &img.mask_stream {
+                bytes = bytes.saturating_add(std::mem::size_of::<Type3ImageXObject>() as u64);
+                stack.push(m.as_ref());
+            }
+        }
+        bytes
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +573,9 @@ impl LoadedFont {
                 bytes = bytes.saturating_add(name.capacity() as u64);
             }
         }
+        if let Some(res) = &self.type3_resources {
+            bytes = bytes.saturating_add(res.estimated_cache_bytes());
+        }
         bytes
     }
 
@@ -361,6 +650,8 @@ impl LoadedFont {
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
+                type3_resources: None,
+                type3_font_bbox: None,
             }
         } else {
             Self::new_legacy_data(font_type, base_font, font_data, cid_widths)
@@ -401,6 +692,8 @@ impl LoadedFont {
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
+                type3_resources: None,
+                type3_font_bbox: None,
             }
         } else {
             tracing::debug!(
@@ -427,6 +720,8 @@ impl LoadedFont {
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
+                type3_resources: None,
+                type3_font_bbox: None,
             }
         }
     }
@@ -467,6 +762,8 @@ impl LoadedFont {
             cid_cmap: None,
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
+            type3_resources: None,
+            type3_font_bbox: None,
         })
     }
 
@@ -578,6 +875,8 @@ impl LoadedFont {
             cid_cmap: None,
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
+            type3_resources: None,
+            type3_font_bbox: None,
         })
     }
 
@@ -603,6 +902,8 @@ impl LoadedFont {
             cid_cmap: None,
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
+            type3_resources: None,
+            type3_font_bbox: None,
         }
     }
 
@@ -650,6 +951,8 @@ impl LoadedFont {
             cid_cmap: self.cid_cmap.clone(),
             dw2: self.dw2,
             variations: self.variations.clone(),
+            type3_resources: None,
+            type3_font_bbox: None,
         }
     }
 
@@ -1901,6 +2204,34 @@ impl LoadedFont {
 
     pub fn is_type3(&self) -> bool {
         matches!(self.font_type, PdfFontType::Type3 { .. })
+    }
+
+    pub fn type3_resources(&self) -> Option<&Type3Resources> {
+        self.type3_resources.as_deref()
+    }
+
+    pub fn with_type3_resources(mut self, resources: Arc<Type3Resources>) -> Self {
+        self.type3_resources = (!resources.is_empty()).then_some(resources);
+        self
+    }
+
+    /// Set the declared `/FontBBox` of a Type 3 font (in glyph space).
+    pub fn with_type3_font_bbox(mut self, bbox: zpdf_core::Rect) -> Self {
+        let b = bbox.normalize();
+        self.type3_font_bbox = (b.x0.is_finite()
+            && b.y0.is_finite()
+            && b.x1.is_finite()
+            && b.y1.is_finite()
+            && b.x1 > b.x0
+            && b.y1 > b.y0)
+            .then_some(b);
+        self
+    }
+
+    /// Declared non-degenerate `/FontBBox` of a Type 3 font in glyph space,
+    /// or `None` when omitted or all-zero (`[0 0 0 0]`, ISO 32000-1 Table 112).
+    pub fn type3_font_bbox(&self) -> Option<zpdf_core::Rect> {
+        self.type3_font_bbox
     }
 
     /// True when this is a Type 3 font that still retains at least one decoded
@@ -3636,32 +3967,28 @@ impl CompanionEntry {
     }
 }
 
-/// Iteratively measure the retained byte size of an inline PDF dictionary,
-/// returning `None` if the size exceeds `max_bytes` (or overflows). Iterative
-/// traversal accounts for the entire subtree at any nesting depth without
-/// risking stack overflow or truncating deep objects.
-fn estimate_pdf_dict_bytes_within(dict: &zpdf_core::PdfDict, max_bytes: u64) -> Option<u64> {
-    enum Node<'a> {
-        Dict(&'a zpdf_core::PdfDict),
-        Obj(&'a zpdf_core::PdfObject),
-    }
+enum PdfMeasureNode<'a> {
+    Dict(&'a zpdf_core::PdfDict),
+    Obj(&'a zpdf_core::PdfObject),
+}
 
+fn estimate_pdf_nodes_within(initial: PdfMeasureNode<'_>, max_bytes: u64) -> Option<u64> {
     let mut total = 0u64;
-    let mut stack = vec![Node::Dict(dict)];
+    let mut stack = vec![initial];
     while let Some(node) = stack.pop() {
         match node {
-            Node::Dict(d) => {
+            PdfMeasureNode::Dict(d) => {
                 total = total.checked_add(64)?;
                 for (k, v) in &d.0 {
                     total = total.checked_add(32)?.checked_add(k.0.len() as u64)?;
-                    stack.push(Node::Obj(v));
+                    stack.push(PdfMeasureNode::Obj(v));
                     let min_pending = (stack.len() as u64).checked_mul(24)?;
                     if total.checked_add(min_pending)? > max_bytes {
                         return None;
                     }
                 }
             }
-            Node::Obj(obj) => match obj {
+            PdfMeasureNode::Obj(obj) => match obj {
                 zpdf_core::PdfObject::Null
                 | zpdf_core::PdfObject::Bool(_)
                 | zpdf_core::PdfObject::Integer(_)
@@ -3685,17 +4012,17 @@ fn estimate_pdf_dict_bytes_within(dict: &zpdf_core::PdfDict, max_bytes: u64) -> 
                         return None;
                     }
                     for item in items {
-                        stack.push(Node::Obj(item));
+                        stack.push(PdfMeasureNode::Obj(item));
                     }
                 }
                 zpdf_core::PdfObject::Dict(d) => {
-                    stack.push(Node::Dict(d));
+                    stack.push(PdfMeasureNode::Dict(d));
                 }
                 zpdf_core::PdfObject::Stream(stream) => {
                     total = total
                         .checked_add(64)?
                         .checked_add(stream.data.len() as u64)?;
-                    stack.push(Node::Dict(&stream.dict));
+                    stack.push(PdfMeasureNode::Dict(&stream.dict));
                 }
             },
         }
@@ -3705,6 +4032,37 @@ fn estimate_pdf_dict_bytes_within(dict: &zpdf_core::PdfDict, max_bytes: u64) -> 
         }
     }
     Some(total)
+}
+
+/// Iteratively measure the retained byte size of an inline PDF dictionary,
+/// returning `None` if the size exceeds `max_bytes` (or overflows). Iterative
+/// traversal accounts for the entire subtree at any nesting depth without
+/// risking stack overflow or truncating deep objects.
+pub fn estimated_pdf_dict_bytes_within(dict: &zpdf_core::PdfDict, max_bytes: u64) -> Option<u64> {
+    estimate_pdf_nodes_within(PdfMeasureNode::Dict(dict), max_bytes)
+}
+
+/// Iteratively measure the retained byte size of an inline PDF object,
+/// returning `None` if the size exceeds `max_bytes` (or overflows).
+pub fn estimated_pdf_object_bytes_within(
+    obj: &zpdf_core::PdfObject,
+    max_bytes: u64,
+) -> Option<u64> {
+    estimate_pdf_nodes_within(PdfMeasureNode::Obj(obj), max_bytes)
+}
+
+/// Iteratively estimate the retained byte size of an inline PDF dictionary.
+pub fn estimated_pdf_dict_bytes(dict: &zpdf_core::PdfDict) -> u64 {
+    estimated_pdf_dict_bytes_within(dict, u64::MAX).unwrap_or(u64::MAX)
+}
+
+/// Iteratively estimate the retained byte size of an inline PDF object.
+pub fn estimated_pdf_object_bytes(obj: &zpdf_core::PdfObject) -> u64 {
+    estimated_pdf_object_bytes_within(obj, u64::MAX).unwrap_or(u64::MAX)
+}
+
+fn estimate_pdf_dict_bytes_within(dict: &zpdf_core::PdfDict, max_bytes: u64) -> Option<u64> {
+    estimated_pdf_dict_bytes_within(dict, max_bytes)
 }
 
 /// Source dictionary location for an admitted Type 3 font so the content
@@ -7023,5 +7381,251 @@ mod tests {
             cache.type3_source(fid),
             Some(Type3Source::ContainerInlineFont { owner_id, .. }) if *owner_id == container_id
         ));
+    }
+
+    #[test]
+    fn type3_shared_form_aliases_charge_nested_resources_once() {
+        // Build a nested resource graph carrying a substantial metadata payload
+        // (an Indexed color space lookup table + ExtGState + image dict).
+        let mut inner = Type3Resources::default();
+        inner.color_spaces.insert(
+            "CS_BIG".into(),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Indexed")),
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+                zpdf_core::PdfObject::Integer(255),
+                zpdf_core::PdfObject::String(zpdf_core::PdfString::new(vec![0xAA; 4096])),
+            ]),
+        );
+        let mut gs = zpdf_core::PdfDict::new();
+        gs.insert(
+            zpdf_core::PdfName::new("D"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Array(
+                    (0..256).map(|_| zpdf_core::PdfObject::Integer(4)).collect(),
+                ),
+                zpdf_core::PdfObject::Integer(0),
+            ]),
+        );
+        inner.ext_g_states.insert("GS_DASH".into(), gs);
+        let inner_arc = Arc::new(inner);
+        let inner_bytes = inner_arc.estimated_cache_bytes();
+        assert!(
+            inner_bytes > 10_000,
+            "nested resource map should report substantial metadata size, got {inner_bytes}"
+        );
+
+        let shared_form = Arc::new(Type3FormXObject {
+            dict: zpdf_core::PdfDict::new(),
+            data: Arc::from(&b"0 0 10 10 re f"[..]),
+            resources: Some(Arc::clone(&inner_arc)),
+        });
+
+        let mut single = Type3Resources::default();
+        single
+            .xobjects
+            .insert("F1".into(), Type3XObject::Form(Arc::clone(&shared_form)));
+        let single_bytes = single.estimated_cache_bytes();
+
+        let mut aliased = Type3Resources::default();
+        aliased
+            .xobjects
+            .insert("F1".into(), Type3XObject::Form(Arc::clone(&shared_form)));
+        aliased
+            .xobjects
+            .insert("F2".into(), Type3XObject::Form(Arc::clone(&shared_form)));
+        let aliased_bytes = aliased.estimated_cache_bytes();
+
+        assert!(
+            aliased_bytes >= single_bytes + 2,
+            "two aliases must still charge the second name entry ({aliased_bytes} vs {single_bytes})"
+        );
+        assert!(
+            aliased_bytes - single_bytes < inner_bytes / 4,
+            "shared Form aliases must count the nested resource graph only once: single={single_bytes}, aliased={aliased_bytes}, inner={inner_bytes}"
+        );
+    }
+
+    #[test]
+    fn type3_resource_metadata_counts_toward_font_cache_admission() {
+        let mut res = Type3Resources::default();
+        // Large Indexed color space lookup table + large ExtGState dash array +
+        // Image dictionary metadata, with tiny stream bytes.
+        res.color_spaces.insert(
+            "CS_INDEXED".into(),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Indexed")),
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+                zpdf_core::PdfObject::Integer(255),
+                zpdf_core::PdfObject::String(zpdf_core::PdfString::new(vec![0x55; 8192])),
+            ]),
+        );
+        let mut gs = zpdf_core::PdfDict::new();
+        gs.insert(
+            zpdf_core::PdfName::new("D"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Array(
+                    (0..512).map(|_| zpdf_core::PdfObject::Integer(2)).collect(),
+                ),
+                zpdf_core::PdfObject::Integer(0),
+            ]),
+        );
+        res.ext_g_states.insert("GS_D".into(), gs);
+        let mut img_dict = zpdf_core::PdfDict::new();
+        img_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::String(zpdf_core::PdfString::new(vec![0x33; 4096])),
+        );
+        res.xobjects.insert(
+            "Im1".into(),
+            Type3XObject::Image(Arc::new(Type3ImageXObject {
+                dict: img_dict,
+                data: Arc::from(&[0u8; 4][..]),
+                smask: None,
+                mask_stream: None,
+            })),
+        );
+
+        let mut char_procs = HashMap::new();
+        char_procs.insert("A".into(), Arc::from(&b"1 0 d0"[..]));
+        let font = Arc::new(
+            LoadedFont::new_with_data(
+                PdfFontType::Type3 {
+                    font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    char_procs,
+                    encoding: vec!["A".into()],
+                    widths: vec![1.0],
+                    first_char: 0,
+                },
+                "T3MetaBudget".into(),
+                Vec::new(),
+                CidWidths::new(1.0),
+            )
+            .with_type3_resources(Arc::new(res)),
+        );
+
+        let est = font.estimated_cache_bytes();
+        assert!(
+            est > 20_000,
+            "retained ColorSpace/ExtGState/Image dict metadata must be charged (>20 KiB), got {est}"
+        );
+
+        let mut budget = FontCacheBudget::default();
+        assert!(
+            !budget.try_admit(&font, 4096),
+            "FontCacheBudget with 4 KiB limit must reject Type 3 font whose retained PDF metadata is {est} bytes"
+        );
+        assert_eq!(budget.bytes_used(), 0);
+        assert!(
+            budget.try_admit(&font, est),
+            "FontCacheBudget matching estimated size ({est}) must admit the font"
+        );
+    }
+
+    #[test]
+    fn type3_form_accounting_is_independent_of_shallow_and_deep_alias_order() {
+        // Leaf Form with a substantial retained image + ColorSpace payload.
+        let mut leaf_res = Type3Resources::default();
+        leaf_res.color_spaces.insert(
+            "CS_LEAF".into(),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("Indexed")),
+                zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+                zpdf_core::PdfObject::Integer(255),
+                zpdf_core::PdfObject::String(zpdf_core::PdfString::new(vec![0x77; 8192])),
+            ]),
+        );
+        leaf_res.xobjects.insert(
+            "ImgLeaf".into(),
+            Type3XObject::Image(Arc::new(Type3ImageXObject {
+                dict: zpdf_core::PdfDict::new(),
+                data: Arc::from(vec![0xFFu8; 4096]),
+                smask: None,
+                mask_stream: None,
+            })),
+        );
+        let leaf_res_bytes = leaf_res.estimated_cache_bytes();
+        assert!(leaf_res_bytes > 12_000);
+
+        let leaf_form = Arc::new(Type3FormXObject {
+            dict: zpdf_core::PdfDict::new(),
+            data: Arc::from(&b"0 0 1 1 re f"[..]),
+            resources: Some(Arc::new(leaf_res)),
+        });
+
+        // Wrap `leaf_form` in a 9-level chain so the deep path reaches `leaf_form`
+        // past the old depth-8 cutoff.
+        let mut deep_chain = Arc::clone(&leaf_form);
+        for _ in 0..9 {
+            let mut r = Type3Resources::default();
+            r.xobjects
+                .insert("Next".into(), Type3XObject::Form(Arc::clone(&deep_chain)));
+            deep_chain = Arc::new(Type3FormXObject {
+                dict: zpdf_core::PdfDict::new(),
+                data: Arc::from(&b"/Next Do"[..]),
+                resources: Some(Arc::new(r)),
+            });
+        }
+
+        // Build many equivalent `(shallow, deep)` roots with distinct 4-char key
+        // pairs so randomized HashMap iteration hits both shallow-first and
+        // deep-first traversal orders. Every instance must report the EXACT same
+        // retained byte size and always include `leaf_res_bytes`.
+        let make_font = |shallow_key: &str, deep_key: &str| -> Arc<LoadedFont> {
+            let mut root = Type3Resources::default();
+            root.xobjects.insert(
+                shallow_key.into(),
+                Type3XObject::Form(Arc::clone(&leaf_form)),
+            );
+            root.xobjects
+                .insert(deep_key.into(), Type3XObject::Form(Arc::clone(&deep_chain)));
+            let mut char_procs = HashMap::new();
+            char_procs.insert("A".into(), Arc::from(&b"1 0 d0"[..]));
+            Arc::new(
+                LoadedFont::new_with_data(
+                    PdfFontType::Type3 {
+                        font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                        char_procs,
+                        encoding: vec!["A".into()],
+                        widths: vec![1.0],
+                        first_char: 0,
+                    },
+                    "T3OrderIndep".into(),
+                    Vec::new(),
+                    CidWidths::new(1.0),
+                )
+                .with_type3_resources(Arc::new(root)),
+            )
+        };
+
+        let mut costs = Vec::new();
+        for i in 0..16 {
+            let k1 = format!("A{i:03}");
+            let k2 = format!("B{i:03}");
+            let f_ab = make_font(&k1, &k2);
+            let f_ba = make_font(&k2, &k1);
+            let c_ab = f_ab.estimated_cache_bytes();
+            let c_ba = f_ba.estimated_cache_bytes();
+            assert_eq!(
+                c_ab, c_ba,
+                "equivalent shallow/deep aliases must have identical estimated_cache_bytes"
+            );
+            assert!(
+                c_ab > leaf_res_bytes,
+                "leaf_form retained resources ({leaf_res_bytes}) must always be charged, got {c_ab}"
+            );
+            // Admission must behave identically for both orderings around the boundary.
+            let mut b1 = FontCacheBudget::default();
+            let mut b2 = FontCacheBudget::default();
+            assert!(!b1.try_admit(&f_ab, c_ab - 1));
+            assert!(!b2.try_admit(&f_ba, c_ba - 1));
+            assert!(b1.try_admit(&f_ab, c_ab));
+            assert!(b2.try_admit(&f_ba, c_ba));
+            costs.push(c_ab);
+        }
+        assert!(
+            costs.iter().all(|&c| c == costs[0]),
+            "all equivalent alias orderings must produce identical admission cost, got {costs:?}"
+        );
     }
 }

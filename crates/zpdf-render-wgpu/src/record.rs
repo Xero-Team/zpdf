@@ -7,7 +7,7 @@
 //! (inside the intersection of all active clips).
 
 use crate::glyph_atlas::GlyphAtlas;
-use crate::path::{fill_mesh, stroke_mesh, Mesh};
+use crate::path::{fill_mesh, fill_mesh_transformed, stroke_mesh, stroke_mesh_transformed, Mesh};
 use crate::transform::{PageMap, SolidVertex, TexturedVertex};
 use zpdf_core::{time::Instant, ParseLimits};
 use zpdf_display_list::{
@@ -75,6 +75,25 @@ pub enum PageOp {
         image_id: ImageKey,
         clip_ref: u32,
     },
+    /// Draw a repeating rasterized tiling-pattern quad (from the textured arena,
+    /// sampling `synthetic_tiles[tile_id]`), testing `stencil == clip_ref`.
+    Tile {
+        range: MeshRange,
+        tile_id: u32,
+        clip_ref: u32,
+    },
+    /// Draw an exact 3-seed affine dense tiling-pattern quad (from the textured
+    /// arena, sampling `tile_trans`, `tile0`, and `tile1` against the live
+    /// backdrop layer), testing `stencil == clip_ref`.
+    AffineTile {
+        range: MeshRange,
+        clip_ref: u32,
+        clips: Vec<ClipStamp>,
+        tile_trans: u32,
+        tile0: u32,
+        tile1: u32,
+        nearest: bool,
+    },
     /// Draw a rasterized-glyph quad (from the glyph arena, sampling the
     /// page's single atlas texture), testing `stencil == clip_ref`. Unlike
     /// `Image`, no texture id is carried — a page has exactly one atlas.
@@ -93,6 +112,17 @@ pub enum PageOp {
         /// then merged per-colorant against the backdrop. `mode`/`alpha` are
         /// unused (Normal / 1.0).
         overprint: Option<Overprint>,
+        /// When true, the group is non-isolated: its layer starts as a copy of
+        /// the parent's current pixels (so blend modes / overprint inside read
+        /// the live backdrop), and `PopBlend` applies `alpha` ONCE to the
+        /// finished result via `mix(base, group, alpha)` (ISO 32000-1 §11.4.5
+        /// / §11.6.7 for `Normal` blend mode).
+        non_isolated: bool,
+        /// When true, do not stamp `clips` into the group's own stencil (used
+        /// when `mask` already incorporates the active clip stack so clip AA
+        /// edges are applied once on `PopBlend`, not once per inner blend pass).
+        /// `clips` are still re-stamped into the parent layer on `PopBlend`.
+        unclipped_group: bool,
     },
     /// End the current group: composite it onto the parent with `mode` (carried by
     /// the matching PushBlend), then re-stamp `clips` into the resulting layer.
@@ -129,7 +159,103 @@ fn arena_fits_u32(current: usize, additional: usize) -> bool {
         .is_some()
 }
 
+/// Identity of a GPU-rasterized [`zpdf_display_list::TilingPattern`] cell texture.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyntheticTileKey {
+    commands: usize,
+    segment_index: usize,
+    overlap_shift: Option<(i64, i64)>,
+    copy_blend_mode: u8,
+    bbox: [u64; 4],
+    steps: [u64; 2],
+    width: u32,
+    height: u32,
+    nearest: bool,
+    blend_depth: usize,
+}
+
+impl SyntheticTileKey {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tiling: &zpdf_display_list::TilingPattern,
+        segment_index: usize,
+        overlap_shift: Option<(i64, i64)>,
+        copy_blend_mode: BlendMode,
+        width: u32,
+        height: u32,
+        nearest: bool,
+        blend_depth: usize,
+    ) -> Self {
+        Self {
+            commands: std::sync::Arc::as_ptr(&tiling.commands) as *const () as usize,
+            segment_index,
+            overlap_shift,
+            copy_blend_mode: copy_blend_mode as u8,
+            bbox: [
+                tiling.bbox.x0.to_bits(),
+                tiling.bbox.y0.to_bits(),
+                tiling.bbox.x1.to_bits(),
+                tiling.bbox.y1.to_bits(),
+            ],
+            steps: [tiling.x_step.to_bits(), tiling.y_step.to_bits()],
+            width,
+            height,
+            nearest,
+            blend_depth,
+        }
+    }
+}
+
+/// Recorded cell content for a dense tiling pattern (> 4,096 visible tiles),
+/// rendered once into an offscreen tile texture and sampled with `Repeat`.
+pub struct SyntheticTile {
+    pub width: u32,
+    pub height: u32,
+    pub nearest: bool,
+    pub ops: Vec<PageOp>,
+    /// Retains the source cell commands so `Arc::as_ptr` keys stay unique for the page.
+    pub _keep_commands: std::sync::Arc<zpdf_display_list::DisplayList>,
+}
+
+impl SyntheticTile {
+    pub fn ops(&self) -> &[PageOp] {
+        self.ops.as_slice()
+    }
+
+    pub fn has_blend_groups(&self) -> bool {
+        self.ops
+            .iter()
+            .any(|o| matches!(o, PageOp::PushBlend { .. } | PageOp::AffineTile { .. }))
+    }
+
+    pub fn uses_reset(&self) -> bool {
+        ops_uses_reset(&self.ops)
+    }
+
+    pub fn needs_fullscreen(&self) -> bool {
+        self.uses_reset() || self.has_blend_groups()
+    }
+}
+
+fn ops_uses_reset(ops: &[PageOp]) -> bool {
+    ops.iter().any(|o| match o {
+        PageOp::ResetStencil => true,
+        PageOp::PushBlend {
+            mask: Some(mask), ..
+        } => ops_uses_reset(&mask.ops),
+        _ => false,
+    })
+}
+
 /// Accumulates geometry + ops for one page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlendFrameKind {
+    Real,
+    RealIsolated,
+    Passthrough,
+    Skipped,
+}
+
 #[derive(Default)]
 pub struct PageRecorder {
     pub vertices: Vec<SolidVertex>,
@@ -150,6 +276,21 @@ pub struct PageRecorder {
     pub inline_images: Vec<std::sync::Arc<zpdf_display_list::InlineImage>>,
     inline_image_ids: std::collections::HashMap<usize, u32>,
     pub ops: Vec<PageOp>,
+    /// Offscreen cell textures for dense tiling patterns, ordered bottom-up so
+    /// nested dense tiles always precede their enclosing tile.
+    pub synthetic_tiles: Vec<SyntheticTile>,
+    synthetic_tile_cache: std::collections::HashMap<SyntheticTileKey, u32>,
+    synthetic_tile_bytes: u64,
+    /// Inline decoded images produced while interpreting Type 3 glyph CharProcs
+    /// (e.g. `/ImageMask true` bitmap stencils), indexed via `TYPE3_IMAGE_ID_BASE`.
+    pub type3_images: Vec<zpdf_image::DecodedImage>,
+    type3_image_cache: std::collections::HashMap<Type3ImageKey, u32>,
+    type3_image_bytes: u64,
+    /// Per-page memo of `TilingPattern::is_backdrop_dependent()`, retaining
+    /// each cell `Arc<DisplayList>` so pointer keys never alias freed memory.
+    tiling_backdrop_cache:
+        std::collections::HashMap<usize, (std::sync::Arc<zpdf_display_list::DisplayList>, bool)>,
+    page_rect: Option<zpdf_core::Rect>,
     clip_stack: Vec<ClipEntry>,
     clip_depth: u32,
     /// `None` keeps the standalone recorder utility unlimited; renderers set a
@@ -158,9 +299,17 @@ pub struct PageRecorder {
     /// Logical outer depth while recording a soft-mask sub-list.
     blend_depth_offset: usize,
     blend_depth: usize,
+    /// True when the active page background was cleared opaque (`alpha >= 1.0`).
+    opaque_canvas: bool,
+    /// Nesting depth of groups whose target (or paired alpha-tracking layer)
+    /// starts transparent rather than guaranteed opaque.
+    isolated_depth: usize,
     /// Groups omitted after reaching the depth cap. Matching pops consume this
     /// counter instead of closing a real outer group.
     skipped_blend_depth: usize,
+    /// LIFO kind of every currently open `PushBlendGroup` frame so passthrough,
+    /// skipped, and real GPU blend layers pop in exact nesting order.
+    blend_frames: Vec<BlendFrameKind>,
     /// Shared by the page and every soft-mask sub-list; never saved/restored
     /// with the local clip/blend state in `record_subops`.
     limits: ParseLimits,
@@ -174,11 +323,118 @@ pub struct PageRecorder {
     recording_error: Option<&'static str>,
 }
 
+/// Stable identity for an inline image texture decoded inside a Type 3 CharProc
+/// so repeated occurrences of the same glyph reuse one texture ID while keeping
+/// independent per-quad transforms and opacity.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Type3ImageKey {
+    pub font_id: zpdf_font::FontId,
+    pub glyph_id: u16,
+    pub image_id: zpdf_image::ImageId,
+    /// Straight RGB tint bits for `/ImageMask true` stencils; `None` for
+    /// intrinsic colored (`d0`) images.
+    pub stencil_tint: Option<[u32; 3]>,
+    /// Canonical glyph-space destination bounds bits when this glyph's
+    /// interpretation depended on placement bounds (e.g. unclipped unbounded
+    /// shading with all-zero `/FontBBox`), preventing distinct placements from
+    /// aliasing one texture under local `image_id = 0`.
+    pub placement_bounds: Option<[u64; 4]>,
+}
+
+/// Base image ID reserved for inline images decoded inside Type 3 CharProcs
+/// (`PageRecorder::type3_images`), disjoint from page `ImageCache` IDs.
+pub const TYPE3_IMAGE_ID_BASE: u32 = 0x8000_0000;
+
 impl PageRecorder {
     pub fn with_limits(mut self, limits: &ParseLimits) -> Self {
         self.limits = limits.clone();
         self.deadline = Some(Instant::now() + RECORD_BUDGET);
         self.with_max_blend_depth(limits.max_blend_group_depth as usize)
+    }
+
+    pub fn with_page_rect(mut self, rect: zpdf_core::Rect) -> Self {
+        self.page_rect = Some(rect);
+        self
+    }
+
+    pub fn with_opaque_canvas(mut self, opaque: bool) -> Self {
+        self.opaque_canvas = opaque;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// True when the active target (and any paired alpha-tracking layer) is
+    /// guaranteed opaque everywhere, so exact opaque-backdrop identity segments
+    /// (white `Multiply`/`Darken`, black `Screen`/`Lighten`) are provable no-ops.
+    pub fn is_opaque_backdrop(&self) -> bool {
+        self.opaque_canvas && self.isolated_depth == 0
+    }
+
+    pub fn page_rect(&self) -> Option<zpdf_core::Rect> {
+        self.page_rect
+    }
+
+    pub fn replace_page_rect(&mut self, rect: Option<zpdf_core::Rect>) -> Option<zpdf_core::Rect> {
+        std::mem::replace(&mut self.page_rect, rect)
+    }
+
+    pub fn blend_depth_total(&self) -> usize {
+        self.blend_depth_offset.saturating_add(self.blend_depth)
+    }
+
+    pub fn cached_synthetic_tile(&self, key: &SyntheticTileKey) -> Option<u32> {
+        self.synthetic_tile_cache.get(key).copied()
+    }
+
+    /// Cached per-page check of `tiling.is_backdrop_dependent()`, keyed by
+    /// `Arc::as_ptr(&tiling.commands)` while keeping the `Arc` alive.
+    pub fn tiling_is_backdrop_dependent(
+        &mut self,
+        tiling: &zpdf_display_list::TilingPattern,
+    ) -> bool {
+        let ptr = std::sync::Arc::as_ptr(&tiling.commands) as *const () as usize;
+        if let Some(&(_, dep)) = self.tiling_backdrop_cache.get(&ptr) {
+            return dep;
+        }
+        let dep = tiling.is_backdrop_dependent();
+        if self.tiling_backdrop_cache.len() >= 256 {
+            self.tiling_backdrop_cache.clear();
+        }
+        self.tiling_backdrop_cache
+            .insert(ptr, (std::sync::Arc::clone(&tiling.commands), dep));
+        dep
+    }
+
+    pub fn insert_synthetic_tile(
+        &mut self,
+        key: SyntheticTileKey,
+        tile: SyntheticTile,
+    ) -> Option<u32> {
+        let tile_bytes = (tile.width as u64)
+            .saturating_mul(tile.height as u64)
+            .saturating_mul(4);
+        let next_bytes = self.synthetic_tile_bytes.saturating_add(tile_bytes);
+        if next_bytes > self.limits.max_gpu_texture_bytes {
+            self.recording_error = Some("GPU tiling cell textures exceed max_gpu_texture_bytes");
+            return None;
+        }
+        let id = u32::try_from(self.synthetic_tiles.len()).ok()?;
+        self.synthetic_tile_bytes = next_bytes;
+        self.synthetic_tiles.push(tile);
+        self.synthetic_tile_cache.insert(key, id);
+        Some(id)
+    }
+
+    /// Latch an explicit recording failure (first failure remains authoritative).
+    pub fn set_recording_error(&mut self, reason: &'static str) {
+        if self.recording_error.is_none() {
+            self.recording_error = Some(reason);
+        }
     }
 
     /// Check at command/glyph boundaries and before appends. All nested work
@@ -202,14 +458,72 @@ impl PageRecorder {
         }
     }
 
+    pub fn get_type3_image(&self, image_id: u32) -> Option<&zpdf_image::DecodedImage> {
+        let idx = image_id.checked_sub(TYPE3_IMAGE_ID_BASE)? as usize;
+        self.type3_images.get(idx)
+    }
+
+    /// Store (or reuse) a decoded inline Type 3 glyph image under `key`
+    /// (honoring `max_gpu_texture_bytes`) and record an image quad referencing it.
+    pub fn add_type3_image_cached(
+        &mut self,
+        key: Option<Type3ImageKey>,
+        quad: [TexturedVertex; 4],
+        make_img: impl FnOnce() -> zpdf_image::DecodedImage,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        if let Some(image_id) = key.and_then(|k| self.type3_image_cache.get(&k).copied()) {
+            self.add_image(quad, image_id);
+            return;
+        }
+        let img = make_img();
+        let img_bytes = (img.width as u64)
+            .saturating_mul(img.height as u64)
+            .saturating_mul(4);
+        let next_bytes = self.type3_image_bytes.saturating_add(img_bytes);
+        if next_bytes > self.limits.max_gpu_texture_bytes {
+            self.recording_error = Some("GPU Type3 inline images exceed max_gpu_texture_bytes");
+            return;
+        }
+        let Ok(idx) = u32::try_from(self.type3_images.len()) else {
+            self.recording_error = Some("GPU Type3 inline image count exceeded u32");
+            return;
+        };
+        let Some(image_id) = TYPE3_IMAGE_ID_BASE.checked_add(idx) else {
+            self.recording_error = Some("GPU Type3 inline image count exceeded ID space");
+            return;
+        };
+        self.type3_image_bytes = next_bytes;
+        self.type3_images.push(img);
+        if let Some(k) = key {
+            self.type3_image_cache.insert(k, image_id);
+        }
+        self.add_image(quad, image_id);
+    }
+
     /// Interpret a Type3 occurrence with the document's content policy and
     /// debit max(1, operators executed) from one render-page allowance. The
     /// minimum charge bounds children with no operators as well.
     /// Work timing is optional; the total operator counter is always available.
+    #[cfg(test)]
     pub fn interpret_type3_stream(
         &mut self,
         stream: &[u8],
-    ) -> Option<zpdf_display_list::DisplayList> {
+        resources: Option<&zpdf_font::Type3Resources>,
+    ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
+        self.interpret_type3_stream_with_bbox(stream, resources, None, None)
+            .map(|(dl, images, _)| (dl, images))
+    }
+
+    pub fn interpret_type3_stream_with_bbox(
+        &mut self,
+        stream: &[u8],
+        resources: Option<&zpdf_font::Type3Resources>,
+        font_bbox: Option<zpdf_core::Rect>,
+        fallback_bounds: Option<zpdf_core::Rect>,
+    ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache, bool)> {
         if !self.can_record() {
             return None;
         }
@@ -224,8 +538,14 @@ impl PageRecorder {
         let deadline = *self
             .deadline
             .get_or_insert_with(|| Instant::now() + RECORD_BUDGET);
-        let rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+        let rect = zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
+        let mut images = zpdf_image::ImageCache::new();
         let (dl, stats) = zpdf_content::interpreter::ContentInterpreter::new(rect)
+            .for_type3_glyph()
+            .with_type3_resources(resources)
+            .with_type3_glyph_bbox(font_bbox)
+            .with_type3_fallback_bounds(fallback_bounds)
+            .with_images(&mut images)
             .with_limits(&limits)
             .with_deadline(deadline)
             .interpret_with_stats(stream);
@@ -243,7 +563,7 @@ impl PageRecorder {
         if !self.can_record() {
             return None;
         }
-        Some(dl)
+        Some((dl, images, stats.type3_used_dest_bounds))
     }
 
     fn reserve_geometry<V>(
@@ -386,6 +706,83 @@ impl PageRecorder {
         });
     }
 
+    /// Record a repeating tiling-pattern quad (4 textured vertices) at the current clip depth.
+    pub fn add_tile(&mut self, quad: [TexturedVertex; 4], tile_id: u32) {
+        if !self.reserve_geometry::<TexturedVertex>(
+            self.tex_vertices.len(),
+            self.tex_indices.len(),
+            4,
+            6,
+        ) {
+            return;
+        }
+        let base_vertex = self.tex_vertices.len() as u32;
+        let first_index = self.tex_indices.len() as u32;
+        self.tex_vertices.extend_from_slice(&quad);
+        self.tex_indices.extend_from_slice(&[
+            base_vertex,
+            base_vertex + 1,
+            base_vertex + 2,
+            base_vertex,
+            base_vertex + 2,
+            base_vertex + 3,
+        ]);
+        self.ops.push(PageOp::Tile {
+            range: MeshRange {
+                first_index,
+                index_count: 6,
+                base_vertex: 0,
+            },
+            tile_id,
+            clip_ref: self.clip_depth,
+        });
+    }
+
+    /// Record an exact 3-seed affine tiling-pattern quad (4 textured vertices)
+    /// composited against the live destination layer at the current clip depth.
+    pub fn add_affine_tile(
+        &mut self,
+        quad: [TexturedVertex; 4],
+        tile_trans: u32,
+        tile0: u32,
+        tile1: u32,
+        nearest: bool,
+    ) {
+        if !self.reserve_geometry::<TexturedVertex>(
+            self.tex_vertices.len(),
+            self.tex_indices.len(),
+            4,
+            6,
+        ) {
+            return;
+        }
+        let base_vertex = self.tex_vertices.len() as u32;
+        let first_index = self.tex_indices.len() as u32;
+        self.tex_vertices.extend_from_slice(&quad);
+        self.tex_indices.extend_from_slice(&[
+            base_vertex,
+            base_vertex + 1,
+            base_vertex + 2,
+            base_vertex,
+            base_vertex + 2,
+            base_vertex + 3,
+        ]);
+        let clips = self.active_clips();
+        self.ops.push(PageOp::AffineTile {
+            range: MeshRange {
+                first_index,
+                index_count: 6,
+                base_vertex: 0,
+            },
+            clip_ref: self.clip_depth,
+            clips,
+            tile_trans,
+            tile0,
+            tile1,
+            nearest,
+        });
+    }
+
     /// Record a glyph-atlas quad (4 textured vertices) at the current clip
     /// depth. Indices are rebased to absolute (mirroring `append()`, unlike
     /// `add_image`'s per-quad `base_vertex`) so consecutive glyph quads are
@@ -429,6 +826,22 @@ impl PageRecorder {
         }
     }
 
+    pub fn add_fill_transformed(
+        &mut self,
+        path: &DlPath,
+        rule: FillRule,
+        color: [f32; 4],
+        ctm: &zpdf_core::Matrix,
+        map: &PageMap,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        if let Some(mesh) = fill_mesh_transformed(path, rule, color, ctm, map) {
+            self.add_mesh(mesh);
+        }
+    }
+
     pub fn add_stroke(
         &mut self,
         path: &DlPath,
@@ -440,6 +853,22 @@ impl PageRecorder {
             return;
         }
         if let Some(mesh) = stroke_mesh(path, style, color, map) {
+            self.add_mesh(mesh);
+        }
+    }
+
+    pub fn add_stroke_transformed(
+        &mut self,
+        path: &DlPath,
+        style: &StrokeStyle,
+        color: [f32; 4],
+        ctm: &zpdf_core::Matrix,
+        map: &PageMap,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        if let Some(mesh) = stroke_mesh_transformed(path, style, color, ctm, map) {
             self.add_mesh(mesh);
         }
     }
@@ -456,12 +885,42 @@ impl PageRecorder {
         self.push_clip_range(range);
     }
 
+    pub fn push_clip_transformed(
+        &mut self,
+        path: &DlPath,
+        rule: FillRule,
+        ctm: &zpdf_core::Matrix,
+        map: &PageMap,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        let range =
+            fill_mesh_transformed(path, rule, [0.0; 4], ctm, map).and_then(|m| self.append(m));
+        self.push_clip_range(range);
+    }
+
     /// Push a clip to a *stroked* path's outline (tessellated as a stroke mesh).
     pub fn push_clip_stroke(&mut self, path: &DlPath, style: &StrokeStyle, map: &PageMap) {
         if !self.can_record() {
             return;
         }
         let range = stroke_mesh(path, style, [0.0; 4], map).and_then(|m| self.append(m));
+        self.push_clip_range(range);
+    }
+
+    pub fn push_clip_stroke_transformed(
+        &mut self,
+        path: &DlPath,
+        style: &StrokeStyle,
+        ctm: &zpdf_core::Matrix,
+        map: &PageMap,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        let range =
+            stroke_mesh_transformed(path, style, [0.0; 4], ctm, map).and_then(|m| self.append(m));
         self.push_clip_range(range);
     }
 
@@ -521,6 +980,12 @@ impl PageRecorder {
         }
     }
 
+    pub fn pop_all_clips(&mut self) {
+        while !self.clip_stack.is_empty() {
+            self.pop_clip();
+        }
+    }
+
     /// The clip paths currently active (for re-stamping into a fresh layer).
     fn active_clips(&self) -> Vec<ClipStamp> {
         self.clip_stack
@@ -545,6 +1010,7 @@ impl PageRecorder {
                 );
             }
             self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            self.blend_frames.push(BlendFrameKind::Skipped);
             return;
         }
         let clips = self.active_clips();
@@ -554,8 +1020,150 @@ impl PageRecorder {
             clips,
             mask,
             overprint: None,
+            non_isolated: false,
+            unclipped_group: false,
         });
         self.blend_depth += 1;
+        self.isolated_depth += 1;
+        self.blend_frames.push(BlendFrameKind::RealIsolated);
+    }
+
+    /// Record a passthrough non-isolated group (`Normal`, `alpha == 1`, no mask,
+    /// no knockout): draws straight onto the active layer at zero layer cost
+    /// while keeping `pop_blend()` balanced.
+    pub fn push_passthrough_blend(&mut self) {
+        self.blend_frames.push(BlendFrameKind::Passthrough);
+    }
+
+    /// Begin a non-isolated group with `mode`, constant `alpha`, and optional
+    /// soft `mask` (ISO 32000-1 §11.4.5 / §11.6.7): the group layer starts from
+    /// a copy of the live parent backdrop so inner blend modes evaluate against
+    /// the real destination before the outer `mode`, `alpha`, and `mask` are
+    /// applied on `PopBlend`.
+    pub fn push_non_isolated_with_mode(
+        &mut self,
+        mode: BlendMode,
+        alpha: f32,
+        mask: Option<MaskOps>,
+    ) {
+        if !self.can_push_blend() {
+            if self.skipped_blend_depth == 0 {
+                tracing::warn!(
+                    limit = self.max_blend_depth.unwrap_or(usize::MAX),
+                    "GPU blend-group nesting exceeds configured limit; using passthrough"
+                );
+            }
+            self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            self.blend_frames.push(BlendFrameKind::Skipped);
+            return;
+        }
+        let clips = self.active_clips();
+        self.ops.push(PageOp::PushBlend {
+            mode,
+            alpha,
+            clips,
+            mask,
+            overprint: None,
+            non_isolated: true,
+            unclipped_group: false,
+        });
+        self.blend_depth += 1;
+        if mode != BlendMode::Normal {
+            // Non-isolated non-Normal groups maintain a transparent paired
+            // alpha-tracking layer for ISO §11.4.5 backdrop removal.
+            self.isolated_depth += 1;
+            self.blend_frames.push(BlendFrameKind::RealIsolated);
+        } else {
+            self.blend_frames.push(BlendFrameKind::Real);
+        }
+    }
+
+    /// Begin a non-isolated `Normal` group with constant `alpha` and optional
+    /// soft `mask` (ISO 32000-1 §11.4.5 / §11.6.7): the group layer starts from
+    /// a copy of the live parent backdrop so blend modes / overprint inside
+    /// evaluate against the real destination, and `PopBlend` applies `alpha`
+    /// (and `mask` coverage when present) ONCE via `mix(base, group, alpha * cov)`.
+    pub fn push_non_isolated(&mut self, alpha: f32, mask: Option<MaskOps>) {
+        self.push_non_isolated_with_mode(BlendMode::Normal, alpha, mask);
+    }
+
+    /// Begin a non-isolated constant-opacity group (no soft mask).
+    pub fn push_non_isolated_opacity(&mut self, alpha: f32) {
+        self.push_non_isolated(alpha, None);
+    }
+
+    /// Evaluate `body` inside an unclipped non-isolated `Normal` group seeded
+    /// from the live backdrop, then merge back into the parent ONCE via
+    /// `mix(parent, group, alpha * shape_mask_cov)` and restore the parent's
+    /// active clip stack. Because `shape_mask` already incorporates the active
+    /// clip stack (recorded via [`Self::record_subops_clipped`]), suppressing
+    /// clips inside the group guarantees that anti-aliased clip edges (such as
+    /// glyph clips) are never multiplied across multiple pattern segments.
+    pub fn with_non_isolated_shape_mask(
+        &mut self,
+        alpha: f32,
+        shape_mask: MaskOps,
+        body: impl FnOnce(&mut Self),
+    ) {
+        if !self.can_push_blend() {
+            body(self);
+            return;
+        }
+        let clips = self.active_clips();
+        self.ops.push(PageOp::PushBlend {
+            mode: BlendMode::Normal,
+            alpha,
+            clips,
+            mask: Some(shape_mask),
+            overprint: None,
+            non_isolated: true,
+            unclipped_group: true,
+        });
+        self.blend_depth += 1;
+        self.blend_frames.push(BlendFrameKind::Real);
+        let saved_stack = std::mem::take(&mut self.clip_stack);
+        let saved_depth = std::mem::replace(&mut self.clip_depth, 0);
+        body(self);
+        self.clip_stack = saved_stack;
+        self.clip_depth = saved_depth;
+        self.pop_blend();
+    }
+
+    /// Evaluate `body` inside an unclipped isolated `Normal` group starting from
+    /// transparent, then composite through `shape_mask` ONCE at `alpha` and
+    /// restore the parent's active clip stack. Because `shape_mask` already
+    /// incorporates the active clip stack (via [`Self::record_subops_clipped`]),
+    /// suppressing the inherited clip inside the color layer prevents
+    /// multiplying resolved clip coverage twice on anti-aliased edges.
+    pub fn with_isolated_shape_mask(
+        &mut self,
+        alpha: f32,
+        shape_mask: MaskOps,
+        body: impl FnOnce(&mut Self),
+    ) {
+        if !self.can_push_blend() {
+            body(self);
+            return;
+        }
+        let clips = self.active_clips();
+        self.ops.push(PageOp::PushBlend {
+            mode: BlendMode::Normal,
+            alpha,
+            clips,
+            mask: Some(shape_mask),
+            overprint: None,
+            non_isolated: false,
+            unclipped_group: true,
+        });
+        self.blend_depth += 1;
+        self.isolated_depth += 1;
+        self.blend_frames.push(BlendFrameKind::RealIsolated);
+        let saved_stack = std::mem::take(&mut self.clip_stack);
+        let saved_depth = std::mem::replace(&mut self.clip_depth, 0);
+        body(self);
+        self.clip_stack = saved_stack;
+        self.clip_depth = saved_depth;
+        self.pop_blend();
     }
 
     /// Begin an overprint group (PDF 8.6.7): the next recorded draw renders into
@@ -570,6 +1178,7 @@ impl PageRecorder {
                 );
             }
             self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            self.blend_frames.push(BlendFrameKind::Skipped);
             return;
         }
         let clips = self.active_clips();
@@ -579,8 +1188,68 @@ impl PageRecorder {
             clips,
             mask: None,
             overprint: Some(op),
+            non_isolated: false,
+            unclipped_group: false,
         });
         self.blend_depth += 1;
+        self.isolated_depth += 1;
+        self.blend_frames.push(BlendFrameKind::RealIsolated);
+    }
+
+    /// Record a sub-sequence into the shared arena with the caller's current
+    /// clip stack stamped up front (used to build a single-pass shape+clip AA
+    /// coverage mask for backdrop-dependent tiling patterns).
+    pub fn record_subops_clipped(&mut self, f: impl FnOnce(&mut Self)) -> Vec<PageOp> {
+        let mut sub = Vec::new();
+        self.record_subops_clipped_into(&mut sub, f);
+        sub
+    }
+
+    /// Append clipped sub-ops into `dst`, stamping the caller's active clip
+    /// stack once when `dst` starts empty. Returns `true` if `f` appended at
+    /// least one op beyond the initial clip stamps.
+    pub fn record_subops_clipped_into(
+        &mut self,
+        dst: &mut Vec<PageOp>,
+        f: impl FnOnce(&mut Self),
+    ) -> bool {
+        let nested_offset = self
+            .blend_depth_offset
+            .saturating_add(self.blend_depth)
+            .saturating_add(1);
+        let saved_ops = std::mem::replace(&mut self.ops, std::mem::take(dst));
+        let saved_stack = self.clip_stack.clone();
+        let saved_depth = self.clip_depth;
+        let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
+        let saved_blend_offset = std::mem::replace(&mut self.blend_depth_offset, nested_offset);
+        let saved_skipped_blend_depth = std::mem::replace(&mut self.skipped_blend_depth, 0);
+        let saved_blend_frames = std::mem::take(&mut self.blend_frames);
+        let saved_opaque_canvas = std::mem::replace(&mut self.opaque_canvas, false);
+        let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
+        if self.ops.is_empty() {
+            for entry in &self.clip_stack {
+                if let Some(range) = entry.range {
+                    self.ops.push(PageOp::StampClip {
+                        range,
+                        ref_value: entry.ref_value,
+                    });
+                }
+            }
+        }
+        let len_before = self.ops.len();
+        f(self);
+        self.close_open_blends();
+        let added = self.ops.len() > len_before;
+        *dst = std::mem::replace(&mut self.ops, saved_ops);
+        self.clip_stack = saved_stack;
+        self.clip_depth = saved_depth;
+        self.blend_depth = saved_blend_depth;
+        self.blend_depth_offset = saved_blend_offset;
+        self.skipped_blend_depth = saved_skipped_blend_depth;
+        self.blend_frames = saved_blend_frames;
+        self.opaque_canvas = saved_opaque_canvas;
+        self.isolated_depth = saved_isolated_depth;
+        added
     }
 
     /// Record a sub-sequence (a soft mask's commands) into the SHARED geometry
@@ -599,6 +1268,9 @@ impl PageRecorder {
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_blend_offset = std::mem::replace(&mut self.blend_depth_offset, nested_offset);
         let saved_skipped_blend_depth = std::mem::replace(&mut self.skipped_blend_depth, 0);
+        let saved_blend_frames = std::mem::take(&mut self.blend_frames);
+        let saved_opaque_canvas = std::mem::replace(&mut self.opaque_canvas, false);
+        let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
         f(self);
         self.close_open_blends();
         let sub = std::mem::replace(&mut self.ops, saved_ops);
@@ -607,23 +1279,33 @@ impl PageRecorder {
         self.blend_depth = saved_blend_depth;
         self.blend_depth_offset = saved_blend_offset;
         self.skipped_blend_depth = saved_skipped_blend_depth;
+        self.blend_frames = saved_blend_frames;
+        self.opaque_canvas = saved_opaque_canvas;
+        self.isolated_depth = saved_isolated_depth;
         sub
     }
 
     pub fn pop_blend(&mut self) {
-        if self.skipped_blend_depth > 0 {
-            self.skipped_blend_depth -= 1;
-            return;
+        match self.blend_frames.pop() {
+            Some(BlendFrameKind::Passthrough) => {}
+            Some(BlendFrameKind::Skipped) => {
+                self.skipped_blend_depth = self.skipped_blend_depth.saturating_sub(1);
+            }
+            Some(BlendFrameKind::RealIsolated) if self.blend_depth > 0 => {
+                self.ops.push(PageOp::PopBlend);
+                self.blend_depth -= 1;
+                self.isolated_depth = self.isolated_depth.saturating_sub(1);
+            }
+            Some(BlendFrameKind::Real) if self.blend_depth > 0 => {
+                self.ops.push(PageOp::PopBlend);
+                self.blend_depth -= 1;
+            }
+            Some(BlendFrameKind::Real | BlendFrameKind::RealIsolated) | None => {}
         }
-        if self.blend_depth == 0 {
-            return;
-        }
-        self.ops.push(PageOp::PopBlend);
-        self.blend_depth -= 1;
     }
 
     pub fn close_open_blends(&mut self) {
-        while self.blend_depth > 0 || self.skipped_blend_depth > 0 {
+        while !self.blend_frames.is_empty() {
             self.pop_blend();
         }
     }
@@ -631,13 +1313,52 @@ impl PageRecorder {
     pub fn has_blend_groups(&self) -> bool {
         self.ops
             .iter()
-            .any(|o| matches!(o, PageOp::PushBlend { .. }))
+            .any(|o| matches!(o, PageOp::PushBlend { .. } | PageOp::AffineTile { .. }))
     }
 
-    /// True if any `ResetStencil` op was recorded (i.e. clips were popped) and a
-    /// fullscreen reset quad must be appended before replay.
+    pub fn clip_depth(&self) -> u32 {
+        self.clip_depth
+    }
+
+    /// Mirror the most recently pushed clip entry into a non-empty sub-op mask
+    /// buffer so nested glyph-local clips stay synchronized with `self.clip_stack`.
+    pub fn mirror_top_clip_into(&self, dst: &mut Vec<PageOp>) {
+        if dst.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.clip_stack.last() {
+            if entry.advanced {
+                if let Some(range) = entry.range {
+                    dst.push(PageOp::StampClip {
+                        range,
+                        ref_value: entry.ref_value,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Mirror a clip pop (stencil reset + re-stamp of remaining active clips)
+    /// into a non-empty sub-op mask buffer.
+    pub fn mirror_clip_rebuild_into(&self, dst: &mut Vec<PageOp>) {
+        if dst.is_empty() {
+            return;
+        }
+        dst.push(PageOp::ResetStencil);
+        for entry in &self.clip_stack {
+            if let Some(range) = entry.range {
+                dst.push(PageOp::StampClip {
+                    range,
+                    ref_value: entry.ref_value,
+                });
+            }
+        }
+    }
+
+    /// True if any `ResetStencil` op was recorded (including inside nested soft
+    /// or shape masks) and a fullscreen reset quad must be appended before replay.
     pub fn uses_reset(&self) -> bool {
-        self.ops.iter().any(|o| matches!(o, PageOp::ResetStencil))
+        ops_uses_reset(&self.ops)
     }
 
     /// Append a fullscreen quad in device pixels (for `ResetStencil`).
@@ -660,11 +1381,7 @@ mod tests {
     use zpdf_core::Point;
 
     fn map() -> PageMap {
-        PageMap {
-            scale: 1.0,
-            x0: 0.0,
-            y1: 100.0,
-        }
+        PageMap::new(zpdf_core::Rect::new(0.0, 0.0, 100.0, 100.0), 1.0)
     }
 
     fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> DlPath {
@@ -686,19 +1403,19 @@ mod tests {
         let mut r = PageRecorder::default().with_limits(&limits);
         let deadline = r.deadline;
         let stream = b"0 0 1 1 re f"; // two operators, one visible command
-        let first = r.interpret_type3_stream(stream).unwrap();
+        let (first, _) = r.interpret_type3_stream(stream, None).unwrap();
         assert_eq!(first.commands.len(), 1);
         let sub = r.record_subops(|nested| {
-            let second = nested.interpret_type3_stream(stream).unwrap();
+            let (second, _) = nested.interpret_type3_stream(stream, None).unwrap();
             assert_eq!(second.commands.len(), 1);
         });
         assert!(sub.is_empty());
         assert_eq!(r.type3_work_used, 4);
         assert_eq!(r.deadline, deadline);
-        assert!(r.interpret_type3_stream(stream).is_none());
+        assert!(r.interpret_type3_stream(stream, None).is_none());
         assert_eq!(r.type3_work_used, 5);
         assert!(r.ensure_within_budget().is_err());
-        assert!(r.interpret_type3_stream(b"q Q").is_none());
+        assert!(r.interpret_type3_stream(b"q Q", None).is_none());
         assert_eq!(r.type3_work_used, 5, "failure stops later work");
     }
 
@@ -710,7 +1427,7 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut r = PageRecorder::default().with_limits(&limits);
-        assert!(r.interpret_type3_stream(stream).is_none());
+        assert!(r.interpret_type3_stream(stream, None).is_none());
         assert_eq!(r.type3_work_used, 1);
         assert!(r.ensure_within_budget().is_err());
         assert!(r.vertices.is_empty());
@@ -721,7 +1438,7 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut r = PageRecorder::default().with_limits(&limits);
-        assert!(r.interpret_type3_stream(stream).is_some());
+        assert!(r.interpret_type3_stream(stream, None).is_some());
         assert_eq!(r.type3_work_used, 2);
         assert!(r.ensure_within_budget().is_ok());
     }
@@ -734,15 +1451,15 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut r = PageRecorder::default().with_limits(&limits);
-        assert!(r.interpret_type3_stream(stream).is_some());
+        assert!(r.interpret_type3_stream(stream, None).is_some());
         assert_eq!(r.type3_work_used, 2);
         let sub = r.record_subops(|nested| {
-            assert!(nested.interpret_type3_stream(stream).is_none());
+            assert!(nested.interpret_type3_stream(stream, None).is_none());
         });
         assert!(sub.is_empty());
         assert_eq!(r.type3_work_used, 3);
         assert!(r.ensure_within_budget().is_err());
-        assert!(r.interpret_type3_stream(stream).is_none());
+        assert!(r.interpret_type3_stream(stream, None).is_none());
         assert_eq!(r.type3_work_used, 3, "failure stops later work");
         assert!(r.vertices.is_empty());
         assert!(r.ops.is_empty());
@@ -755,10 +1472,10 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut r = PageRecorder::default().with_limits(&limits);
-        assert!(r.interpret_type3_stream(b"").is_some());
-        assert!(r.interpret_type3_stream(b"1").is_some());
+        assert!(r.interpret_type3_stream(b"", None).is_some());
+        assert!(r.interpret_type3_stream(b"1", None).is_some());
         assert_eq!(r.type3_work_used, 2);
-        assert!(r.interpret_type3_stream(b"").is_none());
+        assert!(r.interpret_type3_stream(b"", None).is_none());
         assert_eq!(r.type3_work_used, 2);
         assert!(r.ensure_within_budget().is_err());
     }
@@ -797,7 +1514,7 @@ mod tests {
         ];
         for (limits, stream) in cases {
             let mut r = PageRecorder::default().with_limits(&limits);
-            assert!(r.interpret_type3_stream(stream).is_none());
+            assert!(r.interpret_type3_stream(stream, None).is_none());
             assert!(r.ensure_within_budget().is_err());
             assert!(r.vertices.is_empty());
             assert!(r.ops.is_empty());
@@ -810,7 +1527,9 @@ mod tests {
         r.deadline = Some(Instant::now()); // deterministic expiry, no sleep
         let deadline = r.deadline;
         let sub = r.record_subops(|nested| {
-            assert!(nested.interpret_type3_stream(b"0 0 1 1 re f").is_none());
+            assert!(nested
+                .interpret_type3_stream(b"0 0 1 1 re f", None)
+                .is_none());
         });
         assert!(sub.is_empty());
         assert_eq!(r.deadline, deadline);

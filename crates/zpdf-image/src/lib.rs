@@ -16,6 +16,13 @@ pub struct ImageCache {
     images: HashMap<ImageId, DecodedImage>,
     next_id: ImageId,
     bytes_used: u64,
+    /// Image IDs whose pixel contents depended on placement bounds (e.g.
+    /// standalone Type 3 unclipped unbounded shadings with all-zero `/FontBBox`).
+    placement_dependent: Vec<ImageId>,
+    /// Set whenever an image admission was rejected or marked truncated so
+    /// cross-placement Type 3 caches never alias surviving images into an
+    /// earlier dropped bitmap's slot.
+    partial: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,11 +44,57 @@ impl ImageCache {
             images: HashMap::new(),
             next_id: 0,
             bytes_used: 0,
+            placement_dependent: Vec::new(),
+            partial: false,
         }
     }
 
     pub fn get(&self, id: ImageId) -> Option<&DecodedImage> {
         self.images.get(&id)
+    }
+
+    /// Mark `id` as placement-dependent (e.g. a standalone Type 3 shading
+    /// rasterized against inverse-mapped destination bounds).
+    pub fn mark_placement_dependent(&mut self, id: ImageId) {
+        if !self.placement_dependent.contains(&id) {
+            self.placement_dependent.push(id);
+        }
+    }
+
+    /// True when `id` was marked placement-dependent.
+    pub fn is_placement_dependent(&self, id: ImageId) -> bool {
+        self.placement_dependent.contains(&id)
+    }
+
+    /// Mark this cache as partial (an image was dropped or interpretation
+    /// truncated), disabling cross-placement fixed-slot reuse.
+    pub fn mark_partial(&mut self) {
+        self.partial = true;
+    }
+
+    /// True when at least one image admission failed or this cache was marked
+    /// partial.
+    pub fn is_partial(&self) -> bool {
+        self.partial
+    }
+
+    /// Return `Some((is_placement_dependent, category_ordinal))` for `id`
+    /// within a complete freshly interpreted Type 3 glyph `ImageCache`, or
+    /// `None` when the cache is partial so callers bypass cross-placement
+    /// image reuse and never alias a surviving bitmap into a dropped slot.
+    pub fn type3_image_slot(&self, id: ImageId) -> Option<(bool, u32)> {
+        if self.partial {
+            return None;
+        }
+        if self.placement_dependent.is_empty() {
+            return Some((false, id));
+        }
+        if let Some(pos) = self.placement_dependent.iter().position(|&p| p == id) {
+            Some((true, pos as u32))
+        } else {
+            let prior_dep = self.placement_dependent.iter().filter(|&&p| p < id).count() as u32;
+            Some((false, id.saturating_sub(prior_dep)))
+        }
     }
 
     /// Remove and return an image from the cache.
@@ -52,6 +105,7 @@ impl ImageCache {
     /// unusable after this call.
     pub fn remove(&mut self, id: ImageId) -> Option<DecodedImage> {
         let image = self.images.remove(&id)?;
+        self.placement_dependent.retain(|&p| p != id);
         self.bytes_used = self
             .bytes_used
             .saturating_sub(u64::try_from(image.data.capacity()).unwrap_or(u64::MAX));
@@ -72,12 +126,22 @@ impl ImageCache {
     ) -> Option<ImageId> {
         // Charge the retained allocation, not merely its initialized length:
         // decoded buffers commonly reserve their final RGBA size up front.
-        let image_bytes = u64::try_from(image.data.capacity()).ok()?;
-        let new_total = self.bytes_used.checked_add(image_bytes)?;
+        let Some(image_bytes) = u64::try_from(image.data.capacity()).ok() else {
+            self.partial = true;
+            return None;
+        };
+        let Some(new_total) = self.bytes_used.checked_add(image_bytes) else {
+            self.partial = true;
+            return None;
+        };
         if new_total > max_bytes {
+            self.partial = true;
             return None;
         }
-        let id = self.next_free_id()?;
+        let Some(id) = self.next_free_id() else {
+            self.partial = true;
+            return None;
+        };
         self.images.insert(id, image);
         self.bytes_used = new_total;
         Some(id)

@@ -94,3 +94,7 @@ harness = false
 name = "longform"
 harness = false
 required-features = ["bench-long"]
+
+[[bench]]
+name = "tiling_pattern"
+harness = false

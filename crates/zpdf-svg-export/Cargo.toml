@@ -18,6 +18,7 @@ zpdf-content.workspace = true
 zpdf-font.workspace = true
 zpdf-image.workspace = true
 zpdf-render.workspace = true
+zpdf-render-cpu.workspace = true
 
 tracing.workspace = true
 

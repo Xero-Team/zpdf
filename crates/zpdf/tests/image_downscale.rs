@@ -197,11 +197,23 @@ fn render(pdf: &[u8], scale: f32, limits: &ParseLimits, footprints: Footprints) 
     };
     collect(&dl.commands);
     for command in &dl.commands {
-        if let RenderCommand::PushBlendGroup {
-            mask: Some(mask), ..
-        } = command
-        {
-            collect(&mask.commands.commands);
+        match command {
+            RenderCommand::PushBlendGroup {
+                mask: Some(mask), ..
+            } => {
+                collect(&mask.commands.commands);
+            }
+            RenderCommand::FillPath {
+                paint: zpdf::display_list::Paint::Tiling(tiling),
+                ..
+            }
+            | RenderCommand::StrokePath {
+                paint: zpdf::display_list::Paint::Tiling(tiling),
+                ..
+            } => {
+                collect(&tiling.commands.commands);
+            }
+            _ => {}
         }
     }
     let bytes = images.bytes_used();

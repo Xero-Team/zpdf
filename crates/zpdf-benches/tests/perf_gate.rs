@@ -31,16 +31,15 @@ use zpdf_benches::{synthetic_corpus, Composition};
 ///
 /// A change here is a change in what zpdf draws for that feature — the fixtures
 /// are single-feature by construction (see `tests/gen_corpus.py`), which is what
-/// makes an exact number meaningful rather than brittle. (`pattern_tiling` is
-/// large because a tiling pattern expands to its tiles in the display list:
-/// 961 commands for one painted shape.)
+/// makes an exact number meaningful rather than brittle. Tiling patterns emit
+/// `Paint::Tiling` commands instead of expanding per-tile geometry.
 const EXPECTED: &[(&str, u64, u64, u64, u64, u64, u64)] = &[
     ("clip", 9, 5, 0, 0, 0, 2),
     ("curves", 2, 1, 1, 0, 0, 0),
     ("image_rgb", 3, 0, 0, 0, 3, 0),
     ("image_under_clip", 4, 1, 0, 0, 1, 1),
-    ("pattern_tiling", 961, 382, 191, 0, 0, 194),
-    ("pattern_tiling_uncolored", 676, 336, 0, 0, 0, 170),
+    ("pattern_tiling", 3, 3, 0, 0, 0, 0),
+    ("pattern_tiling_uncolored", 2, 2, 0, 0, 0, 0),
     ("rect_fills", 4, 4, 0, 0, 0, 0),
     ("strokes", 3, 0, 3, 0, 0, 0),
     ("text_type3", 3, 3, 0, 0, 0, 0),

@@ -253,8 +253,9 @@ fn cpu_preserves_shading_sampling_grid_inside_tiling_cell() {
     // 600×600 pt unclipped page painting an interior 100×100 pt tiling pattern
     // cell whose content draws a sharp axial gradient via `/Sh0 sh`.
     // Clip elision must NOT tighten `current.clip_bounds` (which drives
-    // `shading_region()`), so the shading keeps its original 768×768 sampling
-    // grid and pixel output matches the unelided display list byte-for-byte.
+    // `shading_region()`), so the shading inside the 100×100 cell keeps its
+    // 200×200 (2×) sampling grid and pixel output matches the unelided display
+    // list byte-for-byte.
     let cell = b"/Sh0 sh";
     let content = b"/Pattern cs /P0 scn 100 100 100 100 re f";
     let pdf = assemble(&[
@@ -289,7 +290,7 @@ fn cpu_preserves_shading_sampling_grid_inside_tiling_cell() {
         (retained_sh.width, retained_sh.height),
         "shading inside tiling cell must preserve its original sample grid"
     );
-    assert_eq!((elided_sh.width, elided_sh.height), (768, 768));
+    assert_eq!((elided_sh.width, elided_sh.height), (200, 200));
 }
 
 #[test]

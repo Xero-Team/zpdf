@@ -4,6 +4,11 @@
 
 ### Compatibility
 
+- **Additive enum variant:** `zpdf_display_list::Paint` adds
+  `Paint::Tiling(Arc<TilingPattern>)` alongside the new `TilingPattern` struct
+  carrying a single pre-interpreted cell `DisplayList`, `/BBox`, `/XStep`,
+  `/YStep`, pattern-to-page matrix, and `/TilingType`. Downstream exhaustive
+  matches on `Paint` must handle `Paint::Tiling`. (#155)
 - **Breaking:** `zpdf_display_list::DisplayList` now stores expanded semantic
   glyph runs in a private field accessed via `DisplayList::expanded_glyph_runs`
   and `DisplayList::push_expanded_glyph_run`; construct display lists with
@@ -14,6 +19,22 @@
   matches on `SlideElement` must handle `SlideElement::Opacity` (unwrapping
   `element` and multiplying its `alpha` onto inner paints); existing opaque
   variant constructors are unchanged. (#156)
+
+### Rendering and performance
+
+- Represent PDF tiling patterns (both coloured `/PaintType 1` and uncoloured
+  `/PaintType 2`) as `Paint::Tiling` instead of expanding per-tile geometry
+  into the flat display list, removing the 4,096-tile solid fallback and
+  command-budget truncation on pattern-heavy pages (e.g. `MOZILLA-1244729-0.pdf`,
+  `PDFBOX-1094-5.pdf`). The CPU backend reuses each rasterized cell while it
+  remains in the bounded per-page tile cache and paints via
+  `tiny_skia::Pattern` with `SpreadMode::Repeat`, handling negative steps,
+  overlapping `/BBox > step`, and arbitrary pattern matrices; SVG export emits
+  deduplicated `<pattern>` definitions, wgpu replays tiles up to 4,096 cells and
+  repeats a GPU-rasterized cell texture above that cap, PowerPoint export
+  rasterizes clipped pattern fills/strokes into slide images, and rich
+  conversion extracts tiling-cell images with bounded transformed placements.
+  (#155)
 
 ### Rendering and Type 3 fonts (`zpdf-content`, `zpdf-display-list`, `zpdf-pptx-export`, `zpdf-font`, `zpdf-document`)
 
