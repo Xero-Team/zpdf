@@ -18,8 +18,15 @@ Released 2026-11-25.
   `owned_heap_bytes` (alongside the new `ExpandedGlyphRun`,
   `RetainedMaskAccounting`, `RetainedMaskDelta`,
   `RenderCommand::owned_heap_bytes`, and `Path::heap_bytes`). Construct display
-  lists with `DisplayList::new` rather than struct literals. (#156, #199, #155,
-  #200)
+  lists with `DisplayList::new` rather than struct literals. Callers editing the
+  public `DisplayList::commands` vector after upgrading must treat `commands` as
+  append-only while recorded ranges are live — inserting, removing, or
+  reordering commands before a recorded range leaves its saved indices pointing
+  at different commands (for example, causing `display_list_to_slide` to skip
+  unrelated artwork instead of an expanded Type 3 glyph run). Use
+  `DisplayList::truncate_commands` to drop a suffix while keeping surviving
+  ranges consistent, and call `DisplayList::clear_command_ranges` before any
+  in-place edit that invalidates existing indices. (#156, #199, #155, #200)
 - **Breaking (enum variants):** `zpdf_display_list::Paint` adds
   `Paint::Tiling(Arc<TilingPattern>)` (alongside the new `TilingPattern`,
   `TilingOverlapRanges`, `TilingBlendSegment`, `TilingBlendStep`, and
