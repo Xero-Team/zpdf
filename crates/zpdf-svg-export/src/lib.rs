@@ -293,9 +293,10 @@ struct SvgWriter<'a> {
     type3_glyphs: HashMap<(FontId, u16), Option<Rc<Type3Glyph>>>,
     type3_glyph_commands: usize,
     type3_glyph_image_bytes: u64,
-    /// Content-interpreter limits applied when replaying standalone Type 3
-    /// CharProc streams.
-    parse_limits: zpdf_core::ParseLimits,
+    /// Optional per-glyph decoded-image byte cap applied via
+    /// `ContentInterpreter::with_image_cache_limit` without altering the
+    /// standalone interpreter's default operator ceiling.
+    max_type3_image_cache_bytes: Option<u64>,
 }
 
 /// What an `<image>` def holds: a page image, a retained inline image, a Type 3
@@ -693,7 +694,7 @@ impl<'a> SvgWriter<'a> {
             type3_glyphs: HashMap::new(),
             type3_glyph_commands: 0,
             type3_glyph_image_bytes: 0,
-            parse_limits: zpdf_core::ParseLimits::default(),
+            max_type3_image_cache_bytes: None,
         }
     }
 
@@ -6471,8 +6472,10 @@ impl<'a> SvgWriter<'a> {
                     .with_type3_resources(font.type3_resources())
                     .with_type3_glyph_bbox(font.type3_font_bbox())
                     .with_type3_fallback_bounds(dest_bounds)
-                    .with_images(&mut images)
-                    .with_limits(&self.parse_limits);
+                    .with_images(&mut images);
+                if let Some(limit) = self.max_type3_image_cache_bytes {
+                    interp = interp.with_image_cache_limit(limit);
+                }
                 if let Some(deadline) = self.deadline {
                     interp = interp.with_deadline(deadline);
                 }
@@ -15000,7 +15003,7 @@ mod tests {
         // Placement 1 padded clip is ~100×12 (~286 KiB gradient); all 3 fit.
         // Placement 2 padded clip is ~100×42 (~992 KiB gradient); gradient fits,
         // 64 KiB Red exceeds 1_010_000 B and is dropped, while 64 B Blue survives.
-        writer.parse_limits.max_image_cache_bytes = 1_010_000;
+        writer.max_type3_image_cache_bytes = Some(1_010_000);
         writer.emit_commands(&dl.commands, EmitDepth::default());
         writer.flush_pending_backdrop();
         writer.flush_disjoint_backdrop();
